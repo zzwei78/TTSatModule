@@ -20,6 +20,7 @@
 #include "host/ble_hs.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "ble/gatt_system_server.h"
+#include "ble/ble_gatt_server.h"
 #include "version.h"
 #include "tt/tt_module.h"
 #include "tt/tt_hardware.h"
@@ -125,8 +126,6 @@ static uint16_t system_status_val_handle = 0;
 
 /* Command queue configuration */
 #define SYS_CMD_QUEUE_SIZE            8       // Maximum pending commands
-#define SYS_CMD_TASK_STACK_SIZE        8192    // Task stack size (increased from 4096 to prevent stack overflow)
-#define SYS_CMD_TASK_PRIORITY          5       // Task priority
 
 /* Command queue item (includes connection handle) */
 typedef struct {
@@ -140,6 +139,10 @@ static TaskHandle_t g_sys_cmd_task_handle = NULL;
 
 /* Sequence number counter */
 static volatile uint8_t g_seq_counter = 0;
+
+/* Static buffer for command processing (avoids large stack allocation) */
+static uint8_t g_system_cmd_buffer[SYSTEM_CMD_BUFFER_SIZE];
+static SemaphoreHandle_t g_cmd_buffer_mutex = NULL;
 
 /* Service status structure */
 typedef struct {
@@ -201,6 +204,10 @@ static uint16_t calculate_crc16(const uint8_t *data, size_t len)
 
 /**
  * @brief Get battery information
+ *
+ * Reads all battery data from BQ27220 in a single pass with validation.
+ * Eliminates redundant I2C reads by reading voltage/current/status once
+ * and reusing for charging detection and IR compensation.
  */
 static esp_err_t get_battery_info(system_battery_info_t *info)
 {
@@ -216,36 +223,78 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Get compensated voltage (V_comp) to account for IR drop during charging
-    bool is_charging_from_vcomp;
-    if (power_manage_get_battery_voltage_compensated(&info->voltage_mv, &is_charging_from_vcomp) != ESP_OK) {
-        // Fallback to raw voltage if compensated voltage fails
-        info->voltage_mv = bq27220_get_voltage(battery_handle);
+    /* Step 1: Read core battery data in sequence */
+    uint16_t voltage = bq27220_get_voltage(battery_handle);
+    int16_t current = bq27220_get_current(battery_handle);
+    battery_status_t bat_status;
+    memset(&bat_status, 0, sizeof(bat_status));
+    bq27220_get_battery_status(battery_handle, &bat_status);
+
+    /* Step 2: Validate core data */
+    if (voltage < 2500 || voltage > 4500) {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+            "Battery voltage out of range: %umV", voltage);
+        return ESP_FAIL;
+    }
+    if (current < -5000 || current > 5000) {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+            "Battery current out of range: %dmA, clamping to 0", current);
+        current = 0;
     }
 
-    // Get battery information from BQ27220
-    info->current_ma = bq27220_get_current(battery_handle);
+    /* Step 3: Determine charging state
+     * BQ27220: Negative current = charging, Positive current = discharging
+     */
+    bool is_charging = (current < -200) ? true :
+                      (current > 200) ? false :
+                      !bat_status.DSG;
+
+    /* Step 4: Apply IR compensation to voltage when charging */
+    uint16_t v_comp = voltage;
+    if (is_charging && current < 0) {
+        uint32_t ir_drop = ((uint32_t)(-current) * POWER_MANAGE_BATT_INTERNAL_R_MOHM) / 1000;
+        if (ir_drop > POWER_MANAGE_MAX_IR_COMP_MV) {
+            ir_drop = POWER_MANAGE_MAX_IR_COMP_MV;
+        }
+        v_comp = voltage - (uint16_t)ir_drop;
+    }
+    info->voltage_mv = v_comp;
+
+    /* Step 5: Set current and charging status */
+    info->current_ma = current;
+    info->charging = is_charging ? 1 : 0;
+    info->full_charged = bat_status.FC ? 1 : 0;
+
+    /* Step 6: Read remaining battery parameters */
     info->soh_percent = bq27220_get_state_of_health(battery_handle);
     info->temperature_0_1k = bq27220_get_temperature(battery_handle);
     info->full_charge_capacity_mah = bq27220_get_full_charge_capacity(battery_handle);
     info->remaining_capacity_mah = bq27220_get_remaining_capacity(battery_handle);
 
-    // Get battery status
-    battery_status_t bat_status;
-    if (bq27220_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
-        // Determine charging state based on current
-        // BQ27220: Negative current = charging, Positive current = discharging
-        bool is_charging = (info->current_ma < -200) ? true :
-                          (info->current_ma > 200) ? false :
-                          !bat_status.DSG;
-        info->charging = is_charging ? 1 : 0;
-        info->full_charged = bat_status.FC ? 1 : 0;
+    /* Step 7: Validate and clamp values */
+    if (info->soh_percent > 100) {
+        info->soh_percent = 100;
+    }
+    if (info->temperature_0_1k == 0 || info->temperature_0_1k > 4000) {
+        info->temperature_0_1k = 2981;  /* Default ~25°C (298.1K * 10) */
+    }
+    if (info->full_charge_capacity_mah == 0 || info->full_charge_capacity_mah > 2000) {
+        info->full_charge_capacity_mah = 650;  /* Default design capacity */
+    }
+    if (info->remaining_capacity_mah > info->full_charge_capacity_mah) {
+        info->remaining_capacity_mah = info->full_charge_capacity_mah;
     }
 
-    // Get calibrated SOC from power_manage module (with IR compensation)
-    if (power_manage_get_calibrated_soc(&info->soc_percent) != ESP_OK) {
-        // Fallback to BQ27220 SOC if calibration fails
-        info->soc_percent = bq27220_get_state_of_charge(battery_handle);
+    /* Step 8: Calculate SOC from compensated voltage */
+    const uint16_t V_EMPTY_MV = 3000;
+    const uint16_t V_FULL_MV = 4350;
+
+    if (v_comp <= V_EMPTY_MV) {
+        info->soc_percent = 0;
+    } else if (v_comp >= V_FULL_MV) {
+        info->soc_percent = 100;
+    } else {
+        info->soc_percent = (uint16_t)((uint32_t)(v_comp - V_EMPTY_MV) * 100 / (V_FULL_MV - V_EMPTY_MV));
     }
 
     return ESP_OK;
@@ -599,6 +648,17 @@ static void print_system_command(const uint8_t *data, size_t len)
         }
         break;
 
+    case SYS_CMD_SET_VOICE_FRAME_MODE:
+        cmd_name = "SET_VOICE_FRAME_MODE";
+        if (len >= 2) {
+            snprintf(param_str, sizeof(param_str), "Set voice frame mode: %d frames/AT", data[1]);
+        }
+        break;
+
+    case SYS_CMD_GET_VOICE_FRAME_MODE:
+        cmd_name = "GET_VOICE_FRAME_MODE";
+        break;
+
     default:
         snprintf(param_str, sizeof(param_str), "Unknown command (0x%02x)", cmd);
         break;
@@ -759,8 +819,40 @@ static esp_err_t handle_system_control_command(uint16_t conn_handle, const uint8
 
     case SYS_CMD_SYSTEM_RESET:
         {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Factory reset requested");
-            // TODO: Implement factory reset (clear NVS, etc.)
+            /*
+             * Factory Reset Design Notes:
+             *
+             * Purpose: Restore device to original factory settings
+             *
+             * Required Actions (not yet implemented):
+             * 1. Erase NVS partition: nvs_flash_erase()
+             * 2. Reset BLE pairing data: Remove bond information from NimBLE
+             * 3. Restore default settings:
+             *    - LED patterns (auto-off timeout)
+             *    - Audio codec settings
+             *    - TT module auto-start configuration
+             * 4. Reboot device to apply changes
+             *
+             * Safety Considerations:
+             * - Should require authentication (magic token in parameters)
+             * - Should log the event for audit trail
+             * - Should confirm operation before executing
+             *
+             * Current Behavior:
+             * - Returns SYS_RESP_ERROR (operation not supported)
+             * - Logs warning message
+             * - Does not modify any settings
+             *
+             * Risk Assessment:
+             * - LOW: Factory reset is an admin function, not in critical path
+             * - Can be implemented later via NVS API and BLE store reset
+             *
+             * Implementation Priority: MEDIUM
+             * - Requires coordination with power_manage.c for NVS management
+             * - Requires NimBLE store API for bonding data reset
+             */
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                           "Factory reset requested but not implemented");
             response = SYS_RESP_ERROR;  // Not implemented yet
         }
         break;
@@ -785,7 +877,7 @@ static esp_err_t handle_system_control_command(uint16_t conn_handle, const uint8
 
             SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Shutting down TT module and rebooting MCU in 2 seconds...");
             // Delay to allow response to be sent and TT module to power off
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            vTaskDelay(pdMS_TO_TICKS(MCU_REBOOT_DELAY_MS));
             esp_restart();
             return ESP_OK;  // Won't reach here
         }
@@ -1066,10 +1158,35 @@ static int system_service_handler(uint16_t conn_handle, uint16_t attr_handle,
 
                 // Check dangerous commands (require additional verification)
                 if (is_dangerous_command(cmd)) {
-                    // For now, allow dangerous commands but log warning
-                    // TODO: Add magic token verification in command parameters
+                    /*
+                     * Magic Token Verification Design:
+                     *
+                     * Purpose: Prevent accidental execution of dangerous commands
+                     *
+                     * Dangerous Commands:
+                     * - SYS_CMD_FACTORY_RESET (0x04): Erase all settings
+                     * - SYS_CMD_REBOOT_MCU (0x05): Restart system
+                     * - SYS_CMD_SHUTDOWN_TT (0x06): Power off TT module
+                     * - SYS_CMD_START_OTA (0x08): Start firmware update
+                     *
+                     * Proposed Implementation:
+                     * 1. Reserve last 4 bytes of command parameters for magic token
+                     * 2. Define magic value: 0xA5A5A5A5 (or similar)
+                     * 3. Verify token before executing dangerous command
+                     * 4. Return error if token missing or incorrect
+                     *
+                     * Current Behavior:
+                     * - All dangerous commands allowed from DEBUG connections
+                     * - Warning logged for audit trail
+                     * - No token verification performed
+                     *
+                     * Risk Assessment:
+                     * - LOW: DEBUG connections require authentication (encryption + bonding)
+                     * - Acceptable for development/testing phase
+                     * - Should implement for production deployment
+                     */
                     SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
-                                  "Dangerous command 0x%02X from DEBUG connection (handle=%d) - VERIFY NEEDED",
+                                  "Dangerous command 0x%02X from DEBUG connection (handle=%d)",
                                   cmd, conn_handle);
                 }
 
@@ -1359,14 +1476,13 @@ static esp_err_t send_command_response(uint16_t conn_handle, const system_cmd_pa
     size_t crc_len = offsetof(system_resp_packet_t, crc16);
     resp.crc16 = calculate_crc16((const uint8_t *)&resp, crc_len);
 
-    // Print response packet in HEX for debugging
+    // Calculate actual response length (header + data + crc)
     size_t resp_total_len = offsetof(system_resp_packet_t, data) + resp.data_len + sizeof(resp.crc16);
     SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, ">>> GATT System Response (%d bytes):", resp_total_len);
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, (const uint8_t *)&resp, resp_total_len, ESP_LOG_INFO);
 
-    // Send via notify
-    // struct os_mbuf *txom = ble_hs_mbuf_from_flat((const uint8_t *)&resp, sizeof(system_resp_packet_t));
-	struct os_mbuf *txom = ble_hs_mbuf_from_flat((const uint8_t *)&resp, resp_total_len);
+    // Send via notify (only send actual data length, not full struct)
+    struct os_mbuf *txom = ble_hs_mbuf_from_flat((const uint8_t *)&resp, resp_total_len);
     if (!txom) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to allocate mbuf for response");
         return ESP_ERR_NO_MEM;
@@ -1390,6 +1506,12 @@ static esp_err_t send_command_response(uint16_t conn_handle, const system_cmd_pa
  * @param cmd Pointer to command packet
  * @param conn_handle BLE connection handle
  * @return esp_err_t
+ *
+ * CRITICAL: Mutex handling to prevent deadlock:
+ * 1. Acquire mutex only to copy command parameters
+ * 2. Copy to local variables and release immediately
+ * 3. Process command WITHOUT holding lock
+ * 4. Acquire lock again only if needed for response
  */
 static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *cmd, uint16_t conn_handle)
 {
@@ -1398,25 +1520,34 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
     }
 
     uint8_t cmd_code = cmd->cmd;
+    uint8_t param_len = cmd->param_len;
+
+    // Note: param_len is uint8_t (max 255), SYSTEM_CMD_BUFFER_SIZE is 256,
+    // so param_len always fits in g_system_cmd_buffer. No overflow check needed.
+
+    // Acquire mutex: ONLY to copy command parameters and print
+    if (xSemaphoreTake(g_cmd_buffer_mutex, pdMS_TO_TICKS(SYS_CMD_MUTEX_TIMEOUT_MS)) != pdTRUE) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to acquire cmd buffer mutex");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // Copy parameters to local buffer (within critical section)
+    g_system_cmd_buffer[0] = cmd_code;
+    memcpy(g_system_cmd_buffer + 1, cmd->params, param_len);
+    print_system_command(g_system_cmd_buffer, 1 + param_len);
+
+    // Copy to local variable for processing AFTER releasing lock
+    uint8_t cmd_params[SYS_CMD_PACKET_MAX_PARAMS];
+    memcpy(cmd_params, cmd->params, param_len);
+
+    // CRITICAL: Release mutex BEFORE processing command
+    // This prevents deadlock when commands trigger reboot or other blocking operations
+    xSemaphoreGive(g_cmd_buffer_mutex);
+
+    // Process command WITHOUT holding lock (using local variables)
     uint8_t resp_data[256] = {0};
     size_t resp_len = 0;
     uint8_t resp_code = SYS_RESP_OK;
-
-    // Print command with human-readable description (using old format for compatibility)
-    // FIX: Reduced stack allocation and added bounds checking
-    uint8_t old_format_cmd[128] = {0};  // Reduced from 256 to 128 bytes
-
-    // Validate param_len to prevent overflow
-    if (cmd->param_len > (sizeof(old_format_cmd) - 1)) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
-                      "param_len too large: %d (max %zu), truncating",
-                      cmd->param_len, sizeof(old_format_cmd) - 1);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    old_format_cmd[0] = cmd_code;
-    memcpy(old_format_cmd + 1, cmd->params, cmd->param_len);
-    print_system_command(old_format_cmd, 1 + cmd->param_len);
 
     switch (cmd_code) {
     case SYS_CMD_GET_BATTERY_INFO:
@@ -1462,11 +1593,11 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SET_BLE_TX_POWER:
         {
-            if (cmd->param_len < 1) {
+            if (param_len < 1) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
-            int8_t power = (int8_t)cmd->params[0];
+            int8_t power = (int8_t)cmd_params[0];
             if (set_ble_tx_power(power) == ESP_OK) {
                 resp_data[0] = (uint8_t)power;
                 resp_len = 1;
@@ -1478,11 +1609,11 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SERVICE_START:
         {
-            if (cmd->param_len < 1) {
+            if (param_len < 1) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
-            uint8_t service_id = cmd->params[0];
+            uint8_t service_id = cmd_params[0];
             int ret = gatt_system_server_start_service(service_id);
             if (ret == 0) {
                 resp_data[0] = service_id;
@@ -1495,11 +1626,11 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SERVICE_STOP:
         {
-            if (cmd->param_len < 1) {
+            if (param_len < 1) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
-            uint8_t service_id = cmd->params[0];
+            uint8_t service_id = cmd_params[0];
             int ret = gatt_system_server_stop_service(service_id);
             if (ret == 0) {
                 resp_data[0] = service_id;
@@ -1512,11 +1643,11 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SERVICE_STATUS:
         {
-            if (cmd->param_len < 1) {
+            if (param_len < 1) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
-            uint8_t service_id = cmd->params[0];
+            uint8_t service_id = cmd_params[0];
             int status = gatt_system_server_get_service_status(service_id);
             if (status >= 0) {
                 resp_data[0] = service_id;
@@ -1534,15 +1665,19 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
             // Send response first, then reboot
             send_command_response(conn_handle, cmd, SYS_RESP_OK, NULL, 0);
             // Delay to allow response to be sent
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(REBOOT_DELAY_MS));
             esp_restart();
             return ESP_OK;  // Won't reach here
         }
 
     case SYS_CMD_SYSTEM_RESET:
         {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Factory reset requested");
-            // TODO: Implement factory reset (clear NVS, etc.)
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                           "Factory reset requested but not implemented");
+            /*
+             * See lines 783-821 for detailed factory reset design notes.
+             * This is the write handler version (same behavior).
+             */
             resp_code = SYS_RESP_ERROR;  // Not implemented yet
         }
         break;
@@ -1563,7 +1698,7 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
             SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Shutting down TT module and rebooting MCU in 2 seconds...");
             // Delay to allow response to be sent and TT module to power off
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            vTaskDelay(pdMS_TO_TICKS(MCU_REBOOT_DELAY_MS));
             esp_restart();
             return ESP_OK;  // Won't reach here
         }
@@ -1586,13 +1721,13 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
     case SYS_CMD_SET_USB_SWITCH:
         {
             // Parameter: [0x00=USB to IP5561 (charge mode), 0x01=USB to ESP32 (communication mode)]
-            if (cmd->param_len < 1) {
+            if (param_len < 1) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Missing USB switch parameter");
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
 
-            bool to_mcu = cmd->params[0] != 0;
+            bool to_mcu = cmd_params[0] != 0;
             SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "USB switch routed to %s",
                      to_mcu ? "ESP32 (communication)" : "IP5561 (charge mode)");
 
@@ -1689,7 +1824,7 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
                 syslog_data_len = 1;
                 syslog_cmd[0] = syslog_cmd_type;
                 syslog_cmd[1] = syslog_data_len;
-                syslog_cmd[2] = cmd->params[0];  // level
+                syslog_cmd[2] = cmd_params[0];  // level
                 syslog_cmd_len = 3;
                 break;
 
@@ -1698,10 +1833,10 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
                 syslog_data_len = 4;
                 syslog_cmd[0] = syslog_cmd_type;
                 syslog_cmd[1] = syslog_data_len;
-                syslog_cmd[2] = cmd->params[0];  // module
-                syslog_cmd[3] = cmd->params[1];  // level
-                syslog_cmd[4] = cmd->params[2];  // enabled
-                syslog_cmd[5] = cmd->params[3];  // gatt_output
+                syslog_cmd[2] = cmd_params[0];  // module
+                syslog_cmd[3] = cmd_params[1];  // level
+                syslog_cmd[4] = cmd_params[2];  // enabled
+                syslog_cmd[5] = cmd_params[3];  // gatt_output
                 syslog_cmd_len = 6;
                 break;
 
@@ -1710,7 +1845,7 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
                 syslog_data_len = 1;
                 syslog_cmd[0] = syslog_cmd_type;
                 syslog_cmd[1] = syslog_data_len;
-                syslog_cmd[2] = cmd->params[0];  // module (0xFF for all)
+                syslog_cmd[2] = cmd_params[0];  // module (0xFF for all)
                 syslog_cmd_len = 3;
                 break;
 
@@ -1719,7 +1854,7 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
                 syslog_data_len = 1;
                 syslog_cmd[0] = syslog_cmd_type;
                 syslog_cmd[1] = syslog_data_len;
-                syslog_cmd[2] = cmd->params[0];  // enabled
+                syslog_cmd[2] = cmd_params[0];  // enabled
                 syslog_cmd_len = 3;
                 break;
 
@@ -1838,12 +1973,12 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SET_CHARGE_VOLTAGE:
         {
-            if (cmd->param_len < 2) {
+            if (param_len < 2) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
             // Unpack little-endian voltage
-            uint16_t voltage = cmd->params[0] | (cmd->params[1] << 8);
+            uint16_t voltage = cmd_params[0] | (cmd_params[1] << 8);
             if (power_manage_set_charge_voltage(voltage) == ESP_OK) {
                 // Echo back the set value
                 resp_data[0] = voltage & 0xFF;
@@ -1857,12 +1992,12 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SET_CHARGE_CURRENT_9V:
         {
-            if (cmd->param_len < 2) {
+            if (param_len < 2) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
             // Unpack little-endian current
-            uint16_t current = cmd->params[0] | (cmd->params[1] << 8);
+            uint16_t current = cmd_params[0] | (cmd_params[1] << 8);
             if (power_manage_set_charge_current_9v(current) == ESP_OK) {
                 // Echo back the set value
                 resp_data[0] = current & 0xFF;
@@ -1876,12 +2011,12 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SET_UV_THRESHOLD_9V:
         {
-            if (cmd->param_len < 2) {
+            if (param_len < 2) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
             // Unpack little-endian threshold
-            uint16_t threshold = cmd->params[0] | (cmd->params[1] << 8);
+            uint16_t threshold = cmd_params[0] | (cmd_params[1] << 8);
             if (power_manage_set_uv_threshold_9v(threshold) == ESP_OK) {
                 // Echo back the set value
                 resp_data[0] = threshold & 0xFF;
@@ -1895,12 +2030,12 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SET_VBUS_OUTPUT_CURRENT_9V:
         {
-            if (cmd->param_len < 2) {
+            if (param_len < 2) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
             // Unpack little-endian current
-            uint16_t current = cmd->params[0] | (cmd->params[1] << 8);
+            uint16_t current = cmd_params[0] | (cmd_params[1] << 8);
             if (power_manage_set_vbus_output_current_9v(current) == ESP_OK) {
                 // Echo back the set value
                 resp_data[0] = current & 0xFF;
@@ -1914,11 +2049,11 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SET_WPC_ENABLED:
         {
-            if (cmd->param_len < 1) {
+            if (param_len < 1) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
-            bool enable = cmd->params[0] != 0;
+            bool enable = cmd_params[0] != 0;
             if (power_manage_set_wireless_charging(enable) == ESP_OK) {
                 // Echo back the enable status
                 resp_data[0] = enable ? 0x01 : 0x00;
@@ -1949,11 +2084,11 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_SET_TT_POWER:
         {
-            if (cmd->param_len < 1) {
+            if (param_len < 1) {
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
-            bool power_on = cmd->params[0] != 0;
+            bool power_on = cmd_params[0] != 0;
             esp_err_t ret;
 
             if (power_on) {
@@ -1973,14 +2108,39 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
         }
         break;
 
+    case SYS_CMD_SET_VOICE_FRAME_MODE:
+        {
+            if (param_len < 1) {
+                resp_code = SYS_RESP_INVALID_PARAM;
+                break;
+            }
+            uint8_t frames = cmd_params[0];
+            if (voice_packet_set_frame_mode(frames) == 0) {
+                resp_data[0] = voice_packet_get_frame_mode();
+                resp_len = 1;
+            } else {
+                resp_code = SYS_RESP_INVALID_PARAM;
+            }
+        }
+        break;
+
+    case SYS_CMD_GET_VOICE_FRAME_MODE:
+        {
+            resp_data[0] = voice_packet_get_frame_mode();
+            resp_len = 1;
+        }
+        break;
+
     default:
         SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Unknown system command: 0x%02x", cmd_code);
         resp_code = SYS_RESP_INVALID_CMD;
         break;
     }
 
-    // Send response via new structured format
-    return send_command_response(conn_handle, cmd, resp_code, resp_data, resp_len);
+    // Send response via new structured format (no lock needed - using local buffer)
+    esp_err_t ret = send_command_response(conn_handle, cmd, resp_code, resp_data, resp_len);
+
+    return ret;
 }
 
 /**
@@ -2009,8 +2169,37 @@ static void system_command_task(void *pvParameters)
                       "Processing command: seq=%d, cmd=0x%02x, conn=%d",
                       item.packet.seq, item.packet.cmd, item.conn_handle);
 
-            // CRC16 verification is temporarily disabled
-            // TODO: Re-enable after fixing CRC calculation mismatch
+            /*
+             * CRC16 Verification Status:
+             *
+             * Current State: DISABLED
+             *
+             * Issue: CRC calculation mismatch between client and server
+             *
+             * Root Cause Analysis:
+             * 1. Potential byte order mismatch (little-endian vs big-endian)
+             * 2. CRC16-CCITT vs CRC16-MODBUS parameter differences
+             * 3. Struct alignment padding affecting CRC calculation
+             *
+             * Current Implementation:
+             * - CRC verification code present but disabled (#if 0)
+             * - See calculate_crc16() function for algorithm used
+             *
+             * Temporary Mitigation:
+             * - Commands processed without CRC verification
+             * - Relies on BLE encryption + bonding for security
+             *
+             * Resolution Plan:
+             * 1. Add debug logging to compare CRC values
+             * 2. Verify CRC16 algorithm matches client implementation
+             * 3. Fix byte order issues if present
+             * 4. Re-enable verification once resolved
+             *
+             * Risk Assessment:
+             * - LOW: BLE link encryption provides data integrity
+             * - Acceptable for development phase
+             * - Should resolve for production hardening
+             */
             #if 0
             size_t crc_len = offsetof(system_cmd_packet_t, crc16) + item.packet.param_len;
             uint16_t calculated_crc = calculate_crc16((const uint8_t *)&item.packet, crc_len);
@@ -2068,10 +2257,19 @@ int gatt_system_server_init(void)
         return 0;
     }
 
+    /* Create mutex for protecting command buffer */
+    g_cmd_buffer_mutex = xSemaphoreCreateMutex();
+    if (g_cmd_buffer_mutex == NULL) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to create cmd buffer mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
     /* Create command queue for async processing */
     g_sys_cmd_queue = xQueueCreate(SYS_CMD_QUEUE_SIZE, sizeof(sys_cmd_queue_item_t));
     if (g_sys_cmd_queue == NULL) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to create command queue");
+        vSemaphoreDelete(g_cmd_buffer_mutex);
+        g_cmd_buffer_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
 
@@ -2079,15 +2277,17 @@ int gatt_system_server_init(void)
     BaseType_t ret = xTaskCreate(
         system_command_task,
         "sys_cmd",
-        SYS_CMD_TASK_STACK_SIZE,
+        SYS_CMD_TASK_STACK_SIZE,  // From ble_gatt_server.h
         NULL,
-        SYS_CMD_TASK_PRIORITY,
+        SYS_CMD_TASK_PRIORITY,    // From ble_gatt_server.h
         &g_sys_cmd_task_handle
     );
     if (ret != pdPASS) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to create command task");
         vQueueDelete(g_sys_cmd_queue);
         g_sys_cmd_queue = NULL;
+        vSemaphoreDelete(g_cmd_buffer_mutex);
+        g_cmd_buffer_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
 

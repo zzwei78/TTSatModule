@@ -100,6 +100,9 @@ static TaskHandle_t g_decode_task_handle = NULL;
 /* Auto-detected frames per AT command (updated from downlink pattern) */
 static volatile uint8_t g_frames_per_cmd = 1;
 
+/* Manual frame mode lock: when true, downlink auto-detection is disabled */
+static volatile bool g_frame_mode_manual = false;
+
 /**
  * @brief 20ms Timer Callback for Decode (ISR context)
  *
@@ -166,8 +169,8 @@ static void voice_decode_task(void *pvParameters)
             g_voice_stats.downlink_packets_total++;
 
             SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
-                           "[Tick #%u] Processing packet (%u bytes) [%s]",
-                           g_20ms_stats.total_ticks, raw_data.data_len, (char *)raw_data.data);
+                           "[Tick #%u] Processing packet (%u bytes)",
+                           g_20ms_stats.total_ticks, raw_data.data_len);
 
             /* Validate AT command format: AT^AUDPCM="base64_data" */
             if (raw_data.data_len < prefix_len + suffix_len + 1) {
@@ -216,10 +219,10 @@ static void voice_decode_task(void *pvParameters)
                 continue;
             }
 
-            /* Update uplink mode to match downlink pattern */
-            if (g_frames_per_cmd != frame_count) {
+            /* Update uplink mode to match downlink pattern (auto-detect) */
+            if (!g_frame_mode_manual && g_frames_per_cmd != frame_count) {
                 SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
-                    "Frame mode changed: %d -> %d frames/AT", g_frames_per_cmd, frame_count);
+                    "Frame mode auto-detected: %d -> %d frames/AT", g_frames_per_cmd, frame_count);
                 g_frames_per_cmd = frame_count;
             }
 
@@ -757,4 +760,25 @@ int voice_downlink_enqueue(uint8_t *data, size_t data_len)
 
     SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Downlink packet enqueued: %d bytes", data_len);
     return 0;
+}
+
+int voice_packet_set_frame_mode(uint8_t frames)
+{
+    if (frames != 1 && frames != 3) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+            "Invalid frame mode: %d (must be 1 or 3)", frames);
+        return -1;
+    }
+
+    g_frames_per_cmd = frames;
+    g_frame_mode_manual = true;
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+        "Uplink frame mode set to %d frames/AT (manual, auto-detect disabled)", frames);
+    return 0;
+}
+
+uint8_t voice_packet_get_frame_mode(void)
+{
+    return g_frames_per_cmd;
 }

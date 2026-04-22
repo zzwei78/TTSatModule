@@ -95,4 +95,19 @@ void voice_tasks_stop(void);
  */
 int voice_downlink_enqueue(uint8_t *data, size_t data_len);
 
+/**
+ * @brief Set uplink voice frame mode (1 or 3 frames per AT command)
+ *
+ * @param frames 1 for single-frame mode, 3 for triple-frame mode
+ * @return 0 on success, -1 on error
+ */
+int voice_packet_set_frame_mode(uint8_t frames);
+
+/**
+ * @brief Get current uplink voice frame mode
+ *
+ * @return Current frames per AT command (1 or 3)
+ */
+uint8_t voice_packet_get_frame_mode(void);
+
 #endif /* VOICE_PACKET_HANDLER_H */

@@ -15,32 +15,46 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "ble/spp_voice_server.h"
+#include "ble/ble_gatt_server.h"
 #include "audio/voice_packet_handler.h"
 #include "audio/audiosvc.h"
 #include "tt/gsm0710_manager.h"
 #include "system/syslog.h"
 
 /* GATT Voice Loopback Test Mode */
-//#define CONFIG_VOICE_GATT_LOOPBACK  // Uncomment to enable GATT loopback test
+// #define CONFIG_VOICE_GATT_LOOPBACK  // Uncomment to enable GATT loopback test
 
 static const char *TAG = "SPP_VOICE_SERVER";
 
-/* Service enabled flag */
-static bool g_voice_service_enabled = true;
-
-/* Service registration flag */
-static bool g_voice_service_registered = false;
-
-/* Current active connection handle for voice data */
-static uint16_t g_voice_active_conn_handle = 0;
-
-/* SPP Voice Service characteristic value handle */
-static uint16_t spp_voice_val_handle = 0;
-
 /* Static buffer for voice data - avoids repeated malloc/free */
-#define SPP_VOICE_MAX_DATA_SIZE 256
+#define SPP_VOICE_MAX_DATA_SIZE VOICE_BUFFER_SIZE  // Use constant from ble_gatt_server.h
 
-static uint8_t g_spp_voice_buffer[SPP_VOICE_MAX_DATA_SIZE];
+/* Voice server context - encapsulates all global state */
+typedef struct {
+    bool initialized;
+    bool enabled;
+    bool registered;
+    uint16_t active_conn_handle;
+    uint16_t val_handle;
+    uint8_t data_buffer[SPP_VOICE_MAX_DATA_SIZE];
+} voice_server_context_t;
+
+static voice_server_context_t g_voice_server = {
+    .initialized = false,
+    .enabled = true,
+    .registered = false,
+    .active_conn_handle = 0,
+    .val_handle = 0,
+};
+
+/* Initialization check macro */
+#define VOICE_SERVER_CHECK_INIT() \
+    do { \
+        if (!g_voice_server.initialized) { \
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice server not initialized"); \
+            return ESP_ERR_INVALID_STATE; \
+        } \
+    } while(0)
 
 /**
  * @brief Voice data output callback (called by voice_packet_handler)
@@ -57,13 +71,13 @@ static void spp_voice_output_callback(const uint8_t *data, size_t len, void *use
     }
 
     // Check if voice service is enabled
-    if (!g_voice_service_enabled) {
+    if (!g_voice_server.enabled) {
         SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice service disabled, data dropped");
         return;
     }
 
     // Check if we have an active connection
-    if (g_voice_active_conn_handle == 0) {
+    if (g_voice_server.active_conn_handle == 0) {
         SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "No active voice connection, data dropped");
         return;
     }
@@ -71,7 +85,7 @@ static void spp_voice_output_callback(const uint8_t *data, size_t len, void *use
     SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Sending voice data to BLE: %d bytes", len);
 
     // Send to BLE GATT
-    spp_voice_server_send(g_voice_active_conn_handle, data, len);
+    spp_voice_server_send(g_voice_server.active_conn_handle, data, len);
 }
 
 /**
@@ -159,7 +173,7 @@ static void spp_voice_mux9_callback(const uint8_t *data, size_t len, void *user_
     }
 
     // Check if voice service is enabled (important: drop data if service disabled)
-    if (!g_voice_service_enabled) {
+    if (!g_voice_server.enabled) {
         // Voice service disabled, drop data without logging (too verbose during call teardown)
         return;
     }
@@ -178,6 +192,11 @@ static void spp_voice_mux9_callback(const uint8_t *data, size_t len, void *user_
     // Calculate number of complete frames (discard incomplete frames)
     size_t complete_frames = len / audio_frame_size;
     size_t remainder = len % audio_frame_size;
+
+    /* Debug: always log MUX9 received size to diagnose 3-frame mode */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+        "MUX9: Received %d bytes (%d complete frames, %d remainder)",
+        len, complete_frames, remainder);
 
     if (complete_frames == 0) {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
@@ -224,7 +243,7 @@ static int spp_voice_service_handler(uint16_t conn_handle, uint16_t attr_handle,
                                      struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     // Check if service is enabled
-    if (!g_voice_service_enabled) {
+    if (!g_voice_server.enabled) {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice service is disabled");
         return BLE_ATT_ERR_READ_NOT_PERMITTED;
     }
@@ -248,10 +267,10 @@ static int spp_voice_service_handler(uint16_t conn_handle, uint16_t attr_handle,
             }
 
             /* Save active connection handle for responses */
-            g_voice_active_conn_handle = conn_handle;
+            g_voice_server.active_conn_handle = conn_handle;
 
             /* Copy data to static buffer */
-            int rc = ble_hs_mbuf_to_flat(ctxt->om, g_spp_voice_buffer,
+            int rc = ble_hs_mbuf_to_flat(ctxt->om, g_voice_server.data_buffer,
                                         SPP_VOICE_MAX_DATA_SIZE, NULL);
             if (rc != 0) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Failed to copy voice data: %d", rc);
@@ -265,7 +284,7 @@ static int spp_voice_service_handler(uint16_t conn_handle, uint16_t attr_handle,
              * 3. AMRNB decode
              * 4. Send PCM to MUX channel 9
              */
-            int ret = voice_downlink_enqueue(g_spp_voice_buffer, data_len);
+            int ret = voice_downlink_enqueue(g_voice_server.data_buffer, data_len);
             if (ret != 0) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Failed to enqueue voice packet: %d", ret);
             }
@@ -291,7 +310,7 @@ static const struct ble_gatt_svc_def spp_voice_service_defs[] = {
                 /* Voice Data Characteristic */
                 .uuid = BLE_UUID16_DECLARE(BLE_SVC_SPP_VOICE_CHR_UUID16),
                 .access_cb = spp_voice_service_handler,
-                .val_handle = &spp_voice_val_handle,
+                .val_handle = &g_voice_server.val_handle,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_NOTIFY,
             }, {
                 0, /* No more characteristics */
@@ -354,7 +373,8 @@ int spp_voice_server_init(void)
         SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Failed to add SPP Voice service: rc=%d", rc);
         return rc;
     }
-    g_voice_service_registered = true;
+    g_voice_server.registered = true;
+    g_voice_server.initialized = true;
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "SPP Voice server initialized (service registered)");
     return 0;
@@ -363,20 +383,16 @@ int spp_voice_server_init(void)
 /* Send voice data to BLE client */
 int spp_voice_server_send(uint16_t conn_handle, const uint8_t *data, uint16_t len)
 {
+    VOICE_SERVER_CHECK_INIT();
+
     if (!data || len == 0) {
         return BLE_HS_EINVAL;
     }
 
-    struct os_mbuf *txom = ble_hs_mbuf_from_flat(data, len);
-    if (!txom) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Failed to allocate mbuf");
-        return BLE_HS_ENOMEM;
-    }
-
-    int rc = ble_gatts_notify_custom(conn_handle, spp_voice_val_handle, txom);
+    // Use safe wrapper that ensures mbuf is always freed
+    int rc = ble_gatts_send_safe_notify(conn_handle, g_voice_server.val_handle, data, len);
     if (rc != 0) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Failed to send notification: rc=%d", rc);
-        os_mbuf_free(txom);
         return rc;
     }
 
@@ -387,7 +403,8 @@ int spp_voice_server_send(uint16_t conn_handle, const uint8_t *data, uint16_t le
 /* Get characteristic value handle */
 uint16_t spp_voice_server_get_val_handle(void)
 {
-    return spp_voice_val_handle;
+    VOICE_SERVER_CHECK_INIT();
+    return g_voice_server.val_handle;
 }
 
 /**
@@ -397,10 +414,10 @@ void spp_voice_server_enable(void)
 {
     int rc;
 
-    g_voice_service_enabled = true;
+    g_voice_server.enabled = true;
 
     /* Request low-latency connection parameters for voice */
-    if (g_voice_active_conn_handle != 0) {
+    if (g_voice_server.active_conn_handle != 0) {
         struct ble_gap_upd_params params = {
             .itvl_min = 14,
             .itvl_max = 16,
@@ -409,7 +426,7 @@ void spp_voice_server_enable(void)
             .min_ce_len = 0,
             .max_ce_len = 0,
         };
-        rc = ble_gap_update_params(g_voice_active_conn_handle, &params);
+        rc = ble_gap_update_params(g_voice_server.active_conn_handle, &params);
         if (rc == 0) {
             SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice enabled: requested low-latency parameters (itvl=14-16)");
         } else {
@@ -427,10 +444,10 @@ void spp_voice_server_disable(void)
 {
     int rc;
 
-    g_voice_service_enabled = false;
+    g_voice_server.enabled = false;
 
     /* Restore default connection parameters */
-    if (g_voice_active_conn_handle != 0) {
+    if (g_voice_server.active_conn_handle != 0) {
         struct ble_gap_upd_params params = {
             .itvl_min = 24,          /* 30ms (default) */
             .itvl_max = 40,          /* 50ms (default) */
@@ -439,7 +456,7 @@ void spp_voice_server_disable(void)
             .min_ce_len = 0,
             .max_ce_len = 0,
         };
-        rc = ble_gap_update_params(g_voice_active_conn_handle, &params);
+        rc = ble_gap_update_params(g_voice_server.active_conn_handle, &params);
         if (rc == 0) {
             SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice disabled: restored default parameters (itvl=24-40)");
         } else {
@@ -455,7 +472,7 @@ void spp_voice_server_disable(void)
  */
 bool spp_voice_server_is_enabled(void)
 {
-    return g_voice_service_enabled;
+    return g_voice_server.enabled;
 }
 
 /**
@@ -467,13 +484,13 @@ bool spp_voice_server_is_enabled(void)
 void spp_voice_server_cleanup_on_disconnect(uint16_t conn_handle)
 {
     // Only clear if this is the active connection
-    if (g_voice_active_conn_handle == conn_handle) {
+    if (g_voice_server.active_conn_handle == conn_handle) {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
             "Cleaning up voice server state (conn_handle=%d)", conn_handle);
-        g_voice_active_conn_handle = 0;
-    } else if (g_voice_active_conn_handle != 0) {
+        g_voice_server.active_conn_handle = 0;
+    } else if (g_voice_server.active_conn_handle != 0) {
         SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
             "Disconnect conn_handle=%d does not match active voice connection=%d, not clearing",
-            conn_handle, g_voice_active_conn_handle);
+            conn_handle, g_voice_server.active_conn_handle);
     }
 }

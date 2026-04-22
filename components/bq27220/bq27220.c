@@ -5,6 +5,7 @@
  */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "bq27220.h"
@@ -18,7 +19,9 @@ static const char *TAG = "bq27220";
 // device id
 #define BQ27220_DEVICE_ID 0x0220
 
-#define I2C_MASTER_FREQ_HZ          400000
+#define I2C_MASTER_FREQ_HZ          200000
+#define BQ27220_READ_RETRIES        3
+#define BQ27220_READ_RETRY_DELAY_MS 5
 #define delay_ms(x) vTaskDelay(pdMS_TO_TICKS(x))
 
 #define WAIT_OPERATION_DONE(handle, condition) do { \
@@ -42,6 +45,7 @@ static const char *TAG = "bq27220";
 
 typedef struct {
     i2c_master_dev_handle_t i2c_device_handle;
+    SemaphoreHandle_t mutex;
 } bq27220_data_t;
 
 
@@ -71,8 +75,32 @@ static uint16_t bq27220_read_u16(bq27220_handle_t bq_handle, uint8_t address)
     bq27220_data_t *bq_data = (bq27220_data_t *)bq_handle;
     uint16_t buf = 0;
 
-    esp_err_t res = bq27220_i2c_read(bq_data->i2c_device_handle, address, 2, (uint8_t *)&buf);
-    PRINT_ERROR(res);
+    if (bq_data->mutex) {
+        xSemaphoreTake(bq_data->mutex, pdMS_TO_TICKS(200));
+    }
+
+    esp_err_t res = ESP_FAIL;
+    for (int i = 0; i < BQ27220_READ_RETRIES; i++) {
+        buf = 0;
+        res = bq27220_i2c_read(bq_data->i2c_device_handle, address, 2, (uint8_t *)&buf);
+        if (res == ESP_OK) {
+            break;
+        }
+        if (i < BQ27220_READ_RETRIES - 1) {
+            ESP_LOGW(TAG, "I2C read reg 0x%02X failed (attempt %d/%d), retrying...",
+                     address, i + 1, BQ27220_READ_RETRIES);
+            delay_ms(BQ27220_READ_RETRY_DELAY_MS);
+        }
+    }
+
+    if (res != ESP_OK) {
+        PRINT_ERROR(res);
+    }
+
+    if (bq_data->mutex) {
+        xSemaphoreGive(bq_data->mutex);
+    }
+
     return buf;
 }
 
@@ -217,6 +245,13 @@ bq27220_handle_t bq27220_create(const bq27220_config_t *config)
         return NULL;
     }
 
+    handle->mutex = xSemaphoreCreateMutex();
+    if (handle->mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutex");
+        free(handle);
+        return NULL;
+    }
+
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = BQ27220_I2C_ADDRESS,
@@ -301,6 +336,9 @@ err:
     if (handle->i2c_device_handle) {
         i2c_master_bus_rm_device(handle->i2c_device_handle);
     }
+    if (handle->mutex) {
+        vSemaphoreDelete(handle->mutex);
+    }
     free(handle);
     return NULL;
 }
@@ -312,6 +350,9 @@ esp_err_t bq27220_delete(bq27220_handle_t bq_handle)
 
     if (bq_data->i2c_device_handle) {
         ESP_RETURN_ON_ERROR(i2c_master_bus_rm_device(bq_data->i2c_device_handle), TAG, "Failed to delete i2c device");
+    }
+    if (bq_data->mutex) {
+        vSemaphoreDelete(bq_data->mutex);
     }
     free(bq_handle);
     return ESP_OK;
