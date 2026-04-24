@@ -17,16 +17,14 @@
 #include "tt/tt_module.h"
 #include "tt/gsm0710_manager.h"
 #include "ble/spp_at_server.h"
+#include "ble/ble_gatt_server.h"
 #include "audio/voice_packet_handler.h"
 #include "system/syslog.h"
 
 static const char *TAG = "SPP_AT_SERVER";
 
 /* AT command queue configuration */
-#define SPP_AT_MAX_CMD_SIZE       256
-#define SPP_AT_CMD_QUEUE_SIZE     4
-#define SPP_AT_TASK_STACK_SIZE    8192   // Increased from 4096 to handle both command and response queues
-#define SPP_AT_TASK_PRIORITY      5
+/* Note: Constants are now defined in ble_gatt_server.h */
 
 /* AT command queue item */
 typedef struct {
@@ -37,7 +35,7 @@ typedef struct {
 
 /* AT response queue item (for async sending from uart_rx_task) */
 typedef struct {
-    uint8_t data[512];  // Larger buffer for responses
+    uint8_t data[SPP_AT_RESP_BUFFER_SIZE];  // Larger buffer for responses
     size_t len;
     uint16_t conn_handle;
 } __attribute__((packed)) spp_at_resp_item_t;
@@ -72,8 +70,8 @@ static void spp_at_cmd_task(void *pvParameters)
         // This ensures responses are sent immediately even when commands arrive continuously
         bool processed = false;
 
-        // Try response queue FIRST (timeout 10ms)
-        if (xQueueReceive(g_spp_at_resp_queue, &resp_item, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // Try response queue FIRST (timeout QUEUE_TIMEOUT_SHORT_MS)
+        if (xQueueReceive(g_spp_at_resp_queue, &resp_item, pdMS_TO_TICKS(QUEUE_TIMEOUT_SHORT_MS)) == pdTRUE) {
             // Send response via BLE (this is safe now, we're in low-priority task)
             int rc = spp_at_server_send_response(resp_item.conn_handle, resp_item.data, resp_item.len);
             if (rc != 0) {
@@ -82,8 +80,8 @@ static void spp_at_cmd_task(void *pvParameters)
             processed = true;
         }
 
-        // Then try command queue (timeout 10ms)
-        if (xQueueReceive(g_spp_at_cmd_queue, &cmd_item, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // Then try command queue (timeout QUEUE_TIMEOUT_SHORT_MS)
+        if (xQueueReceive(g_spp_at_cmd_queue, &cmd_item, pdMS_TO_TICKS(QUEUE_TIMEOUT_SHORT_MS)) == pdTRUE) {
             // Ensure null termination
             char *cmd_str = (char *)cmd_item.data;
             size_t cmd_len = cmd_item.len;
@@ -183,18 +181,12 @@ int spp_at_server_send_response(uint16_t conn_handle, const uint8_t *data, uint1
         return BLE_HS_EINVAL;
     }
 
-    struct os_mbuf *txom = ble_hs_mbuf_from_flat(data, len);
-    if (!txom) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_SPP_AT, TAG, "Failed to allocate mbuf");
-        return BLE_HS_ENOMEM;
-    }
-
-    int rc = ble_gatts_notify_custom(conn_handle, spp_at_service_val_handle, txom);
+    // Use safe wrapper that ensures mbuf is always freed
+    int rc = ble_gatts_send_safe_notify(conn_handle, spp_at_service_val_handle, data, len);
     if (rc != 0) {
         // Change to DEBUG level - this is normal if client hasn't subscribed
         // Common error: BLE_HS_EDONE (client not subscribed)
         SYS_LOGD_MODULE(SYS_LOG_MODULE_SPP_AT, TAG, "Failed to send notification (client may not be subscribed): rc=%d", rc);
-        os_mbuf_free(txom);
         return rc;
     }
 

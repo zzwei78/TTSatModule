@@ -112,6 +112,10 @@ struct gsm0710_context
     /* Frame buffer for gsm0710_write_frame - static allocation for thread safety */
     char    frame_buffer[GSM0710_FRAME_BUFFER_SIZE];
 
+    /* Test command/response buffers - static allocation for thread safety */
+    char    test_resp_buffer[128];
+    char    test_cmd_buffer[128];
+
     /* Hooks to upper layers */
     void   *user_data;
     int     fd;

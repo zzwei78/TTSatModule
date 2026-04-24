@@ -26,11 +26,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* GSM0710 Protocol Constants */
+#define GSM0710_MIN_PACKET_LEN           2
+#define GSM0710_STATUS_RESP_MAX_SIZE    33
+#define GSM0710_STATUS_PAYLOAD_MAX      31
+#define GSM0710_MAX_FRAME_SIZE          256
+#define GSM0710_FLAG_BYTE_SIZE          2
+#define GSM0710_CRC_SIZE                2
+
+/* Timeout constants */
+#define GSM0710_MUTEX_TIMEOUT_MS        100
+#define GSM0710_RESP_TIMEOUT_MS         5000
+
+/* Static test command buffer (replaces VLA) */
+#define GSM0710_TEST_DATA_BUFFER_SIZE   128
+
 /* Create a GSM 07.10 context and initialize in preparation for startup */
 struct gsm0710_context* gsm0710_context_new()
 {
     struct gsm0710_context* ctx;
     ctx = malloc( sizeof( struct gsm0710_context ) );
+    if ( ctx == NULL ) {
+        return NULL;
+    }
+
+    /* Initialize all buffers to prevent information leakage and undefined behavior */
+    memset(ctx->buffer, 0, GSM0710_BUFFER_SIZE);
+    memset(ctx->frame_buffer, 0, GSM0710_FRAME_BUFFER_SIZE);
+    memset(ctx->test_resp_buffer, 0, sizeof(ctx->test_resp_buffer));
+    memset(ctx->test_cmd_buffer, 0, sizeof(ctx->test_cmd_buffer));
+
     ctx->mode = GSM0710_MODE_BASIC;
     ctx->frame_size = GSM0710_DEFAULT_FRAME_SIZE;
     ctx->port_speed = 115200;
@@ -319,7 +344,15 @@ gsm0710_packet( struct gsm0710_context *ctx, int channel, int type, const char *
             {
                 /* Test command from other side - send the same bytes back */
                 gsm0710_debug( ctx, "received test command, sending response" );
-                char *resp = ( char * )alloca( len );
+
+                /* Use context buffer for thread safety */
+                char *resp = ctx->test_resp_buffer;
+
+                /* Safety check: ensure data fits in buffer */
+                if (len > GSM0710_TEST_DATA_BUFFER_SIZE) {
+                    gsm0710_debug(ctx, "test command too large, truncating");
+                    len = GSM0710_TEST_DATA_BUFFER_SIZE;
+                }
 
                 memcpy( resp, data, len );
                 resp[0] = ( char )0x41; /* Clear the C/R bit in the response */
@@ -338,7 +371,7 @@ gsm0710_packet( struct gsm0710_context *ctx, int channel, int type, const char *
     {
 
         /* Status change message */
-        if ( len >= 2 )
+        if ( len >= GSM0710_MIN_PACKET_LEN )
         {
             /* Handle status changes on other channels */
             int original_channel = channel;  // Save original channel
@@ -354,17 +387,17 @@ gsm0710_packet( struct gsm0710_context *ctx, int channel, int type, const char *
         }
 
         /* Send the response to the status change request to ACK it */
-        char resp[33];
+        char resp[GSM0710_STATUS_RESP_MAX_SIZE];
 
-        if ( len > 31 )
+        if ( len > GSM0710_STATUS_PAYLOAD_MAX )
         {
-            len = 31;
+            len = GSM0710_STATUS_PAYLOAD_MAX;
         }
 
         resp[0] = ( char )GSM0710_STATUS_ACK;
         resp[1] = ( char )( ( len << 1 ) | 0x01 );
         memcpy( resp + 2, data, len );
-        gsm0710_write_frame( ctx, 0, GSM0710_DATA, resp, len + 2 );
+        gsm0710_write_frame( ctx, 0, GSM0710_DATA, resp, len + GSM0710_FLAG_BYTE_SIZE );
 
     }
     else if ( type == ( 0x3F & 0xEF ) )
@@ -733,10 +766,18 @@ void gsm0710_send_test( struct gsm0710_context *ctx, const void *testdata, int l
         gsm0710_debug( ctx, "*** GSM 07.10 truncating test command ***" );
         len = ctx->frame_size - 4;
     }
-    char data[len + 2];
 
-    data[0] = ( char )GSM0710_CMD_TEST | GSM0710_CR | GSM0710_EA;
-    data[1] = ( char )GSM0710_EA | ( len << 1 );
-    memcpy( &data[2], testdata, len );
-    gsm0710_write_frame( ctx, 0, GSM0710_DATA, data, len + 2 );
+    /* Use context buffer for thread safety */
+    char *cmd = ctx->test_cmd_buffer;
+
+    /* Safety check: ensure data fits in buffer (including 2-byte header) */
+    if (len + 2 > GSM0710_TEST_DATA_BUFFER_SIZE) {
+        gsm0710_debug(ctx, "*** GSM 07.10 test command too large, truncating ***");
+        len = GSM0710_TEST_DATA_BUFFER_SIZE - 2;
+    }
+
+    cmd[0] = ( char )GSM0710_CMD_TEST | GSM0710_CR | GSM0710_EA;
+    cmd[1] = ( char )GSM0710_EA | ( len << 1 );
+    memcpy( &cmd[2], testdata, len );
+    gsm0710_write_frame( ctx, 0, GSM0710_DATA, cmd, len + 2 );
 }

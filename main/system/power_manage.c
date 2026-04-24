@@ -20,7 +20,7 @@
 static const char *TAG = "POWER_MANAGE";
 
 /* I2C bus handle */
-static __attribute__((unused)) i2c_master_bus_handle_t g_i2c_bus_handle = NULL;
+static i2c_master_bus_handle_t g_i2c_bus_handle = NULL;
 
 /* IP5561 device handle (Charging management) */
 static ip5561_handle_t g_ip5561_handle = NULL;
@@ -30,7 +30,7 @@ static bq27220_handle_t g_bq27220_handle = NULL;
 
 /* Monitor task handles */
 static TaskHandle_t g_ip5561_task_handle = NULL;
-static __attribute__((unused)) TaskHandle_t g_bq27220_task_handle = NULL;
+static TaskHandle_t g_bq27220_task_handle = NULL;
 
 /* Monitor task running flags */
 static bool g_ip5561_task_running = false;
@@ -286,6 +286,49 @@ static void __attribute__((unused)) ip5561_monitor_task(void *pvParameters)
  */
 
 /**
+ * @brief Apply IR (Internal Resistance) compensation to battery voltage
+ *
+ * When charging, the terminal voltage is higher than the actual battery voltage
+ * due to internal resistance (IR drop). This function compensates for this effect
+ * to provide a more accurate representation of the battery's true state.
+ *
+ * Calculation:
+ * - If charging: V_comp = V_term - (|I_chg| × R_internal)
+ * - If discharging: V_comp = V_term (no compensation)
+ *
+ * @param voltage_mv Measured voltage in mV
+ * @param current_ma Current in mA (negative for charging)
+ * @param is_charging Output parameter: true if charging, false if discharging
+ * @return Compensated voltage in mV
+ */
+static uint16_t apply_ir_compensation(uint16_t voltage_mv, int16_t current_ma, bool *is_charging)
+{
+    uint32_t ir_drop = 0;
+
+    /* Determine charging state based on current */
+    if (current_ma < -200) {
+        /* Clearly charging: current < -200mA */
+        *is_charging = true;
+        ir_drop = ((-current_ma) * POWER_MANAGE_BATT_INTERNAL_R_MOHM) / 1000;
+    } else if (current_ma > 200) {
+        /* Clearly discharging: current > 200mA */
+        *is_charging = false;
+        ir_drop = 0;
+    } else {
+        /* Small current zone: assume discharging (conservative) */
+        *is_charging = false;
+        ir_drop = 0;
+    }
+
+    /* Limit IR compensation to prevent over-compensation */
+    if (ir_drop > POWER_MANAGE_MAX_IR_COMP_MV) {
+        ir_drop = POWER_MANAGE_MAX_IR_COMP_MV;
+    }
+
+    return voltage_mv - ir_drop;
+}
+
+/**
  * @brief Get compensated battery voltage for TT module power decision
  *
  * This function implements a hybrid approach to determine the "true" battery voltage:
@@ -414,29 +457,15 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
     }
 
     /* ========== Step 4: Apply IR compensation if charging ========== */
-    *decision_voltage = voltage;
+    *decision_voltage = apply_ir_compensation(voltage, current, is_charging);
 
-    if (*is_charging && current < 0) {
-        /* Calculate IR voltage drop compensation
-         * V_real = V_terminal - I_charging × R_internal
-         * Note: current is negative during charging, so we use absolute value
-         */
-        uint32_t ir_drop = ((-current) * POWER_MANAGE_BATT_INTERNAL_R_MOHM) / 1000;
-
-        /* Limit compensation to prevent over-compensation */
-        if (ir_drop > POWER_MANAGE_MAX_IR_COMP_MV) {
-            ir_drop = POWER_MANAGE_MAX_IR_COMP_MV;
-        }
-
-        *decision_voltage = voltage - ir_drop;
-
+    if (*is_charging) {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "Charging IR compensation: V_term=%umV, I_chg=%dmA, IR_drop=%umV → V_comp=%umV",
-            voltage, current, ir_drop, *decision_voltage);
+            "Charging IR compensation: V_term=%umV, I_chg=%dmA → V_comp=%umV",
+            voltage, current, *decision_voltage);
     } else {
-        /* Discharging - use terminal voltage directly (no compensation needed) */
         SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "Discharging: V_term=%umV, I_load=%dmA", voltage, current);
+            "Discharging: V_term=%umV (no IR compensation)", voltage);
     }
 
     return ESP_OK;
@@ -1574,8 +1603,12 @@ esp_err_t power_manage_ip5561_print_diagnostics(void)
     /* Read IBAT (battery charging current) - KEY INDICATOR! */
     if (g_ip5561_handle != NULL) {
         int16_t ibat_current = ip5561_get_battery_current(g_ip5561_handle);
-        /* IBAT ADC scaling: raw value (not calibrated) */
-        /* TODO: Apply proper ADC scaling factor based on datasheet */
+        /*
+         * IBAT ADC scaling: IP5561 provides signed 16-bit ADC value
+         * LSB = 1.0 mA per IP5561 datasheet
+         * Positive value = charging, Negative value = discharging
+         * Conversion already applied in ip5561_get_battery_current()
+         */
         int16_t ibat_ma = ibat_current;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
             "IBAT_ADC: %d mA (raw: %d)",
@@ -1738,37 +1771,14 @@ esp_err_t power_manage_get_calibrated_soc(uint16_t *soc_percent)
     uint16_t voltage_mv = bq27220_get_voltage(battery_handle);
     int16_t current_ma = bq27220_get_current(battery_handle);
 
-    // Get battery status to determine charging state
-    battery_status_t bat_status;
+    // Use apply_ir_compensation to get V_comp
     bool is_charging = false;
+    uint16_t v_comp_mv = apply_ir_compensation(voltage_mv, current_ma, &is_charging);
 
-    if (bq27220_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
-        // Determine charging state based on current
-        // BQ27220: Negative current = charging, Positive current = discharging
-        is_charging = (current_ma < -200) ? true :
-                      (current_ma > 200) ? false :
-                      !bat_status.DSG;
-    }
-
-    // Calculate compensated voltage for SOC calculation
-    // When charging, compensate for IR drop: V_comp = V_term - I_chg × R_internal
-    uint16_t v_comp_mv = voltage_mv;
-
-    if (is_charging && current_ma < 0) {
-        // Calculate IR voltage drop compensation
-        // Use same constants as power_manage module
-        uint32_t ir_drop = ((-current_ma) * POWER_MANAGE_BATT_INTERNAL_R_MOHM) / 1000;
-
-        // Limit compensation to prevent over-compensation
-        if (ir_drop > POWER_MANAGE_MAX_IR_COMP_MV) {
-            ir_drop = POWER_MANAGE_MAX_IR_COMP_MV;
-        }
-
-        v_comp_mv = voltage_mv - ir_drop;
-
+    if (is_charging) {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "Battery SOC calibration: V_term=%umV, I_chg=%dmA, IR_drop=%umV → V_comp=%umV",
-            voltage_mv, current_ma, ir_drop, v_comp_mv);
+            "Battery SOC calibration: V_term=%umV, I_chg=%dmA → V_comp=%umV",
+            voltage_mv, current_ma, v_comp_mv);
     }
 
     // Calculate SOC based on compensated voltage
@@ -1857,34 +1867,21 @@ esp_err_t power_manage_get_battery_voltage_compensated(uint16_t *voltage_mv, boo
         }
     }
 
-    /* Apply IR compensation if charging
-     * V_real = V_terminal - I_charging × R_internal
-     * Note: current is negative during charging, so we use absolute value
-     */
-    uint16_t v_comp = voltage;
+    /* Use apply_ir_compensation for consistency */
+    bool charging_state;
+    uint16_t v_comp = apply_ir_compensation(voltage, current, &charging_state);
 
-    if (charging && current < 0) {
-        /* Calculate IR voltage drop compensation */
-        uint32_t ir_drop = ((-current) * POWER_MANAGE_BATT_INTERNAL_R_MOHM) / 1000;
-
-        /* Limit compensation to prevent over-compensation */
-        if (ir_drop > POWER_MANAGE_MAX_IR_COMP_MV) {
-            ir_drop = POWER_MANAGE_MAX_IR_COMP_MV;
-        }
-
-        v_comp = voltage - ir_drop;
-
+    if (charging_state) {
         SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "V_comp: V_term=%umV, I_chg=%dmA, IR_drop=%umV → V_comp=%umV",
-            voltage, current, ir_drop, v_comp);
+            "V_comp: V_term=%umV, I_chg=%dmA → V_comp=%umV",
+            voltage, current, v_comp);
     } else {
         SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "V_comp: V_term=%umV (no IR compensation, charging=%d)",
-            voltage, charging);
+            "V_comp: V_term=%umV (no IR compensation)", voltage);
     }
 
     *voltage_mv = v_comp;
-    *is_charging = charging;
+    *is_charging = charging_state;
 
     return ESP_OK;
 }

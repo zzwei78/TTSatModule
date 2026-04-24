@@ -22,7 +22,7 @@ extern "C" {
 #define FIRMWARE_BUILD_TIME        __TIME__
 
 /* Version String */
-#define FIRMWARE_VERSION_STRING    "1.1.6"
+#define FIRMWARE_VERSION_STRING    "1.1.7"
 
 /* Product Information */
 #define PRODUCT_MANUFACTURER       "TTCat"

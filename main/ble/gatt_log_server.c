@@ -14,6 +14,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "ble/gatt_log_server.h"
+#include "ble/ble_gatt_server.h"
 #include "system/syslog.h"
 
 static const char *TAG = "GATT_LOG_SERVER";
@@ -78,16 +79,10 @@ int gatt_log_server_send_log(uint16_t conn_handle, syslog_level_t level, const c
 
     size_t packet_len = log_len + 2; // Level(1) + log content + null terminator(1)
 
-    struct os_mbuf *txom = ble_hs_mbuf_from_flat(log_packet, packet_len);
-    if (!txom) {
-        ESP_LOGE(TAG, "Failed to allocate mbuf for log");
-        return BLE_HS_ENOMEM;
-    }
-
-    int rc = ble_gatts_notify_custom(conn_handle, log_service_val_handle, txom);
+    // Use safe wrapper that ensures mbuf is always freed
+    int rc = ble_gatts_send_safe_notify(conn_handle, log_service_val_handle, log_packet, packet_len);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to send log notification: rc=%d", rc);
-        os_mbuf_free(txom);
         return rc;
     }
 

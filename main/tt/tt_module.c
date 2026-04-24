@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "driver/uart.h"
 #include "tt/tt_module.h"
 #include "tt/tt_hardware.h"
@@ -279,21 +280,19 @@ static void handle_simst_detection(const char *found_simst,
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "TT module ready (^SIMST: detected), AT commands now allowed");
 
-    // If SIM is ready (^SIMST: 1), trigger MUX initialization
+    // Notify MUX init task or create one if not running
     if (sim_ready) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "SIM ready! Triggering MUX initialization...");
-
-        // Check if MUX init task is already running
         if (g_mux_init_task_handle == NULL) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Creating MUX initialization task...");
+            // Task not running (e.g., previous attempt exited after baud rate failure)
+            // Create a new mux init task
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "SIM ready! Creating new MUX init task...");
             if (xTaskCreate(tt_mux_init_task, "tt_mux_init_task", 8192, NULL, 8, &g_mux_init_task_handle) != pdPASS) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to create MUX initialization task");
             } else {
-                // Give semaphore to unblock the newly created task
                 xSemaphoreGive(g_simst_sem);
             }
         } else {
-            // Task already exists, give semaphore to proceed
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "SIM ready! Notifying existing MUX init task...");
             xSemaphoreGive(g_simst_sem);
         }
     } else {
@@ -405,27 +404,94 @@ static void uart_at_rx_task(void *pvParameters)
  * This task waits for SIMST:1 detection, sends AT command to enter MUX mode,
  * and starts the GSM0710 MUX module.
  */
+/**
+ * @brief MUX Initialization Task
+ *
+ * This task waits for SIMST:1 detection with retry logic, sends AT command to enter MUX mode,
+ * and starts the GSM0710 MUX module.
+ *
+ * SIMST wait retry:
+ * - Waits up to SIMST_WAIT_TIMEOUT_SEC per attempt
+ * - On timeout: power cycles the TT module and retries
+ * - After SIMST_MAX_RETRIES failures: declares HARDWARE_FAULT
+ */
+#define SIMST_WAIT_TIMEOUT_SEC    15    // Per-attempt SIMST wait timeout
+#define SIMST_MAX_RETRIES         3     // Maximum power-cycle retries
+#define SIMST_RETRY_DELAY_MS      2000  // Delay between power off and power on
+
 static void tt_mux_init_task(void *pvParameters)
 {
     esp_err_t ret = ESP_OK;
     char at_response[TT_AT_RESP_BUF_SIZE];
-    int loop_count = 0;
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "MUX Initialization Task started");
 
-    // Wait for SIMST:1 to be detected
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Waiting for SIMST:1...");
+    // === SIMST detection with power-cycle retry ===
+    bool simst_detected = false;
 
-    // Debug log every 5 seconds while waiting
-    while (xSemaphoreTake(g_simst_sem, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        loop_count++;
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Still waiting for SIMST:1... (%d seconds elapsed)", loop_count * 5);
-        if (loop_count * 5 >= 30) {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Timeout waiting for SIMST:1 after 30 seconds");
-            g_mux_init_task_handle = NULL;
-        vTaskDelete(NULL);
-            return;
+    for (int attempt = 1; attempt <= SIMST_MAX_RETRIES; attempt++) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Waiting for SIMST:1... (attempt %d/%d, timeout=%ds)",
+                        attempt, SIMST_MAX_RETRIES, SIMST_WAIT_TIMEOUT_SEC);
+
+        int waited_sec = 0;
+        while (waited_sec < SIMST_WAIT_TIMEOUT_SEC) {
+            if (xSemaphoreTake(g_simst_sem, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                simst_detected = true;
+                break;
+            }
+            waited_sec += 5;
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                            "Waiting for SIMST:1... (%ds/%ds, attempt %d/%d)",
+                            waited_sec, SIMST_WAIT_TIMEOUT_SEC, attempt, SIMST_MAX_RETRIES);
         }
+
+        if (simst_detected) {
+            break;  // Got SIMST, proceed to MUX init
+        }
+
+        // SIMST timeout for this attempt
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                        "SIMST timeout after %ds (attempt %d/%d)",
+                        SIMST_WAIT_TIMEOUT_SEC, attempt, SIMST_MAX_RETRIES);
+
+        if (attempt < SIMST_MAX_RETRIES) {
+            // Power cycle the TT module and retry
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Power cycling TT module for retry...");
+
+            // Drain any stale semaphore before power cycle
+            xSemaphoreTake(g_simst_sem, 0);
+
+            tt_hw_power_off();
+            g_tt_module_running = false;
+            g_simst_detected = false;
+            g_tt_module_ready = false;
+            vTaskDelay(pdMS_TO_TICKS(SIMST_RETRY_DELAY_MS));
+
+            ret = tt_hw_power_on();
+            if (ret != ESP_OK) {
+                SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Power on failed during retry: %s", esp_err_to_name(ret));
+                continue;
+            }
+            ret = tt_hw_enter_normal_mode();
+            if (ret != ESP_OK) {
+                SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Enter normal mode failed during retry: %s", esp_err_to_name(ret));
+                continue;
+            }
+
+            g_tt_module_running = true;
+            vTaskDelay(pdMS_TO_TICKS(500));  // Wait for module to start booting
+        }
+    }
+
+    if (!simst_detected) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                        "SIMST not detected after %d attempts, declaring hardware fault",
+                        SIMST_MAX_RETRIES);
+        set_tt_state(TT_STATE_HARDWARE_FAULT);
+        g_tt_error_code = TT_ERROR_COMM_TIMEOUT;
+        g_mux_init_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "SIMST:1 detected! Proceeding with baud rate switch and MUX initialization...");
@@ -450,7 +516,7 @@ static void tt_mux_init_task(void *pvParameters)
 
         // Exit current task - uart_at_rx_task will handle re-initialization
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "MUX init task exiting, waiting for re-initialization after module reset...");
-        set_tt_state(TT_STATE_WORKING);
+        set_tt_state(TT_STATE_INITIALIZING);
         g_mux_init_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -495,7 +561,7 @@ static void tt_mux_init_task(void *pvParameters)
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Successfully entered MUX mode");
-    set_tt_state(TT_STATE_WORKING);
+    // State remains INITIALIZING until CFUN=1 succeeds
 
     // Update UART mode to MUX mode
     if (xSemaphoreTake(g_tt_module.mode_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -509,8 +575,6 @@ static void tt_mux_init_task(void *pvParameters)
     if (ret != ESP_OK) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to initialize GSM0710 Manager: %s", esp_err_to_name(ret));
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Reverting to AT command mode...");
-        set_tt_state(TT_STATE_HARDWARE_FAULT);
-        g_tt_error_code = TT_ERROR_MUX_FAILED;
 
         // Cleanup GSM0710 manager
         gsm0710_manager_deinit();
@@ -530,7 +594,7 @@ static void tt_mux_init_task(void *pvParameters)
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Restarting AT RX task...");
         tt_module_restart_at_task();
 
-        set_tt_state(TT_STATE_WORKING);
+        set_tt_state(TT_STATE_INITIALIZING);
         g_mux_init_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -541,8 +605,6 @@ static void tt_mux_init_task(void *pvParameters)
     if (ret != ESP_OK) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to start GSM0710 MUX session: %s", esp_err_to_name(ret));
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Reverting to AT command mode...");
-        set_tt_state(TT_STATE_HARDWARE_FAULT);
-        g_tt_error_code = TT_ERROR_MUX_FAILED;
 
         // Cleanup GSM0710 manager
         gsm0710_manager_deinit();
@@ -562,12 +624,12 @@ static void tt_mux_init_task(void *pvParameters)
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Restarting AT RX task...");
         tt_module_restart_at_task();
 
-        set_tt_state(TT_STATE_WORKING);
+        set_tt_state(TT_STATE_INITIALIZING);
         g_mux_init_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
-    
+
     // Open channels according to configuration
     // Note: Channel 0 (MUX_CONTROL) is automatically opened when MUX session starts
     int channels[] = {
@@ -584,8 +646,6 @@ static void tt_mux_init_task(void *pvParameters)
         if (ret != ESP_OK) {
             SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to open channel %d: %s", channels[i], esp_err_to_name(ret));
             SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Reverting to AT command mode...");
-            set_tt_state(TT_STATE_HARDWARE_FAULT);
-            g_tt_error_code = TT_ERROR_MUX_FAILED;
 
             // Close any open channels
             for (int j = 0; j < i; j++) {
@@ -611,7 +671,7 @@ static void tt_mux_init_task(void *pvParameters)
             SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Restarting AT RX task...");
             tt_module_restart_at_task();
 
-            set_tt_state(TT_STATE_WORKING);
+            set_tt_state(TT_STATE_INITIALIZING);
             g_mux_init_task_handle = NULL;
             vTaskDelete(NULL);
             return;
@@ -630,26 +690,118 @@ static void tt_mux_init_task(void *pvParameters)
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Registered AT response routing callback with gsm0710_manager");
     }
 
+    // ===== Configure terminal type and voice rate before AT+CFUN=1 =====
+    // These commands must be sent before CFUN=1 according to the AT command documentation.
+
+    // Step 1: Query current terminal type
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Querying terminal type (AT^TETYPE?)...");
+    char tetype_response[128];
+    bool tetype_needs_set = true;
+    tt_at_result_t tetype_result = tt_module_send_at_cmd_wait("^TETYPE?", tetype_response, sizeof(tetype_response), 3000);
+    if (tetype_result == TT_AT_RESULT_OK) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^TETYPE? response: %s", tetype_response);
+        // Parse response: "^TETYPE: <type>"
+        char *p = strstr(tetype_response, "^TETYPE:");
+        if (p != NULL) {
+            int type = atoi(p + strlen("^TETYPE:"));
+            if (type == 6) {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Terminal type already 6 (降速语音), skip setting");
+                tetype_needs_set = false;
+            } else {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Current terminal type is %d, need to set to 6", type);
+            }
+        }
+    } else {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^TETYPE? query failed (result=%d), will try to set", tetype_result);
+    }
+
+    // Step 2: Set terminal type to 6 if needed
+    if (tetype_needs_set) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Setting terminal type to 6 (AT^TETYPE=6)...");
+        char tetype_set_response[128];
+        tt_at_result_t tetype_set_result = tt_module_send_at_cmd_wait("^TETYPE=6", tetype_set_response, sizeof(tetype_set_response), 3000);
+        if (tetype_set_result == TT_AT_RESULT_OK) {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^TETYPE=6 successful, rebooting system to take effect...");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+            return;  // Never reached, but for clarity
+        } else {
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^TETYPE=6 failed (result=%d), continuing without reboot", tetype_set_result);
+        }
+    }
+
+    // Step 3: Query current voice rate
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Querying voice rate (AT^VOICERATE?)...");
+    char voicerate_response[128];
+    bool voicerate_needs_set = true;
+    tt_at_result_t voicerate_result = tt_module_send_at_cmd_wait("^VOICERATE?", voicerate_response, sizeof(voicerate_response), 3000);
+    if (voicerate_result == TT_AT_RESULT_OK) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^VOICERATE? response: %s", voicerate_response);
+        // Parse response: "^VOICERATE: <rate1>[,<rate2>[,<rate3>]]"
+        // Check if rate 5 (1.0Kbps) is already present
+        char *p = strstr(voicerate_response, "^VOICERATE:");
+        if (p != NULL) {
+            p += strlen("^VOICERATE:");
+            // Check each comma-separated value
+            bool has_1k = false;
+            char *token = strtok(p, ", \r\n");
+            while (token != NULL) {
+                if (atoi(token) == 5) {
+                    has_1k = true;
+                    break;
+                }
+                token = strtok(NULL, ", \r\n");
+            }
+            if (has_1k) {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Voice rate already includes 1.0Kbps (rate=5), skip setting");
+                voicerate_needs_set = false;
+            }
+        }
+    } else {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^VOICERATE? query failed (result=%d), will try to set", voicerate_result);
+    }
+
+    // Step 4: Set voice rate to 1.0Kbps if needed
+    if (voicerate_needs_set) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Setting voice rate to 1.0Kbps (AT^VOICERATE=5)...");
+        char voicerate_set_response[128];
+        tt_at_result_t voicerate_set_result = tt_module_send_at_cmd_wait("^VOICERATE=5", voicerate_set_response, sizeof(voicerate_set_response), 3000);
+        if (voicerate_set_result == TT_AT_RESULT_OK) {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^VOICERATE=5 successful: %s", voicerate_set_response);
+        } else {
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^VOICERATE=5 failed (result=%d), continuing...", voicerate_set_result);
+        }
+    }
+
+    // ===== End of terminal type and voice rate configuration =====
+
     // Send AT+CFUN=1 to enable full functionality after MUX mode initialization
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Sending AT+CFUN=1 to enable full functionality...");
     char cfun_response[128];
     tt_at_result_t cfun_result = tt_module_send_at_cmd_wait("+CFUN=1", cfun_response, sizeof(cfun_response), 5000);
     if (cfun_result != TT_AT_RESULT_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT+CFUN=1 failed (result=%d), but continuing...", cfun_result);
-    } else {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT+CFUN=1 successful: %s", cfun_response);
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT+CFUN=1 failed (result=%d), module not functional", cfun_result);
+        set_tt_state(TT_STATE_HARDWARE_FAULT);
+        g_tt_error_code = TT_ERROR_COMM_TIMEOUT;
+        g_mux_init_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
     }
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT+CFUN=1 successful: %s", cfun_response);
 
     // Send AT^VOICEMODE=1 to enable voice mode
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Sending AT^VOICEMODE=1 to enable voice mode...");
     char voicemode_response[128];
     tt_at_result_t voicemode_result = tt_module_send_at_cmd_wait("^VOICEMODE=1", voicemode_response, sizeof(voicemode_response), 2000);
     if (voicemode_result != TT_AT_RESULT_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^VOICEMODE=1 failed (result=%d), but continuing...", voicemode_result);
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^VOICEMODE=1 failed (result=%d), voice not available", voicemode_result);
     } else {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^VOICEMODE=1 successful: %s", voicemode_response);
     }
 
+    // All initialization complete - now set to WORKING
+    set_tt_state(TT_STATE_WORKING);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module fully initialized and WORKING ===");
 
     // This task is done, it can be deleted
     g_mux_init_task_handle = NULL;
@@ -822,7 +974,7 @@ cleanup:
     }
 
     g_tt_module.initialized = false;
-    set_tt_state(TT_STATE_WORKING);
+    set_tt_state(TT_STATE_USER_OFF);
     g_simst_detected = false;
 
     return ret;
@@ -985,7 +1137,7 @@ esp_err_t tt_module_start(void)
 
     // 3. Set running flag to wake up UART tasks
     g_tt_module_running = true;
-    set_tt_state(TT_STATE_WORKING);
+    set_tt_state(TT_STATE_INITIALIZING);  // Will be WORKING after MUX init completes
     g_tt_module.uart_mode = TT_UART_MODE_AT;
 
     // Set powered flag
@@ -998,8 +1150,16 @@ esp_err_t tt_module_start(void)
         xSemaphoreGive(g_at_context_mutex);
     }
 
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Tiantong Module started in AT command mode");
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "MUX mode will be automatically started when SIMST:1 is detected");
+    // Create MUX initialization task immediately (it waits for SIMST internally)
+    if (g_mux_init_task_handle == NULL) {
+        if (xTaskCreate(tt_mux_init_task, "tt_mux_init_task", 8192, NULL, 8, &g_mux_init_task_handle) != pdPASS) {
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to create MUX initialization task");
+        } else {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "MUX init task created, waiting for SIMST detection...");
+        }
+    }
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Tiantong Module started in AT command mode (state=INITIALIZING)");
 
     return ESP_OK;
 }
@@ -1065,7 +1225,7 @@ esp_err_t tt_module_stop(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // 4. Restore to initial state
-    set_tt_state(TT_STATE_WORKING);
+    set_tt_state(TT_STATE_USER_OFF);
     g_tt_module.uart_mode = TT_UART_MODE_AT;
     g_simst_detected = false;
     g_tt_module_ready = false;  // Reset ready flag - module needs to re-announce ready state
@@ -1800,8 +1960,8 @@ esp_err_t tt_module_reset_state(void)
     g_simst_detected = false;
     g_tt_module_ready = false;  // Module needs to re-announce ready state
 
-    // Update module state to AT command mode
-    set_tt_state(TT_STATE_WORKING);
+    // Update module state to initializing (need to re-detect SIMST)
+    set_tt_state(TT_STATE_INITIALIZING);
 
     // Update UART mode to AT mode
     // The uart_at_rx_task will detect this change and automatically continue working
@@ -2053,8 +2213,8 @@ esp_err_t tt_module_exit_ota_mode(void)
     tt_module_reset();
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    // Restore normal operation - restart in AT command mode
-    set_tt_state(TT_STATE_WORKING);
+    // Restore normal operation - will become WORKING after SIMST detected and MUX init
+    set_tt_state(TT_STATE_INITIALIZING);
     g_tt_module.uart_mode = TT_UART_MODE_AT;
 
     // Restart AT command task
@@ -2232,11 +2392,8 @@ esp_err_t tt_module_full_startup(void)
     /* Update power flag */
     g_tt_module_powered = true;
 
-    /* Update final status based on internal state */
+    /* Log final status - state will be updated to WORKING by tt_mux_init_task when fully initialized */
     tt_state_t state = tt_module_get_state();
-    if (state == TT_STATE_WORKING || state == TT_STATE_WORKING) {
-        set_tt_state(TT_STATE_WORKING);
-    }
 
     SYS_LOGI(TAG, "=== TT Module Startup Complete (State: %d) ===", state);
     return ESP_OK;
@@ -2323,9 +2480,9 @@ esp_err_t tt_module_user_power_on(void)
         return ESP_FAIL;
     }
 
-    // Step 6: Update power flag and ensure final state
+    // Step 6: Update power flag
+    // State remains INITIALIZING (set by tt_module_start), will become WORKING after MUX init completes
     g_tt_module_powered = true;
-    set_tt_state(TT_STATE_WORKING);  // Ensure final state is WORKING
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module User Power On Complete (battery: %umV%s) ===",
         voltage_read_ok ? voltage_mv : 0, voltage_read_ok ? "" : " (unread)");

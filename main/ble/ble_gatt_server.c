@@ -17,13 +17,210 @@
 #include "audio/voice_packet_handler.h"
 #include "system/syslog.h"
 
-// External variables
-bool conn_handle_subs[CONFIG_BT_NIMBLE_MAX_CONNECTIONS + 1];
+static const char *TAG = "BLE_GATT_SERVER";
+
+// Connection handle subscription state (with mutex protection)
+static bool conn_handle_subs[CONFIG_BT_NIMBLE_MAX_CONNECTIONS + 1];
+static SemaphoreHandle_t conn_subs_mutex = NULL;
 static uint8_t own_addr_type;
 static int ble_active_conn_count = 0;
 
 static int ble_spp_server_gap_event(struct ble_gap_event *event, void *arg);
 void ble_store_config_init(void);
+
+// Forward declaration for advertise function
+static void ble_spp_server_advertise(void);
+
+/**
+ * @brief Thread-safe wrapper: Set subscription state for a connection handle
+ *
+ * @param conn_handle Connection handle
+ * @param subscribed true if subscribed, false otherwise
+ */
+static void conn_set_subscribed(uint16_t conn_handle, bool subscribed)
+{
+    if (conn_handle > CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+        MODLOG_DFLT(ERROR, "Invalid conn_handle=%d (max %d)", conn_handle, CONFIG_BT_NIMBLE_MAX_CONNECTIONS);
+        return;
+    }
+
+    if (conn_subs_mutex != NULL) {
+        if (xSemaphoreTake(conn_subs_mutex, pdMS_TO_TICKS(CONN_SUBS_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+            conn_handle_subs[conn_handle] = subscribed;
+            xSemaphoreGive(conn_subs_mutex);
+        } else {
+            MODLOG_DFLT(ERROR, "Failed to acquire conn_subs_mutex (timeout)");
+        }
+    } else {
+        // Fallback during initialization
+        conn_handle_subs[conn_handle] = subscribed;
+    }
+}
+
+/**
+ * @brief Thread-safe wrapper: Check if a connection handle is subscribed
+ *
+ * @param conn_handle Connection handle
+ * @return true if subscribed, false otherwise
+ */
+static bool conn_is_subscribed(uint16_t conn_handle)
+{
+    if (conn_handle > CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+        return false;
+    }
+
+    bool subscribed = false;
+    if (conn_subs_mutex != NULL) {
+        if (xSemaphoreTake(conn_subs_mutex, pdMS_TO_TICKS(CONN_SUBS_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+            subscribed = conn_handle_subs[conn_handle];
+            xSemaphoreGive(conn_subs_mutex);
+        } else {
+            MODLOG_DFLT(ERROR, "Failed to acquire conn_subs_mutex (timeout)");
+        }
+    } else {
+        // Fallback during initialization
+        subscribed = conn_handle_subs[conn_handle];
+    }
+    return subscribed;
+}
+
+/**
+ * @brief Thread-safe wrapper: Clear all subscription states
+ *
+ * This function should be called during cleanup or reinitialization.
+ */
+static void conn_clear_all_subscriptions(void)
+{
+    if (conn_subs_mutex != NULL) {
+        if (xSemaphoreTake(conn_subs_mutex, pdMS_TO_TICKS(CONN_SUBS_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+            for (int i = 0; i <= CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++) {
+                conn_handle_subs[i] = false;
+            }
+            xSemaphoreGive(conn_subs_mutex);
+        } else {
+            MODLOG_DFLT(ERROR, "Failed to acquire conn_subs_mutex (timeout)");
+        }
+    } else {
+        // Fallback during initialization
+        for (int i = 0; i <= CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++) {
+            conn_handle_subs[i] = false;
+        }
+    }
+}
+
+/**
+ * @brief Safe GATT notification send helper with automatic mbuf cleanup
+ *
+ * This function ensures that the mbuf is always freed, even if the
+ * notification fails. This prevents memory leaks in error paths.
+ *
+ * @param conn_handle Connection handle
+ * @param attr_handle Attribute handle
+ * @param data Data to send
+ * @param len Data length
+ * @return 0 on success, non-zero error code on failure
+ *
+ * Note: This function takes ownership of the mbuf and will always free it.
+ */
+int ble_gatts_send_safe_notify(uint16_t conn_handle, uint16_t attr_handle,
+                                const uint8_t *data, uint16_t len)
+{
+    // Enhanced parameter validation
+    if (data == NULL && len > 0) {
+        MODLOG_DFLT(ERROR, "Invalid parameters: data=NULL, len=%d", len);
+        return BLE_HS_EINVAL;
+    }
+
+    if (len == 0) {
+        MODLOG_DFLT(DEBUG, "Zero length data, skipping notification");
+        return 0;
+    }
+
+    // Allocate mbuf
+    struct os_mbuf *txom = ble_hs_mbuf_from_flat(data, len);
+    if (txom == NULL) {
+        MODLOG_DFLT(ERROR, "Failed to allocate mbuf (len=%d)", len);
+        return BLE_HS_ENOMEM;
+    }
+
+    // Send notification (txom cannot be NULL here)
+    int rc = ble_gatts_notify_custom(conn_handle, attr_handle, txom);
+
+    // Handle result (mbuf ownership transferred to stack)
+    if (rc == 0) {
+        MODLOG_DFLT(DEBUG, "Notify sent successfully");
+        // txom has been freed by NimBLE stack
+    } else {
+        MODLOG_DFLT(DEBUG, "Notify failed: rc=%d (mbuf freed by stack)", rc);
+        // txom has been freed by NimBLE stack even on failure
+    }
+
+    return rc;
+}
+
+/**
+ * @brief Safe fragmented GATT notification send helper
+ *
+ * This function sends large data payloads in multiple fragments to respect
+ * the MTU size limit. Each fragment is sent as a separate notification.
+ * The mbuf is always freed, even if sending fails.
+ *
+ * @param conn_handle Connection handle
+ * @param attr_handle Attribute handle
+ * @param data Data to send
+ * @param len Total data length
+ * @param mtu Maximum transmission unit (payload size per notification)
+ * @return 0 on success, non-zero error code on failure
+ *
+ * Note: This function takes ownership of the mbuf and will always free it.
+ */
+int ble_gatts_send_safe_notify_fragmented(uint16_t conn_handle, uint16_t attr_handle,
+                                          const uint8_t *data, uint16_t len, uint16_t mtu)
+{
+    // Enhanced parameter validation
+    if (data == NULL && len > 0) {
+        MODLOG_DFLT(ERROR, "Invalid parameters: data=NULL, len=%d", len);
+        return BLE_HS_EINVAL;
+    }
+
+    if (mtu == 0) {
+        MODLOG_DFLT(ERROR, "Invalid parameter: mtu=0");
+        return BLE_HS_EINVAL;
+    }
+
+    if (len == 0) {
+        MODLOG_DFLT(DEBUG, "Zero length data, skipping fragmented notification");
+        return 0;
+    }
+
+    // Send data in MTU-sized chunks
+    size_t offset = 0;
+    int last_rc = 0;
+
+    while (offset < len) {
+        uint16_t chunk_len = (len - offset > mtu) ? mtu : (len - offset);
+
+        // Allocate mbuf for this fragment
+        struct os_mbuf *txom = ble_hs_mbuf_from_flat(data + offset, chunk_len);
+        if (txom == NULL) {
+            MODLOG_DFLT(ERROR, "Failed to allocate mbuf for fragment (offset=%zu, len=%d)", offset, chunk_len);
+            return BLE_HS_ENOMEM;
+        }
+
+        // Send this fragment
+        int rc = ble_gatts_notify_custom(conn_handle, attr_handle, txom);
+        if (rc != 0) {
+            MODLOG_DFLT(ERROR, "Fragment send failed: rc=%d (offset=%zu)", rc, offset);
+            // txom has been freed by NimBLE stack even on failure
+            return rc;
+        }
+
+        offset += chunk_len;
+        last_rc = rc;
+    }
+
+    return last_rc;
+}
 
 /**
  * Logs information about a connection to the console.
@@ -130,178 +327,238 @@ ble_spp_server_advertise(void)
     }
 }
 
-#define BLE_VOICE_ITVL_MIN  8
-#define BLE_VOICE_ITVL_MAX  10
-
-static int
-ble_spp_server_gap_event(struct ble_gap_event *event, void *arg)
+/**
+ * @brief Handle GAP connection established event
+ */
+static int handle_gap_event_connect(struct ble_gap_event *event, void *arg)
 {
     struct ble_gap_conn_desc desc;
     int rc;
 
-    switch (event->type) {
-    case BLE_GAP_EVENT_CONNECT:
-        /* A new connection was established or a connection attempt failed. */
-        MODLOG_DFLT(INFO, "connection %s; status=%d\n",
-                    event->connect.status == 0 ? "established" : "failed",
-                    event->connect.status);
+    MODLOG_DFLT(INFO, "connection %s; status=%d\n",
+                event->connect.status == 0 ? "established" : "failed",
+                event->connect.status);
 
-        if (event->connect.status == 0) {
+    if (event->connect.status != 0) {
+        // Connection attempt failed
+        MODLOG_DFLT(INFO, "Connection attempt failed\n");
 #ifdef CONFIG_BLE_MULTI_CONN_ENABLE
-            // Multi-connection mode: check max connections
-            if (ble_conn_manager_is_max_connections()) {
-                MODLOG_DFLT(INFO, "Max connections reached (%d), rejecting new connection\n",
-                            BLE_MAX_CONNECTIONS);
-                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-                return 0;
-            }
-#else
-            // Single-connection mode: only allow 1 connection
-            if (ble_active_conn_count >= 1) {
-                MODLOG_DFLT(INFO, "Connection already exists (count=%d), rejecting new connection\n",
-                            ble_active_conn_count);
-                // Stop advertising to prevent further connection attempts
-                ble_gap_adv_stop();
-                // Terminate the new connection immediately
-                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-                return 0;
-            }
-#endif
-
-            rc = ble_att_set_preferred_mtu(SPP_GATT_MTU_SIZE);
-            if (rc != 0) {
-                MODLOG_DFLT(INFO, "Failed to set preferred MTU; rc = %d", rc);
-            }
-
-            rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
-            assert(rc == 0);
-            ble_spp_server_print_conn_desc(&desc);
-
-#ifdef CONFIG_BLE_MULTI_CONN_ENABLE
-            // Add connection and assign role
-            ble_conn_role_t role = ble_conn_manager_add_connection(
-                event->connect.conn_handle,
-                desc.peer_id_addr.val,
-                desc.peer_id_addr.type
-            );
-
-            if (role == BLE_CONN_ROLE_NONE) {
-                MODLOG_DFLT(ERROR, "Failed to add connection\n");
-                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-                return 0;
-            }
-
-            MODLOG_DFLT(INFO, "Connection role: %s\n",
-                        role == BLE_CONN_ROLE_PRIMARY ? "PRIMARY" : "DEBUG");
-
-            // Set GATT connection handle for syslog (will route to DEBUG if exists)
-            syslog_set_gatt_conn_handle(event->connect.conn_handle);
-
-            // Set active GATT connection for tt_module (for unsolicited AT notifications)
-            extern void tt_module_set_active_gatt_conn(uint16_t conn_handle);
-            tt_module_set_active_gatt_conn(event->connect.conn_handle);
-
-            // Print connection manager state
-            ble_conn_manager_print_info();
-
-            // Stop advertising if max connections reached
-            if (ble_conn_manager_is_max_connections()) {
-                MODLOG_DFLT(INFO, "Max connections reached, stopping advertising\n");
-                ble_gap_adv_stop();
-            } else {
-                MODLOG_DFLT(INFO, "Waiting for more connections (%d/%d)\n",
-                            ble_conn_manager_get_connection_count(), BLE_MAX_CONNECTIONS);
-            }
-#else
-            ble_active_conn_count++;
-            MODLOG_DFLT(INFO, "Active connections: %d\n", ble_active_conn_count);
-
-            // Set GATT connection handle for syslog
-            syslog_set_gatt_conn_handle(event->connect.conn_handle);
-
-            // Set active GATT connection for tt_module (for unsolicited AT notifications)
-            extern void tt_module_set_active_gatt_conn(uint16_t conn_handle);
-            tt_module_set_active_gatt_conn(event->connect.conn_handle);
-
-            // Stop advertising after connection established
-            ble_gap_adv_stop();
-#endif
-        } else {
-            // Connection attempt failed
-            MODLOG_DFLT(INFO, "Connection attempt failed\n");
-#ifdef CONFIG_BLE_MULTI_CONN_ENABLE
-            // In multi-connection mode, only restart advertising if no connections
-            if (ble_conn_manager_get_connection_count() == 0) {
-                ble_spp_server_advertise();
-            }
-#else
-            ble_active_conn_count = 0;
-            ble_spp_server_advertise();
-#endif
-        }
-        return 0;
-
-    case BLE_GAP_EVENT_DISCONNECT:
-        MODLOG_DFLT(INFO, "disconnect; reason=%d\n", event->disconnect.reason);
-
-#ifdef CONFIG_BLE_MULTI_CONN_ENABLE
-        // Remove connection from manager (handles role persistence)
-        ble_conn_role_t role = ble_conn_manager_get_role(event->disconnect.conn.conn_handle);
-        ble_conn_manager_remove_connection(event->disconnect.conn.conn_handle);
-
-        // Clear GATT connection handle for syslog if needed
-        // Note: syslog will auto-route to remaining connection
-        syslog_clear_gatt_conn_handle();
-
-        // Clear subscription state for this connection
-        conn_handle_subs[event->disconnect.conn.conn_handle] = false;
-
-        // Clean up AT server state (only if this was the active AT connection)
-        spp_at_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-
-        // Clean up voice server state (only if this was the active voice connection)
-        spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-
-        // Clean up OTA state if OTA was in progress (only if this was the OTA connection)
-        gatt_ota_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-
-        // Print connection manager state
-        ble_conn_manager_print_info();
-
-        // Restart advertising only if no connections remain
-        // (avoid interrupting primary work if one connection still active)
         if (ble_conn_manager_get_connection_count() == 0) {
-            MODLOG_DFLT(INFO, "All connections closed, restarting advertising\n");
             ble_spp_server_advertise();
-        } else {
-            MODLOG_DFLT(INFO, "Still have %d active connection(s), advertising remains off\n",
-                        ble_conn_manager_get_connection_count());
         }
 #else
         ble_active_conn_count = 0;
-
-        // Clear GATT connection handle for syslog
-        syslog_clear_gatt_conn_handle();
-
-        // Clear subscription state for this connection
-        conn_handle_subs[event->disconnect.conn.conn_handle] = false;
-
-        // Clean up AT server state (only if this was the active AT connection)
-        spp_at_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-
-        // Clean up voice server state (only if this was the active voice connection)
-        spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-
-        // Clean up OTA state if OTA was in progress (only if this was the OTA connection)
-        gatt_ota_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-
-        MODLOG_DFLT(INFO, "All connections closed, restarting advertising\n");
         ble_spp_server_advertise();
 #endif
         return 0;
+    }
+
+#ifdef CONFIG_BLE_MULTI_CONN_ENABLE
+    if (ble_conn_manager_is_max_connections()) {
+        MODLOG_DFLT(INFO, "Max connections reached (%d), rejecting new connection\n",
+                    BLE_MAX_CONNECTIONS);
+        ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+#else
+    if (ble_active_conn_count >= 1) {
+        MODLOG_DFLT(INFO, "Connection already exists (count=%d), rejecting new connection\n",
+                    ble_active_conn_count);
+        ble_gap_adv_stop();
+        ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+#endif
+
+    rc = ble_att_set_preferred_mtu(SPP_GATT_MTU_SIZE);
+    if (rc != 0) {
+        MODLOG_DFLT(INFO, "Failed to set preferred MTU; rc = %d", rc);
+    }
+
+    rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+    if (rc != 0) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to find connection: rc=%d", rc);
+        return rc;
+    }
+    ble_spp_server_print_conn_desc(&desc);
+
+#ifdef CONFIG_BLE_MULTI_CONN_ENABLE
+    ble_conn_role_t role = ble_conn_manager_add_connection(
+        event->connect.conn_handle,
+        desc.peer_id_addr.val,
+        desc.peer_id_addr.type
+    );
+
+    if (role == BLE_CONN_ROLE_NONE) {
+        MODLOG_DFLT(ERROR, "Failed to add connection\n");
+        ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    MODLOG_DFLT(INFO, "Connection role: %s\n",
+                role == BLE_CONN_ROLE_PRIMARY ? "PRIMARY" : "DEBUG");
+
+    syslog_set_gatt_conn_handle(event->connect.conn_handle);
+
+    extern void tt_module_set_active_gatt_conn(uint16_t conn_handle);
+    tt_module_set_active_gatt_conn(event->connect.conn_handle);
+
+    ble_conn_manager_print_info();
+
+    if (ble_conn_manager_is_max_connections()) {
+        MODLOG_DFLT(INFO, "Max connections reached, stopping advertising\n");
+        ble_gap_adv_stop();
+    } else {
+        MODLOG_DFLT(INFO, "Waiting for more connections (%d/%d)\n",
+                    ble_conn_manager_get_connection_count(), BLE_MAX_CONNECTIONS);
+    }
+#else
+    ble_active_conn_count++;
+    MODLOG_DFLT(INFO, "Active connections: %d\n", ble_active_conn_count);
+
+    syslog_set_gatt_conn_handle(event->connect.conn_handle);
+
+    extern void tt_module_set_active_gatt_conn(uint16_t conn_handle);
+    tt_module_set_active_gatt_conn(event->connect.conn_handle);
+
+    ble_gap_adv_stop();
+#endif
+
+    return 0;
+}
+
+/**
+ * @brief Handle GAP disconnection event
+ */
+static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
+{
+    MODLOG_DFLT(INFO, "disconnect; reason=%d\n", event->disconnect.reason);
+
+#ifdef CONFIG_BLE_MULTI_CONN_ENABLE
+    ble_conn_role_t role = ble_conn_manager_get_role(event->disconnect.conn.conn_handle);
+    ble_conn_manager_remove_connection(event->disconnect.conn.conn_handle);
+
+    syslog_clear_gatt_conn_handle();
+    conn_set_subscribed(event->disconnect.conn.conn_handle, false);
+    spp_at_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+    spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+    gatt_ota_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+
+    ble_conn_manager_print_info();
+
+    if (ble_conn_manager_get_connection_count() == 0) {
+        MODLOG_DFLT(INFO, "All connections closed, restarting advertising\n");
+        ble_spp_server_advertise();
+    } else {
+        MODLOG_DFLT(INFO, "Still have %d active connection(s), advertising remains off\n",
+                    ble_conn_manager_get_connection_count());
+    }
+#else
+    ble_active_conn_count = 0;
+
+    syslog_clear_gatt_conn_handle();
+    conn_set_subscribed(event->disconnect.conn.conn_handle, false);
+    spp_at_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+    spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+    gatt_ota_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+
+    MODLOG_DFLT(INFO, "All connections closed, restarting advertising\n");
+    ble_spp_server_advertise();
+#endif
+
+    return 0;
+}
+
+/**
+ * @brief Handle GAP subscription event
+ */
+static int handle_gap_event_subscribe(struct ble_gap_event *event, void *arg)
+{
+    MODLOG_DFLT(INFO, "subscribe event; conn_handle=%d attr_handle=%d "
+                "reason=%d prevn=%d curn=%d previ=%d curi=%d\n",
+                event->subscribe.conn_handle,
+                event->subscribe.attr_handle,
+                event->subscribe.reason,
+                event->subscribe.prev_notify,
+                event->subscribe.cur_notify,
+                event->subscribe.prev_indicate,
+                event->subscribe.cur_indicate);
+
+    conn_set_subscribed(event->subscribe.conn_handle, true);
+    return 0;
+}
+
+/**
+ * @brief Handle GAP connection update event
+ */
+static int handle_gap_event_conn_update(struct ble_gap_event *event, void *arg)
+{
+    struct ble_gap_conn_desc desc;
+    int rc;
+
+    rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+    if (rc != 0) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to find connection during update: rc=%d", rc);
+        return rc;
+    }
+    MODLOG_DFLT(INFO, "conn update(%d)\n", desc.conn_itvl);
+    ble_spp_server_print_conn_desc(&desc);
+
+    if (spp_voice_server_is_enabled()) {
+        if (desc.conn_itvl < BLE_VOICE_CONN_ITVL_MIN || desc.conn_itvl > BLE_VOICE_CONN_ITVL_MAX) {
+            struct ble_gap_upd_params params = {
+                .itvl_min = BLE_VOICE_CONN_ITVL_MIN,
+                .itvl_max = BLE_VOICE_CONN_ITVL_MAX,
+                .latency = BLE_CONN_LATENCY_NONE,
+                .supervision_timeout = BLE_SUPERVISION_TIMEOUT_400,
+                .min_ce_len = 0,
+                .max_ce_len = 0,
+            };
+            rc = ble_gap_update_params(event->connect.conn_handle, &params);
+            if (rc != 0) {
+                MODLOG_DFLT(ERROR, "failed to update voice connection parameters: %d\n", rc);
+                return rc;
+            }
+            MODLOG_DFLT(INFO, "voice mode: requested low-latency params (itvl=%d-%d)\n",
+                        BLE_VOICE_CONN_ITVL_MIN, BLE_VOICE_CONN_ITVL_MAX);
+        }
+    } else {
+        if (desc.conn_itvl < BLE_VOICE_CONN_ITVL_MIN || desc.conn_itvl > BLE_VOICE_CONN_ITVL_MAX) {
+            struct ble_gap_upd_params params = {
+                .itvl_min = BLE_DEFAULT_CONN_ITVL_MIN,
+                .itvl_max = BLE_DEFAULT_CONN_ITVL_MAX,
+                .latency = BLE_CONN_LATENCY_NONE,
+                .supervision_timeout = BLE_SUPERVISION_TIMEOUT_400,
+                .min_ce_len = 0,
+                .max_ce_len = 0,
+            };
+            rc = ble_gap_update_params(event->connect.conn_handle, &params);
+            if (rc != 0) {
+                MODLOG_DFLT(ERROR, "failed to update default connection parameters: %d\n", rc);
+                return rc;
+            }
+            MODLOG_DFLT(INFO, "normal mode: requested default params (itvl=%d-%d)\n",
+                        BLE_DEFAULT_CONN_ITVL_MIN, BLE_DEFAULT_CONN_ITVL_MAX);
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Main GAP event handler - delegates to specific handlers
+ */
+static int
+ble_spp_server_gap_event(struct ble_gap_event *event, void *arg)
+{
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        return handle_gap_event_connect(event, arg);
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        return handle_gap_event_disconnect(event, arg);
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        // Advertising stopped, don't restart (will be restarted on disconnect or error)
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -312,63 +569,10 @@ ble_spp_server_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
-        MODLOG_DFLT(INFO, "subscribe event; conn_handle=%d attr_handle=%d "
-                    "reason=%d prevn=%d curn=%d previ=%d curi=%d\n",
-                    event->subscribe.conn_handle,
-                    event->subscribe.attr_handle,
-                    event->subscribe.reason,
-                    event->subscribe.prev_notify,
-                    event->subscribe.cur_notify,
-                    event->subscribe.prev_indicate,
-                    event->subscribe.cur_indicate);
-        conn_handle_subs[event->subscribe.conn_handle] = true;
-        return 0;
+        return handle_gap_event_subscribe(event, arg);
 
     case BLE_GAP_EVENT_CONN_UPDATE:
-        rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
-        MODLOG_DFLT(INFO, "conn update(%d)\n", desc.conn_itvl);
-        assert(rc == 0);
-        ble_spp_server_print_conn_desc(&desc);
-
-        /* Update connection parameters based on voice service state */
-        if (spp_voice_server_is_enabled()) {
-            /* Voice service enabled: ensure low-latency parameters */
-            if (desc.conn_itvl < BLE_VOICE_ITVL_MIN || desc.conn_itvl > BLE_VOICE_ITVL_MAX) {
-                struct ble_gap_upd_params params = {
-                    .itvl_min = BLE_VOICE_ITVL_MIN,         /* 17.5ms */
-                    .itvl_max = BLE_VOICE_ITVL_MAX,         /* 20ms */
-                    .latency = 0,
-                    .supervision_timeout = 400,
-                    .min_ce_len = 0,
-                    .max_ce_len = 0,
-                };
-                rc = ble_gap_update_params(event->connect.conn_handle, &params);
-                if (rc != 0) {
-                    MODLOG_DFLT(ERROR, "failed to update voice connection parameters: %d\n", rc);
-                    return rc;
-                }
-                MODLOG_DFLT(INFO, "voice mode: requested low-latency params (itvl=%d-%d)\n", BLE_VOICE_ITVL_MIN, BLE_VOICE_ITVL_MAX);
-            }
-        } else {
-            /* Voice service disabled: ensure default/power-saving parameters */
-            if (desc.conn_itvl < BLE_VOICE_ITVL_MIN || desc.conn_itvl > BLE_VOICE_ITVL_MAX) {
-                struct ble_gap_upd_params params = {
-                    .itvl_min = BLE_VOICE_ITVL_MIN,         /* 30ms (default) */
-                    .itvl_max = BLE_VOICE_ITVL_MAX,         /* 50ms (default) */
-                    .latency = 0,
-                    .supervision_timeout = 400,
-                    .min_ce_len = 0,
-                    .max_ce_len = 0,
-                };
-                rc = ble_gap_update_params(event->connect.conn_handle, &params);
-                if (rc != 0) {
-                    MODLOG_DFLT(ERROR, "failed to update default connection parameters: %d\n", rc);
-                    return rc;
-                }
-                MODLOG_DFLT(INFO, "normal mode: requested default params (itvl=14-16--default)\n");
-            }
-        }
-        return 0;
+        return handle_gap_event_conn_update(event, arg);
 
     default:
         return 0;
@@ -387,7 +591,10 @@ ble_spp_server_on_sync(void)
     int rc;
 
     rc = ble_hs_util_ensure_addr(0);
-    assert(rc == 0);
+    if (rc != 0) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to ensure address: rc=%d", rc);
+        return;
+    }
 
     /* Figure out address to use while advertising (no privacy for now) */
     rc = ble_hs_id_infer_auto(0, &own_addr_type);
@@ -442,7 +649,7 @@ gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg)
         break;
 
     default:
-        assert(0);
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Unknown GATT register operation: %d", ctxt->op);
         break;
     }
 }
@@ -517,10 +724,15 @@ int ble_gatt_server_init(void)
         return ret;
     }
 
-    /* Initialize connection_handle array */
-    for (int i = 0; i <= CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++) {
-        conn_handle_subs[i] = false;
+    /* Create mutex for protecting conn_handle_subs[] array */
+    conn_subs_mutex = xSemaphoreCreateMutex();
+    if (conn_subs_mutex == NULL) {
+        MODLOG_DFLT(ERROR, "Failed to create conn_subs_mutex");
+        return ESP_ERR_NO_MEM;
     }
+
+    /* Initialize connection_handle array (thread-safe via mutex) */
+    conn_clear_all_subscriptions();
 
     /* Initialize the NimBLE host configuration. */
     ble_hs_cfg.reset_cb = ble_spp_server_on_reset;
@@ -559,7 +771,22 @@ int ble_gatt_server_init(void)
         return rc;
     }
 
-    /* XXX Need to have template for store */
+    /*
+     * NimBLE Store Configuration:
+     *
+     * Initializes the persistent store for BLE bonding data.
+     * This includes:
+     * - Bonding information (encryption keys)
+     * - Pairing records
+     * - Device whitelist
+     *
+     * Note: ble_store_config_init() is provided by NimBLE.
+     * It uses the default RAM-based store implementation.
+     * For persistent storage across reboots, NVS-backed store should be configured.
+     *
+     * Current Implementation: RAM-based (lost on reboot)
+     * Future Enhancement: Use ble_store_nvs for persistent bonding
+     */
     ble_store_config_init();
 
     /* Create FreeRTOS task for the NimBLE host */

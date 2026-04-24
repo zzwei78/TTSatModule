@@ -53,8 +53,17 @@ static gsm0710_manager_t g_gsm_mgr = {
     .deliver_data_ch1_count = 0
 };
 
-/* Static UART RX buffer - avoids repeated malloc/free */
-#define GSM0710_UART_RX_BUF_SIZE 1024  // Increased from 512 to reduce cross-boundary frames
+/*
+ * Static UART RX buffer - avoids repeated malloc/free
+ *
+ * Buffer size reasoning:
+ * - MUX frame max size: 1600 bytes (configured in tt_mux_init_task)
+ * - Largest observed frames: ~800 bytes during voice data transfer
+ * - Buffer needs to handle at least 1 full frame + margin
+ * - 1024 provides 20% headroom for worst-case fragmentation
+ * History: Increased from 512 to 1024 due to cross-boundary frames issue
+ */
+#define GSM0710_UART_RX_BUF_SIZE 1024
 static uint8_t g_gsm0710_uart_rx_buf[GSM0710_UART_RX_BUF_SIZE];
 
 /* AT channel data receive callback */
