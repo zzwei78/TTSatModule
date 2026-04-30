@@ -173,8 +173,13 @@ static void uart_log_rx_task(void *pvParameters)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "UART%d Log RX Task started", TT_UART_LOG_PORT_NUM);
 
     while (1) {
+        // Pre-check available data to prevent buffer overflow
+        size_t buffered_len = 0;
+        uart_get_buffered_data_len(TT_UART_LOG_PORT_NUM, &buffered_len);
+        size_t read_len = (buffered_len > TT_UART_RX_BUF_SIZE) ? TT_UART_RX_BUF_SIZE : buffered_len;
+
         // Read data from UART using static buffer
-        int len = uart_read_bytes(TT_UART_LOG_PORT_NUM, g_uart_log_rx_buf, TT_UART_RX_BUF_SIZE, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(TT_UART_LOG_PORT_NUM, g_uart_log_rx_buf, read_len, pdMS_TO_TICKS(100));
 
         if (len > 0) {
             // Ensure null termination (safe since we reserve space)
@@ -185,6 +190,13 @@ static void uart_log_rx_task(void *pvParameters)
             }
             // Print log data
             SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "TT_LOG: %s", g_uart_log_rx_buf);
+
+            // Log if data was truncated
+            if (buffered_len > TT_UART_RX_BUF_SIZE) {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                    "UART log data truncated: %zu bytes available, read %d bytes",
+                    buffered_len, len);
+            }
         }
     }
 
@@ -350,8 +362,13 @@ static void uart_at_rx_task(void *pvParameters)
             continue;
         }
 
+        // Pre-check available data to prevent buffer overflow
+        size_t buffered_len = 0;
+        uart_get_buffered_data_len(TT_UART_AT_PORT_NUM, &buffered_len);
+        size_t read_len = (buffered_len > TT_UART_RX_BUF_SIZE) ? TT_UART_RX_BUF_SIZE : buffered_len;
+
         // Read data from UART using static buffer
-        int len = uart_read_bytes(TT_UART_AT_PORT_NUM, g_uart_at_rx_buf, TT_UART_RX_BUF_SIZE, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(TT_UART_AT_PORT_NUM, g_uart_at_rx_buf, read_len, pdMS_TO_TICKS(100));
 
         // Log heartbeat every 10 seconds (100 iterations)
         if (loop_count % 100 == 0) {
@@ -360,6 +377,12 @@ static void uart_at_rx_task(void *pvParameters)
         }
 
         if (len > 0) {
+            // Log if data was truncated
+            if (buffered_len > TT_UART_RX_BUF_SIZE) {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                    "UART AT data truncated: %zu bytes available, read %d bytes",
+                    buffered_len, len);
+            }
             SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "<<< UART RX RAW: %d bytes received", len);
 
             // Check for ^SIMST: if not already detected
@@ -423,8 +446,12 @@ static void tt_mux_init_task(void *pvParameters)
 {
     esp_err_t ret = ESP_OK;
     char at_response[TT_AT_RESP_BUF_SIZE];
+    bool mutex_taken = false;  /* Track mutex ownership for cleanup */
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "MUX Initialization Task started");
+
+    /* Cleanup label for error handling */
+    bool cleanup_needed = false;
 
     // === SIMST detection with power-cycle retry ===
     bool simst_detected = false;
@@ -489,6 +516,7 @@ static void tt_mux_init_task(void *pvParameters)
                         SIMST_MAX_RETRIES);
         set_tt_state(TT_STATE_HARDWARE_FAULT);
         g_tt_error_code = TT_ERROR_COMM_TIMEOUT;
+        tt_module_user_power_off();
         g_mux_init_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -543,6 +571,7 @@ static void tt_mux_init_task(void *pvParameters)
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Response: %s", at_response);
         set_tt_state(TT_STATE_HARDWARE_FAULT);
         g_tt_error_code = TT_ERROR_MUX_FAILED;
+        tt_module_user_power_off();
         g_mux_init_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -555,6 +584,7 @@ static void tt_mux_init_task(void *pvParameters)
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT+CMUX command failed");
         set_tt_state(TT_STATE_HARDWARE_FAULT);
         g_tt_error_code = TT_ERROR_MUX_FAILED;
+        tt_module_user_power_off();
         g_mux_init_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -783,6 +813,7 @@ static void tt_mux_init_task(void *pvParameters)
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT+CFUN=1 failed (result=%d), module not functional", cfun_result);
         set_tt_state(TT_STATE_HARDWARE_FAULT);
         g_tt_error_code = TT_ERROR_COMM_TIMEOUT;
+        tt_module_user_power_off();
         g_mux_init_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -1122,6 +1153,7 @@ esp_err_t tt_module_start(void)
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to power on module: %s", esp_err_to_name(ret));
         set_tt_state(TT_STATE_HARDWARE_FAULT);
         g_tt_error_code = TT_ERROR_HARDWARE_FAULT;
+        tt_module_user_power_off();
         return ret;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -2187,6 +2219,8 @@ esp_err_t tt_module_enter_ota_mode(void)
     g_tt_module.uart_mode = TT_UART_MODE_AT;
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Entered OTA mode successfully");
+
+    // Release mutex before returning
     xSemaphoreGive(g_tt_module.mode_mutex);
     return ESP_OK;
 }
@@ -2484,6 +2518,10 @@ esp_err_t tt_module_user_power_on(void)
     // State remains INITIALIZING (set by tt_module_start), will become WORKING after MUX init completes
     g_tt_module_powered = true;
 
+    // Notify sleep manager
+    extern void sleep_manager_notify_tt_powered_on(void);
+    sleep_manager_notify_tt_powered_on();
+
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module User Power On Complete (battery: %umV%s) ===",
         voltage_read_ok ? voltage_mv : 0, voltage_read_ok ? "" : " (unread)");
 
@@ -2529,6 +2567,10 @@ esp_err_t tt_module_user_power_off(void)
     // Step 7: Clear power flag and ensure final state
     g_tt_module_powered = false;
     set_tt_state(TT_STATE_USER_OFF);  // Ensure final state is USER_OFF
+
+    // Notify sleep manager
+    extern void sleep_manager_notify_tt_powered_off(void);
+    sleep_manager_notify_tt_powered_off();
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module User Power Off Complete ===");
 

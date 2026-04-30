@@ -138,6 +138,10 @@ static int spp_at_service_handler(uint16_t conn_handle, uint16_t attr_handle, st
 
             SYS_LOGD_MODULE(SYS_LOG_MODULE_SPP_AT, TAG, "AT Service - Data received: len=%d", data_len);
 
+            /* Notify sleep manager of BLE activity */
+            extern void sleep_manager_notify_activity(const char *source);
+            sleep_manager_notify_activity("spp_at_rx");
+
             // Check size limit
             if (data_len > SPP_AT_MAX_CMD_SIZE) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_SPP_AT, TAG, "Command too large: %d", data_len);

@@ -260,8 +260,9 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
     }
     info->voltage_mv = v_comp;
 
-    /* Step 5: Set current and charging status */
-    info->current_ma = current;
+    /* Step 5: Set current (average from power_manage cache) and charging status */
+    //info->current_ma = power_manage_get_avg_current();
+    info->current_ma = bq27220_get_current(battery_handle);
     info->charging = is_charging ? 1 : 0;
     info->full_charged = bat_status.FC ? 1 : 0;
 
@@ -1115,6 +1116,10 @@ static int system_service_handler(uint16_t conn_handle, uint16_t attr_handle,
 
     case BLE_GATT_ACCESS_OP_WRITE_CHR:
         if (attr_handle == system_control_val_handle) {
+            /* Notify sleep manager of BLE activity */
+            extern void sleep_manager_notify_activity(const char *source);
+            sleep_manager_notify_activity("sys_cmd_rx");
+
             // Parse new structured packet format: [seq][cmd][param_len][params...][crc16_lo][crc16_hi]
             SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "System control command received: len=%d", ctxt->om->om_len);
 
@@ -2088,6 +2093,11 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
                 resp_code = SYS_RESP_INVALID_PARAM;
                 break;
             }
+
+            /* Notify sleep manager of user activity */
+            extern void sleep_manager_notify_activity(const char *source);
+            sleep_manager_notify_activity("set_tt_power");
+
             bool power_on = cmd_params[0] != 0;
             esp_err_t ret;
 

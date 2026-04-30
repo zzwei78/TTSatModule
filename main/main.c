@@ -27,6 +27,7 @@
 #include "tt/tt_module.h"
 #include "system/power_manage.h"
 #include "system/ble_monitor.h"
+#include "system/sleep_manager.h"
 #include "config/user_params.h"
 #include "bq27220.h"
 
@@ -137,6 +138,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* Initialize sleep manager (detects deep sleep wakeup cause) */
+    sleep_manager_init();
+
     /* Initialize user parameters (NVS storage for user preferences) */
     ret = user_params_init();
     if (ret != ESP_OK) {
@@ -149,6 +153,44 @@ void app_main(void)
                         params ? params->low_battery_threshold_mv : USER_PARAMS_DEFAULT_LOW_BATT_MV);
     }
 
+    /* Initialize system log module */
+    ret = syslog_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize system log: %d", ret);
+        return;
+    }
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "System log initialized");
+
+    /* Print wakeup source (detected earlier, now syslog is ready) */
+    sleep_manager_print_wakeup_info();
+
+    /* ========== TEMP_AWAKE fast path (timer wakeup) ========== */
+    if (sleep_manager_is_temp_awake()) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "=== TEMP_AWAKE: minimal init (BLE advertise only) ===");
+
+        /* Minimal init: just power management + BLE */
+        ret = power_manage_init();
+        if (ret != ESP_OK) {
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Power management init failed: %s", esp_err_to_name(ret));
+        }
+
+        ret = ble_gatt_server_init();
+        if (ret != ESP_OK) {
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to initialize BLE GATT server: %d", ret);
+            return;
+        }
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BLE GATT server initialized (TEMP_AWAKE)");
+
+        /* Start temp_awake timer — will re-enter deep sleep if no BLE connection */
+        sleep_manager_start_temp_awake_timer();
+
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "=== TEMP_AWAKE ready, advertising for %ds ===",
+                        SLEEP_TEMP_AWAKE_SEC);
+        return;
+    }
+
+    /* ========== Full initialization path (normal boot or GPIO21 wakeup) ========== */
+
     /* Initialize audio codec service (AMRNB encode/decode) */
     ret = audio_svc_init();
     if (ret != 0) {
@@ -157,20 +199,6 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "Audio service initialized");
     }
-
-    /* Note: Voice service is disabled by default
-     * It can be started via System service command using BLE
-     */
-
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-    /* Initialize system log module */
-    ret = syslog_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize system log: %d", ret);
-        return;
-    }
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "System log initialized");
 
     /*
      * Initialization order:
@@ -245,6 +273,9 @@ void app_main(void)
         return;
     }
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BLE GATT server initialized");
+
+    /* Start sleep manager decision task */
+    sleep_manager_task_start();
 
     /* Step 5: Start BLE Health Monitor */
 #if BLE_MONITOR_ENABLED

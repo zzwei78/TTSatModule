@@ -383,6 +383,19 @@ int16_t bq27220_get_maxload_current(bq27220_handle_t bq_handle);
  */
 int16_t bq27220_get_standby_current(bq27220_handle_t bq_handle);
 
+/**
+ * @brief Get the raw coulomb count
+ *
+ * Returns an unsigned integer representing coulombs transferred.
+ * Counter increments during discharge, decrements during charge.
+ * Resets to zero when FC (Full Charge) bit is set.
+ *
+ * @param bq_handle[in] Handle to the BQ27220 device
+ *
+ * @return uint16_t Raw coulomb count
+ */
+uint16_t bq27220_get_raw_coulomb_count(bq27220_handle_t bq_handle);
+
 #ifdef __cplusplus
 }
 #endif

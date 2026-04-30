@@ -5,6 +5,7 @@
  */
 
 #include "ble/ble_gatt_server.h"
+#include "system/sleep_manager.h"
 #include "ble/ble_conn_manager.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -16,14 +17,42 @@
 #include "ble/gatt_log_server.h"
 #include "audio/voice_packet_handler.h"
 #include "system/syslog.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "BLE_GATT_SERVER";
+
+/* Atomic operations for ble_active_conn_count */
+#define BLE_CONN_COUNT_INC() do { \
+    UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR(); \
+    ble_active_conn_count++; \
+    taskEXIT_CRITICAL_FROM_ISR(interrupt_mask); \
+} while(0)
+
+#define BLE_CONN_COUNT_DEC() do { \
+    UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR(); \
+    if (ble_active_conn_count > 0) ble_active_conn_count--; \
+    taskEXIT_CRITICAL_FROM_ISR(interrupt_mask); \
+} while(0)
+
+#define BLE_CONN_COUNT_RESET() do { \
+    UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR(); \
+    ble_active_conn_count = 0; \
+    taskEXIT_CRITICAL_FROM_ISR(interrupt_mask); \
+} while(0)
+
+#define BLE_CONN_COUNT_GET() ({ \
+    UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR(); \
+    int count = ble_active_conn_count; \
+    taskEXIT_CRITICAL_FROM_ISR(interrupt_mask); \
+    count; \
+})
 
 // Connection handle subscription state (with mutex protection)
 static bool conn_handle_subs[CONFIG_BT_NIMBLE_MAX_CONNECTIONS + 1];
 static SemaphoreHandle_t conn_subs_mutex = NULL;
 static uint8_t own_addr_type;
-static int ble_active_conn_count = 0;
+static volatile int ble_active_conn_count = 0;  /* Use volatile for atomic access */
 
 static int ble_spp_server_gap_event(struct ble_gap_event *event, void *arg);
 void ble_store_config_init(void);
@@ -347,7 +376,7 @@ static int handle_gap_event_connect(struct ble_gap_event *event, void *arg)
             ble_spp_server_advertise();
         }
 #else
-        ble_active_conn_count = 0;
+        BLE_CONN_COUNT_RESET();
         ble_spp_server_advertise();
 #endif
         return 0;
@@ -361,9 +390,9 @@ static int handle_gap_event_connect(struct ble_gap_event *event, void *arg)
         return 0;
     }
 #else
-    if (ble_active_conn_count >= 1) {
+    if (BLE_CONN_COUNT_GET() >= 1) {
         MODLOG_DFLT(INFO, "Connection already exists (count=%d), rejecting new connection\n",
-                    ble_active_conn_count);
+                    BLE_CONN_COUNT_GET());
         ble_gap_adv_stop();
         ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return 0;
@@ -403,6 +432,10 @@ static int handle_gap_event_connect(struct ble_gap_event *event, void *arg)
     extern void tt_module_set_active_gatt_conn(uint16_t conn_handle);
     tt_module_set_active_gatt_conn(event->connect.conn_handle);
 
+    /* Notify sleep manager of BLE connection */
+    extern void sleep_manager_notify_ble_connected(void);
+    sleep_manager_notify_ble_connected();
+
     ble_conn_manager_print_info();
 
     if (ble_conn_manager_is_max_connections()) {
@@ -413,8 +446,8 @@ static int handle_gap_event_connect(struct ble_gap_event *event, void *arg)
                     ble_conn_manager_get_connection_count(), BLE_MAX_CONNECTIONS);
     }
 #else
-    ble_active_conn_count++;
-    MODLOG_DFLT(INFO, "Active connections: %d\n", ble_active_conn_count);
+    BLE_CONN_COUNT_INC();
+    MODLOG_DFLT(INFO, "Active connections: %d\n", BLE_CONN_COUNT_GET());
 
     syslog_set_gatt_conn_handle(event->connect.conn_handle);
 
@@ -454,7 +487,7 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
                     ble_conn_manager_get_connection_count());
     }
 #else
-    ble_active_conn_count = 0;
+    BLE_CONN_COUNT_RESET();
 
     syslog_clear_gatt_conn_handle();
     conn_set_subscribed(event->disconnect.conn.conn_handle, false);
@@ -465,6 +498,10 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
     MODLOG_DFLT(INFO, "All connections closed, restarting advertising\n");
     ble_spp_server_advertise();
 #endif
+
+    /* Notify sleep manager of BLE disconnection */
+    extern void sleep_manager_notify_ble_disconnected(void);
+    sleep_manager_notify_ble_disconnected();
 
     return 0;
 }
@@ -485,6 +522,11 @@ static int handle_gap_event_subscribe(struct ble_gap_event *event, void *arg)
                 event->subscribe.cur_indicate);
 
     conn_set_subscribed(event->subscribe.conn_handle, true);
+
+    /* Notify sleep manager of BLE activity */
+    extern void sleep_manager_notify_activity(const char *source);
+    sleep_manager_notify_activity("ble_subscribe");
+
     return 0;
 }
 

@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_intr_alloc.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "IP5561.h"
@@ -18,6 +19,15 @@
 #include "config/user_params.h"
 
 static const char *TAG = "POWER_MANAGE";
+
+/* Cached battery data for interrupt context access */
+static struct {
+    uint16_t voltage_mv;
+    int16_t current_ma;
+    bool is_charging;
+    uint32_t last_update_ms;
+    bool initialized;
+} g_battery_cache = {0};
 
 /* I2C bus handle */
 static i2c_master_bus_handle_t g_i2c_bus_handle = NULL;
@@ -35,6 +45,9 @@ static TaskHandle_t g_bq27220_task_handle = NULL;
 /* Monitor task running flags */
 static bool g_ip5561_task_running = false;
 static bool g_bq27220_task_running = false;
+
+/* Cached average current (calculated from CoulombCounter delta, updated every 60s) */
+static int16_t g_avg_current_ma = 0;
 
 /* IP5561 configuration fingerprint for reset detection */
 typedef struct {
@@ -93,6 +106,78 @@ static void ip5561_wakeup_sequence(void)
 
     gpio_set_level(IP5561_WAKEUP_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(IP5561_WAKEUP_DELAY_MS / 2));  /* 5ms stabilization */
+}
+
+/* ========== Interrupt-Safe Battery Data Access ========== */
+
+/**
+ * @brief Update battery cache with new readings
+ *
+ * This function should be called periodically from the monitor task
+ * to keep the cache fresh for interrupt context access.
+ */
+static void update_battery_cache(void)
+{
+    if (g_bq27220_handle == NULL) {
+        return;
+    }
+
+    /* Read battery data */
+    uint16_t voltage = bq27220_get_voltage(g_bq27220_handle);
+    int16_t current = bq27220_get_current(g_bq27220_handle);
+
+    /* Determine charging state */
+    bool is_charging = (current < -200);
+
+    /* Update cache atomically */
+    UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR();
+    g_battery_cache.voltage_mv = voltage;
+    g_battery_cache.current_ma = current;
+    g_battery_cache.is_charging = is_charging;
+    g_battery_cache.last_update_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    g_battery_cache.initialized = true;
+    taskEXIT_CRITICAL_FROM_ISR(interrupt_mask);
+}
+
+/**
+ * @brief Get battery voltage safely (works in interrupt context)
+ *
+ * In interrupt context, returns cached value.
+ * In normal context, reads from I2C directly.
+ */
+static uint16_t safe_get_battery_voltage(void)
+{
+    if (xPortInIsrContext()) {
+        /* In interrupt context - use cached value */
+        if (!g_battery_cache.initialized) {
+            return 0;  /* No cache available */
+        }
+        return g_battery_cache.voltage_mv;
+    }
+    /* In normal context - read from I2C directly */
+    if (g_bq27220_handle == NULL) {
+        return 0;
+    }
+    return bq27220_get_voltage(g_bq27220_handle);
+}
+
+/**
+ * @brief Get battery current safely (works in interrupt context)
+ */
+static int16_t safe_get_battery_current(void)
+{
+    if (xPortInIsrContext()) {
+        /* In interrupt context - use cached value */
+        if (!g_battery_cache.initialized) {
+            return 0;
+        }
+        return g_battery_cache.current_ma;
+    }
+    /* In normal context - read from I2C directly */
+    if (g_bq27220_handle == NULL) {
+        return 0;
+    }
+    return bq27220_get_current(g_bq27220_handle);
 }
 
 /* Enable/disable detailed diagnostics in monitor task */
@@ -266,8 +351,10 @@ static void __attribute__((unused)) ip5561_monitor_task(void *pvParameters)
         //power_manage_ip5561_print_diagnostics();
 #endif
 
-        /* Read every 10 seconds */
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        /* Read every 60 seconds (1s granularity for quick stop response) */
+        for (int i = 0; i < 60 && g_ip5561_task_running; i++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task stopped");
@@ -346,6 +433,16 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
 {
     if (decision_voltage == NULL || is_charging == NULL) {
         return ESP_FAIL;
+    }
+
+    /* Check interrupt context early - use cached values if in ISR */
+    if (xPortInIsrContext()) {
+        if (!g_battery_cache.initialized) {
+            return ESP_FAIL;
+        }
+        *decision_voltage = g_battery_cache.voltage_mv;
+        *is_charging = g_battery_cache.is_charging;
+        return ESP_OK;
     }
 
     esp_err_t ret;
@@ -473,50 +570,77 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
 
 static void __attribute__((unused)) bq27220_monitor_task(void *pvParameters)
 {
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 monitor task started (5s period)");
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  Discharging: OFF < %.1fV, ON >= %.1fV",
-                   POWER_MANAGE_TT_MODULE_V_OFF_MV / 1000.0f,
-                   POWER_MANAGE_TT_MODULE_V_ON_MV / 1000.0f);
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  Charging:    OFF < %.1fV, ON >= %.1fV (with IR compensation)",
-                   POWER_MANAGE_TT_MODULE_V_OFF_CHG_MV / 1000.0f,
-                   POWER_MANAGE_TT_MODULE_V_ON_CHG_MV / 1000.0f);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 monitor task started (60s period)");
 
     int error_count = 0;
-    uint32_t loop_count = 0;
+    uint16_t prev_coulomb_count = 0;
+    bool first_read = true;
 
     while (g_bq27220_task_running) {
-        loop_count++;
-
-        /* ========== Get compensated battery voltage with charging detection ========== */
-        uint16_t decision_voltage;
-        bool is_charging;
-        esp_err_t ret = get_battery_decision_voltage(&decision_voltage, &is_charging);
-
-        if (ret != ESP_OK) {
+        /* ========== Read all BQ27220 data ========== */
+        uint16_t voltage = bq27220_get_voltage(g_bq27220_handle);
+        if (voltage == 0) {
             error_count++;
             if (error_count > 3) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                    "Battery monitor failed %d times, skipping this cycle", error_count);
+                    "BQ27220 read failed %d times", error_count);
             }
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            for (int i = 0; i < 60 && g_bq27220_task_running; i++) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
             continue;
         }
 
-        error_count = 0;  /* Reset error counter on success */
+        error_count = 0;
 
-        /* ========== TT Module Power Control DISABLED ========== */
-        /* Phone call has highest priority - no automatic power control based on battery */
-        SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "[Battery] V=%umV, Charging=%d (TT auto-control disabled, phone call priority)",
-            decision_voltage, is_charging);
+        int16_t instant_current = bq27220_get_current(g_bq27220_handle);
+        uint16_t coulomb_count = bq27220_get_raw_coulomb_count(g_bq27220_handle);
+        uint16_t soc = bq27220_get_state_of_charge(g_bq27220_handle);
+        int16_t avg_power = bq27220_get_average_power(g_bq27220_handle);
 
-        /* Wait 20 seconds before next check */
-        vTaskDelay(pdMS_TO_TICKS(20000));
+        /* ========== Update battery cache for interrupt context ========== */
+        update_battery_cache();
+
+        /* ========== Calculate average current from CoulombCounter delta ========== */
+        int32_t avg_current_ma = 0;
+        if (!first_read) {
+            int32_t delta = (int32_t)coulomb_count - (int32_t)prev_coulomb_count;
+            /* Delta > 0 = discharge (coulomb count increased)
+             * Delta < 0 = charge (coulomb count decreased)
+             * avg_current = delta_mAh * 3600 / interval_s
+             * TODO: confirm CoulombCount unit, adjust if not 1 LSB = 1 mAh */
+            avg_current_ma = delta * 3600 / 60;
+        }
+        first_read = false;
+        prev_coulomb_count = coulomb_count;
+
+        /* Cache average current for other modules to read
+         * CoulombCount convention is opposite to Current(): negate to match
+         * APP convention: discharge positive, charge negative */
+        g_avg_current_ma = -(int16_t)avg_current_ma;
+
+        /* ========== Print battery status ========== */
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[BATT] V=%umV, I_now=%dmA, I_avg=%dmA, SOC=%u%%, P_avg=%dmW, Coulomb=%u",
+            voltage, instant_current, avg_current_ma, soc, avg_power, coulomb_count);
+
+        /* Wait 60 seconds before next check (1s granularity for quick stop response) */
+        for (int i = 0; i < 60 && g_bq27220_task_running; i++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
 
     SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 monitor task exiting");
     g_bq27220_task_handle = NULL;
     vTaskDelete(NULL);
+}
+
+int16_t power_manage_get_avg_current(void)
+{
+    if (g_avg_current_ma == 0 && g_bq27220_handle != NULL) {
+        return bq27220_get_current(g_bq27220_handle);
+    }
+    return g_avg_current_ma;
 }
 
 /* ========== Independent Device Initialization Functions ========== */
@@ -1767,9 +1891,14 @@ esp_err_t power_manage_get_calibrated_soc(uint16_t *soc_percent)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Get battery voltage and current
-    uint16_t voltage_mv = bq27220_get_voltage(battery_handle);
-    int16_t current_ma = bq27220_get_current(battery_handle);
+    // Get battery voltage and current (interrupt-safe)
+    uint16_t voltage_mv = safe_get_battery_voltage();
+    int16_t current_ma = safe_get_battery_current();
+
+    if (voltage_mv == 0 && !xPortInIsrContext()) {
+        // I2C read failed and not in interrupt context
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // Use apply_ir_compensation to get V_comp
     bool is_charging = false;
@@ -1838,33 +1967,36 @@ esp_err_t power_manage_get_battery_voltage_compensated(uint16_t *voltage_mv, boo
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Get battery voltage and current */
-    uint16_t voltage = bq27220_get_voltage(battery_handle);
-    if (voltage == 0) {
+    /* Get battery voltage and current (interrupt-safe) */
+    uint16_t voltage = safe_get_battery_voltage();
+    if (voltage == 0 && !xPortInIsrContext()) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to read battery voltage");
         return ESP_FAIL;
     }
 
-    int16_t current = bq27220_get_current(battery_handle);
+    int16_t current = safe_get_battery_current();
 
-    /* Get battery status to determine charging state */
-    battery_status_t bat_status;
+    /* Determine charging state based on current with hysteresis */
     bool charging = false;
 
-    if (bq27220_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
-        /* Determine charging state based on current with hysteresis
-         * BQ27220: Negative current = charging, Positive current = discharging
-         */
-        if (current < -200) {
-            /* Clearly charging: current < -200mA */
-            charging = true;
-        } else if (current > 200) {
-            /* Clearly discharging: current > 200mA */
-            charging = false;
-        } else {
-            /* Small current zone (-200mA ~ +200mA): use DSG flag */
-            charging = !bat_status.DSG;
+    if (!xPortInIsrContext() && battery_handle != NULL) {
+        /* Not in interrupt context - we can read battery status */
+        battery_status_t bat_status;
+        if (bq27220_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
+            if (current < -200) {
+                /* Clearly charging: current < -200mA */
+                charging = true;
+            } else if (current > 200) {
+                /* Clearly discharging: current > 200mA */
+                charging = false;
+            } else {
+                /* Small current zone (-200mA ~ +200mA): use DSG flag */
+                charging = !bat_status.DSG;
+            }
         }
+    } else {
+        /* In interrupt context - use cache or current-based detection */
+        charging = (current < -200) ? true : (current > 200) ? false : false;
     }
 
     /* Use apply_ir_compensation for consistency */

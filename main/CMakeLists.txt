@@ -39,6 +39,7 @@ set(SYSTEM_SRCS
     "system/ota_partition.c"
     "system/syslog.c"
     "system/ble_monitor.c"
+    "system/sleep_manager.c"
 )
 
 # Config source files

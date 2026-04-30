@@ -47,6 +47,11 @@ esp_err_t tt_hw_init(void)
     esp_rom_gpio_pad_select_gpio(TT_UART_BOOT);
     esp_rom_gpio_pad_select_gpio(TT_IOTL_GPIO);
 
+    /* Release GPIO holds from deep sleep (hold persists across wakeup reset on ESP32-S3) */
+    gpio_hold_dis(GPIO_TTPWR_EN);
+    gpio_hold_dis(AP_WAKEUP_BB_PIN);
+    gpio_deep_sleep_hold_dis();
+
     /* Configure Output Pins */
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;

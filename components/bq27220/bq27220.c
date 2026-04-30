@@ -373,6 +373,11 @@ int16_t bq27220_get_avgcurrent(bq27220_handle_t bq_handle)
     return bq27220_read_u16(bq_handle, COMMAND_AVERAGE_CURRENT);
 }
 
+uint16_t bq27220_get_raw_coulomb_count(bq27220_handle_t bq_handle)
+{
+    return bq27220_read_u16(bq_handle, COMMAND_RAW_COULOMB_COUNT);
+}
+
 esp_err_t bq27220_get_battery_status(bq27220_handle_t bq_handle, battery_status_t *battery_status)
 {
     uint16_t data = bq27220_read_u16(bq_handle, COMMAND_BATTERY_STATUS);

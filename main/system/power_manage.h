@@ -358,6 +358,16 @@ esp_err_t power_manage_get_calibrated_soc(uint16_t *soc_percent);
  */
 esp_err_t power_manage_get_battery_voltage_compensated(uint16_t *voltage_mv, bool *is_charging);
 
+/**
+ * @brief Get cached average battery current (updated every 60s by BQ27220 monitor)
+ *
+ * Calculated from CoulombCounter delta over 60 seconds.
+ * Positive = discharging, negative = charging.
+ *
+ * @return int16_t Average current in mA, 0 if not yet calculated
+ */
+int16_t power_manage_get_avg_current(void);
+
 #ifdef __cplusplus
 }
 #endif
