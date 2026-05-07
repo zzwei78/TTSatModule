@@ -530,8 +530,10 @@ static void tt_mux_init_task(void *pvParameters)
     // Send AT+CMUX command to enter MUX mode
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Sending AT+CMUX command to enter MUX mode...");
 
-    // Update state BEFORE sending command
-    g_tt_module.state = TT_STATE_WAITING_MUX_RESP;  // Transient state, no status update
+    // NOTE: Do NOT set WAITING_MUX_RESP before sending command!
+    // AT RX task checks this state and pauses UART reading.
+    // The LOCAL CMD mechanism depends on AT RX task to read the response.
+    // Set state AFTER the response is received.
 
     // Format the AT command (without "AT" prefix, as tt_module_send_at_cmd will add it)
     // Use parameters: <mode>=0 (basic), <subset>=0 (no UIH frames only), <port_speed>=5 (115200), <N1>=1600 (max frame size)
@@ -568,7 +570,10 @@ static void tt_mux_init_task(void *pvParameters)
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Successfully entered MUX mode");
-    // State remains INITIALIZING until CFUN=1 succeeds
+
+    // NOW set state to WAITING_MUX_RESP - AT RX task should pause
+    // so that the MUX init code can handle GSM0710 framing
+    g_tt_module.state = TT_STATE_WAITING_MUX_RESP;
 
     // Update UART mode to MUX mode
     if (xSemaphoreTake(g_tt_module.mode_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {

@@ -733,56 +733,57 @@ void sleep_manager_enter_deep_sleep(void)
 /* ========== TEMP_AWAKE Timer ========== */
 
 /**
- * @brief TEMP_AWAKE timer callback with race condition protection
+ * @brief TEMP_AWAKE timeout handler task (runs with its own stack)
  *
- * This callback is called when the TEMP_AWAKE timer expires. Before entering
- * deep sleep, we must check:
- * 1. BLE connection status - if connected or connecting, abort deep sleep
- * 2. Deferred init task status - if running, wait for it to complete
+ * Spawned by temp_awake_timer_callback to avoid stack overflow in the
+ * Timer Service task. Performs safety checks before entering deep sleep.
+ */
+static void temp_awake_timeout_task(void *pvParameters)
+{
+    SYS_LOGI(TAG, "TEMP_AWAKE timeout, checking conditions before deep sleep...");
+
+    /* Safety Check 1: Deferred init already completed */
+    if (g_deferred_init_done) {
+        SYS_LOGW(TAG, "TEMP_AWAKE: Deferred init completed, should not be here");
+    }
+
+    /* Safety Check 2: BLE connection */
+    if (is_ble_connected()) {
+        SYS_LOGI(TAG, "TEMP_AWAKE: BLE connected, aborting deep sleep");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Safety Check 3: Sleep inhibit */
+    if (g_inhibit_sleep) {
+        SYS_LOGW(TAG, "TEMP_AWAKE: Sleep inhibited, aborting deep sleep");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Safety Check 4: Current mode */
+    if (g_current_mode != SLEEP_MODE_TEMP_AWAKE) {
+        SYS_LOGW(TAG, "TEMP_AWAKE: Mode changed to %d, aborting deep sleep", g_current_mode);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    SYS_LOGI(TAG, "TEMP_AWAKE: All checks passed, entering deep sleep");
+    sleep_manager_enter_deep_sleep();
+    /* Does not return */
+}
+
+/**
+ * @brief TEMP_AWAKE timer callback (runs in Timer Service context)
  *
- * Race conditions prevented:
- * - Timer expires while BLE connection is being established
- * - Timer expires while deferred init task is initializing services
- * - Connection event arrives just before timer check
+ * IMPORTANT: Keep this function minimal! The Timer Service task has a small
+ * stack (~2KB). We only spawn a dedicated task here to do the heavy work
+ * (logging, BLE scanning, I2C reads, deep sleep entry).
  */
 static void temp_awake_timer_callback(TimerHandle_t xTimer)
 {
     (void)xTimer;
-
-    SYS_LOGI(TAG, "TEMP_AWAKE timer expired, checking conditions before deep sleep...");
-
-    /* ========== Safety Check 1: Check if deferred init is running ========== */
-    if (g_deferred_init_done) {
-        SYS_LOGW(TAG, "TEMP_AWAKE: Deferred init already completed, should not be in TEMP_AWAKE mode");
-        /* This is unexpected - if deferred init completed, we should have transitioned
-         * out of TEMP_AWAKE mode. Log warning but continue with checks. */
-    }
-
-    /* ========== Safety Check 2: Check BLE connection via helper function ========== */
-    if (is_ble_connected()) {
-        /* BLE is connected - abort deep sleep, normal initialization will proceed */
-        SYS_LOGI(TAG, "TEMP_AWAKE: BLE connected, aborting deep sleep");
-        /* Mode transition will be handled by sleep_manager_notify_ble_connected() */
-        return;
-    }
-
-    /* ========== Safety Check 3: Check sleep inhibit flag ========== */
-    if (g_inhibit_sleep) {
-        SYS_LOGW(TAG, "TEMP_AWAKE: Sleep inhibited, aborting deep sleep");
-        return;
-    }
-
-    /* ========== Safety Check 4: Check current mode ========== */
-    /* If we're no longer in TEMP_AWAKE mode, something else changed state */
-    if (g_current_mode != SLEEP_MODE_TEMP_AWAKE) {
-        SYS_LOGW(TAG, "TEMP_AWAKE: Mode changed to %d, aborting deep sleep", g_current_mode);
-        return;
-    }
-
-    /* ========== All checks passed - safe to enter deep sleep ========== */
-    SYS_LOGI(TAG, "TEMP_AWAKE: All checks passed (ble=%d, inhibit=%d, mode=%d), entering deep sleep",
-             g_ble_conn_count, g_inhibit_sleep, g_current_mode);
-    sleep_manager_enter_deep_sleep();
+    xTaskCreate(temp_awake_timeout_task, "temp_awake_to", 4096, NULL, 3, NULL);
 }
 
 void sleep_manager_temp_awake_timeout(void)
