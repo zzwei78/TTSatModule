@@ -173,13 +173,8 @@ static void uart_log_rx_task(void *pvParameters)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "UART%d Log RX Task started", TT_UART_LOG_PORT_NUM);
 
     while (1) {
-        // Pre-check available data to prevent buffer overflow
-        size_t buffered_len = 0;
-        uart_get_buffered_data_len(TT_UART_LOG_PORT_NUM, &buffered_len);
-        size_t read_len = (buffered_len > TT_UART_RX_BUF_SIZE) ? TT_UART_RX_BUF_SIZE : buffered_len;
-
-        // Read data from UART using static buffer
-        int len = uart_read_bytes(TT_UART_LOG_PORT_NUM, g_uart_log_rx_buf, read_len, pdMS_TO_TICKS(100));
+        // Read data from UART, limit to buffer size
+        int len = uart_read_bytes(TT_UART_LOG_PORT_NUM, g_uart_log_rx_buf, TT_UART_RX_BUF_SIZE, pdMS_TO_TICKS(100));
 
         if (len > 0) {
             // Ensure null termination (safe since we reserve space)
@@ -190,13 +185,6 @@ static void uart_log_rx_task(void *pvParameters)
             }
             // Print log data
             SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "TT_LOG: %s", g_uart_log_rx_buf);
-
-            // Log if data was truncated
-            if (buffered_len > TT_UART_RX_BUF_SIZE) {
-                SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
-                    "UART log data truncated: %zu bytes available, read %d bytes",
-                    buffered_len, len);
-            }
         }
     }
 
@@ -362,13 +350,8 @@ static void uart_at_rx_task(void *pvParameters)
             continue;
         }
 
-        // Pre-check available data to prevent buffer overflow
-        size_t buffered_len = 0;
-        uart_get_buffered_data_len(TT_UART_AT_PORT_NUM, &buffered_len);
-        size_t read_len = (buffered_len > TT_UART_RX_BUF_SIZE) ? TT_UART_RX_BUF_SIZE : buffered_len;
-
-        // Read data from UART using static buffer
-        int len = uart_read_bytes(TT_UART_AT_PORT_NUM, g_uart_at_rx_buf, read_len, pdMS_TO_TICKS(100));
+        // Read data from UART, limit to buffer size
+        int len = uart_read_bytes(TT_UART_AT_PORT_NUM, g_uart_at_rx_buf, TT_UART_RX_BUF_SIZE, pdMS_TO_TICKS(100));
 
         // Log heartbeat every 10 seconds (100 iterations)
         if (loop_count % 100 == 0) {
@@ -377,12 +360,6 @@ static void uart_at_rx_task(void *pvParameters)
         }
 
         if (len > 0) {
-            // Log if data was truncated
-            if (buffered_len > TT_UART_RX_BUF_SIZE) {
-                SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
-                    "UART AT data truncated: %zu bytes available, read %d bytes",
-                    buffered_len, len);
-            }
             SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "<<< UART RX RAW: %d bytes received", len);
 
             // Check for ^SIMST: if not already detected

@@ -34,7 +34,7 @@ typedef enum {
 
 #define SLEEP_LIGHT_IDLE_SEC        10      /* First entry: idle before light sleep */
 #define SLEEP_LIGHT_REENTER_SEC     2       /* Re-entry: quick re-sleep after wake */
-#define SLEEP_DEEP_IDLE_SEC         600     /* BLE disconnected: idle before deep sleep (10 min) */
+#define SLEEP_DEEP_IDLE_SEC         60      /* BLE disconnected: idle before deep sleep (10 min) */
 #define SLEEP_TEMP_AWAKE_SEC        5       /* Timer wakeup: BLE advertise duration */
 #define SLEEP_DEEP_TIMER_SEC        60      /* Deep sleep interval between timer wakeups */
 #define SLEEP_LIGHT_TIMER_SEC       30      /* Light sleep timer interval (battery check) */
