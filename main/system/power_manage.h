@@ -23,7 +23,7 @@ extern "C" {
  * When battery voltage drops below this threshold, TT module will be powered off.
  * Unit: millivolts (mV)
  */
-#define POWER_MANAGE_TT_MODULE_V_OFF_MV     3500    /* 3.5V - Turn OFF threshold (discharging) */
+#define POWER_MANAGE_TT_MODULE_V_OFF_MV     3100    /* 3.1V - Turn OFF threshold (discharging) */
 
 /**
  * @brief TT module power ON threshold
@@ -32,7 +32,7 @@ extern "C" {
  * This threshold is higher than V_OFF to provide hysteresis and prevent oscillation.
  * Unit: millivolts (mV)
  */
-#define POWER_MANAGE_TT_MODULE_V_ON_MV      3600    /* 3.6V - Turn ON threshold (discharging) */
+#define POWER_MANAGE_TT_MODULE_V_ON_MV      3300    /* 3.3V - Turn ON threshold (discharging) */
 
 /**
  * @brief TT module power OFF threshold during charging

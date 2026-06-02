@@ -69,6 +69,13 @@ void gatt_ota_server_enable(void);
 void gatt_ota_server_disable(void);
 
 /**
+ * @brief Check if OTA service is enabled
+ *
+ * @return true if enabled, false otherwise
+ */
+bool gatt_ota_server_is_enabled(void);
+
+/**
  * @brief Check if OTA is in progress
  *
  * @return true if OTA is in progress, false otherwise

@@ -86,4 +86,11 @@ void gatt_log_server_enable(void);
  */
 void gatt_log_server_disable(void);
 
+/**
+ * @brief Check if Log service is enabled
+ *
+ * @return true if enabled, false otherwise
+ */
+bool gatt_log_server_is_enabled(void);
+
 #endif /* GATT_LOG_SERVER_H */

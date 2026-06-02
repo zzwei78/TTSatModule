@@ -144,23 +144,6 @@ static volatile uint8_t g_seq_counter = 0;
 static uint8_t g_system_cmd_buffer[SYSTEM_CMD_BUFFER_SIZE];
 static SemaphoreHandle_t g_cmd_buffer_mutex = NULL;
 
-/* Service status structure */
-typedef struct {
-    bool ota_enabled;
-    bool log_enabled;
-    bool at_enabled;
-    bool spp_enabled;
-    bool voice_enabled;
-} service_status_t;
-
-static service_status_t g_service_status = {
-    .ota_enabled = false,
-    .log_enabled = false,
-    .at_enabled = true,    // AT service is always enabled (core service)
-    .spp_enabled = true,   // SYSTEM service is always enabled (core service)
-    .voice_enabled = true // Voice service is disabled by default
-};
-
 /* System server initialization flag */
 static bool g_system_server_initialized = false;
 
@@ -660,6 +643,16 @@ static void print_system_command(const uint8_t *data, size_t len)
         cmd_name = "GET_VOICE_FRAME_MODE";
         break;
 
+    case SYS_CMD_TT_FORCE_ON:
+        cmd_name = "TT_FORCE_ON";
+        snprintf(param_str, sizeof(param_str), "Force TT module on (ignore low battery)");
+        break;
+
+    case SYS_CMD_TT_FORCE_OFF:
+        cmd_name = "TT_FORCE_OFF";
+        snprintf(param_str, sizeof(param_str), "Cancel force, restore low battery protection");
+        break;
+
     default:
         snprintf(param_str, sizeof(param_str), "Unknown command (0x%02x)", cmd);
         break;
@@ -913,11 +906,11 @@ static esp_err_t handle_system_control_command(uint16_t conn_handle, const uint8
 
             // Build service status bitmask
             sys_info.service_status = 0;
-            if (g_service_status.ota_enabled) sys_info.service_status |= (1 << 0);
-            if (g_service_status.log_enabled) sys_info.service_status |= (1 << 1);
-            if (g_service_status.at_enabled) sys_info.service_status |= (1 << 2);
-            if (g_service_status.spp_enabled) sys_info.service_status |= (1 << 3);
-            if (g_service_status.voice_enabled) sys_info.service_status |= (1 << 4);
+            if (gatt_ota_server_is_enabled()) sys_info.service_status |= (1 << 0);
+            if (gatt_log_server_is_enabled()) sys_info.service_status |= (1 << 1);
+            sys_info.service_status |= (1 << 2);  // AT always enabled
+            sys_info.service_status |= (1 << 3);  // SPP always enabled
+            if (spp_voice_server_is_enabled()) sys_info.service_status |= (1 << 4);
 
             memcpy(resp_data + 1, &sys_info, sizeof(sys_info));
             resp_len = 1 + sizeof(sys_info);
@@ -1081,11 +1074,11 @@ static esp_err_t handle_system_info_read(uint16_t conn_handle)
 
     // Build service status bitmask
     sys_info.service_status = 0;
-    if (g_service_status.ota_enabled) sys_info.service_status |= (1 << 0);
-    if (g_service_status.log_enabled) sys_info.service_status |= (1 << 1);
-    if (g_service_status.at_enabled) sys_info.service_status |= (1 << 2);
-    if (g_service_status.spp_enabled) sys_info.service_status |= (1 << 3);
-    if (g_service_status.voice_enabled) sys_info.service_status |= (1 << 4);
+    if (gatt_ota_server_is_enabled()) sys_info.service_status |= (1 << 0);
+    if (gatt_log_server_is_enabled()) sys_info.service_status |= (1 << 1);
+    sys_info.service_status |= (1 << 2);  // AT always enabled
+    sys_info.service_status |= (1 << 3);  // SPP always enabled
+    if (spp_voice_server_is_enabled()) sys_info.service_status |= (1 << 4);
 
     // Send system info
     struct os_mbuf *txom = ble_hs_mbuf_from_flat(&sys_info, sizeof(sys_info));
@@ -1279,24 +1272,22 @@ int gatt_system_server_start_service(uint8_t service_id)
 
     switch (service_id) {
     case SYS_SERVICE_ID_OTA:
-        if (g_service_status.ota_enabled) {
+        if (gatt_ota_server_is_enabled()) {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "OTA service already running");
             return -1;
         }
         // Service is already initialized during startup, just enable it
         gatt_ota_server_enable();
-        g_service_status.ota_enabled = true;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "OTA service started");
         break;
 
     case SYS_SERVICE_ID_LOG:
-        if (g_service_status.log_enabled) {
+        if (gatt_log_server_is_enabled()) {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Log service already running");
             return -1;
         }
         // Service is already initialized during startup, just enable it
         gatt_log_server_enable();
-        g_service_status.log_enabled = true;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Log service started");
         break;
 
@@ -1311,7 +1302,7 @@ int gatt_system_server_start_service(uint8_t service_id)
         return -1;
 
     case SYS_SERVICE_ID_VOICE:
-        if (g_service_status.voice_enabled) {
+        if (spp_voice_server_is_enabled()) {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Voice service already running");
             return -1;
         }
@@ -1322,7 +1313,6 @@ int gatt_system_server_start_service(uint8_t service_id)
         }
         // Service is already initialized during startup, just enable it
         spp_voice_server_enable();
-        g_service_status.voice_enabled = true;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Voice GATT service started");
         break;
 
@@ -1341,22 +1331,20 @@ int gatt_system_server_stop_service(uint8_t service_id)
 {
     switch (service_id) {
     case SYS_SERVICE_ID_OTA:
-        if (!g_service_status.ota_enabled) {
+        if (!gatt_ota_server_is_enabled()) {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "OTA service not running");
             return -1;
         }
         gatt_ota_server_disable();
-        g_service_status.ota_enabled = false;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "OTA service stopped");
         break;
 
     case SYS_SERVICE_ID_LOG:
-        if (!g_service_status.log_enabled) {
+        if (!gatt_log_server_is_enabled()) {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Log service not running");
             return -1;
         }
         gatt_log_server_disable();
-        g_service_status.log_enabled = false;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Log service stopped");
         break;
 
@@ -1371,12 +1359,11 @@ int gatt_system_server_stop_service(uint8_t service_id)
         return -1;
 
     case SYS_SERVICE_ID_VOICE:
-        if (!g_service_status.voice_enabled) {
+        if (!spp_voice_server_is_enabled()) {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Voice service not running");
             return -1;
         }
         spp_voice_server_disable();
-        g_service_status.voice_enabled = false;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Voice GATT service stopped");
         break;
 
@@ -1395,15 +1382,15 @@ int gatt_system_server_get_service_status(uint8_t service_id)
 {
     switch (service_id) {
     case SYS_SERVICE_ID_OTA:
-        return g_service_status.ota_enabled ? 1 : 0;
+        return gatt_ota_server_is_enabled() ? 1 : 0;
     case SYS_SERVICE_ID_LOG:
-        return g_service_status.log_enabled ? 1 : 0;
+        return gatt_log_server_is_enabled() ? 1 : 0;
     case SYS_SERVICE_ID_AT:
-        return g_service_status.at_enabled ? 1 : 0;
+        return 1;  // AT service is always enabled
     case SYS_SERVICE_ID_SPP:
-        return g_service_status.spp_enabled ? 1 : 0;
+        return 1;  // SPP/System service is always enabled
     case SYS_SERVICE_ID_VOICE:
-        return g_service_status.voice_enabled ? 1 : 0;
+        return spp_voice_server_is_enabled() ? 1 : 0;
     default:
         return -1;
     }
@@ -1776,11 +1763,11 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
             // Build service status bitmask
             sys_info.service_status = 0;
-            if (g_service_status.ota_enabled) sys_info.service_status |= (1 << 0);
-            if (g_service_status.log_enabled) sys_info.service_status |= (1 << 1);
-            if (g_service_status.at_enabled) sys_info.service_status |= (1 << 2);
-            if (g_service_status.spp_enabled) sys_info.service_status |= (1 << 3);
-            if (g_service_status.voice_enabled) sys_info.service_status |= (1 << 4);
+            if (gatt_ota_server_is_enabled()) sys_info.service_status |= (1 << 0);
+            if (gatt_log_server_is_enabled()) sys_info.service_status |= (1 << 1);
+            sys_info.service_status |= (1 << 2);  // AT always enabled
+            sys_info.service_status |= (1 << 3);  // SPP always enabled
+            if (spp_voice_server_is_enabled()) sys_info.service_status |= (1 << 4);
 
             memcpy(resp_data, &sys_info, sizeof(sys_info));
             resp_len = sizeof(sys_info);
@@ -2073,13 +2060,14 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
         {
             tt_status_info_t info;
             if (tt_module_get_status_info(&info) == ESP_OK) {
-                // Response format: [state][voltage_mv_lo][voltage_mv_hi][error_code][reserved1][reserved2]
+                // Response format: [state][voltage_mv_lo][voltage_mv_hi][error_code][flags][reserved]
+                // flags: bit0 = force_on
                 resp_data[0] = (uint8_t)info.state;
                 resp_data[1] = (uint8_t)(info.voltage_mv & 0xFF);        // voltage low byte
                 resp_data[2] = (uint8_t)((info.voltage_mv >> 8) & 0xFF); // voltage high byte
                 resp_data[3] = info.error_code;
-                resp_data[4] = 0x00;  // reserved1
-                resp_data[5] = 0x00;  // reserved2
+                resp_data[4] = info.flags;    // flags (bit0: force_on)
+                resp_data[5] = 0x00;          // reserved
                 resp_len = 6;
             } else {
                 resp_code = SYS_RESP_ERROR;
@@ -2138,6 +2126,46 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
         {
             resp_data[0] = voice_packet_get_frame_mode();
             resp_len = 1;
+        }
+        break;
+
+    case SYS_CMD_TT_FORCE_ON:
+        {
+            esp_err_t ret = tt_module_force_on();
+            tt_state_t state = tt_module_get_state();
+            uint16_t v = 0;
+            bq27220_handle_t bq = power_manage_get_bq27220_handle();
+            if (bq) v = bq27220_get_voltage(bq);
+
+            if (ret == ESP_OK) {
+                resp_code = SYS_RESP_OK;
+            } else if (ret == ESP_ERR_NOT_ALLOWED) {
+                resp_code = SYS_RESP_ERROR;
+            } else {
+                resp_code = SYS_RESP_ERROR;
+            }
+
+            // Response: [state][voltage_lo][voltage_hi]
+            resp_data[0] = (uint8_t)state;
+            resp_data[1] = (uint8_t)(v & 0xFF);
+            resp_data[2] = (uint8_t)((v >> 8) & 0xFF);
+            resp_len = 3;
+        }
+        break;
+
+    case SYS_CMD_TT_FORCE_OFF:
+        {
+            tt_module_force_off();
+            tt_state_t state = tt_module_get_state();
+            uint16_t v = 0;
+            bq27220_handle_t bq = power_manage_get_bq27220_handle();
+            if (bq) v = bq27220_get_voltage(bq);
+
+            // Response: [state][voltage_lo][voltage_hi]
+            resp_data[0] = (uint8_t)state;
+            resp_data[1] = (uint8_t)(v & 0xFF);
+            resp_data[2] = (uint8_t)((v >> 8) & 0xFF);
+            resp_len = 3;
         }
         break;
 
@@ -2317,16 +2345,6 @@ int gatt_system_server_init(void)
         SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Failed to add system service: rc=%d", rc);
         return rc;
     }
-
-    /* Initialize service status */
-    /* Note: SPP and AT services are initialized in ble_gatt_server_init() */
-    /* LOG, OTA, and VOICE services are disabled by default */
-    /* They can be started dynamically via System service commands */
-    g_service_status.spp_enabled = true;     /* Core service, always enabled */
-    g_service_status.at_enabled = true;      /* Always running */
-    g_service_status.log_enabled = false;    /* Default disabled, start via SYS_CMD_SERVICE_START */
-    g_service_status.ota_enabled = false;    /* Default disabled, start via SYS_CMD_SERVICE_START */
-    g_service_status.voice_enabled = true;  /* Default disabled, start via SYS_CMD_SERVICE_START */
 
     g_system_server_initialized = true;
     SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "GATT System server initialized successfully");

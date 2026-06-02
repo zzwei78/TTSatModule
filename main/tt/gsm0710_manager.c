@@ -353,7 +353,7 @@ static void gsm0710_deliver_data_cb(struct gsm0710_context *ctx, int channel, co
     // - NONE context: Forward as unsolicited notification
     if (channel == GSM0710_CHANNEL_AT) {
         if (g_at_channel_callback != NULL) {
-            SYS_LOGD_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> MUX ROUTE: Forwarding %d bytes from AT channel to tt_module", len);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> MUX AT CH: %d bytes: %.*s", len, len > 80 ? 80 : len, data);
             g_at_channel_callback((const uint8_t *)data, len, g_at_channel_callback_user_data);
         } else {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "<<< MUX ROUTE: No AT channel callback registered, data dropped!");
@@ -362,7 +362,7 @@ static void gsm0710_deliver_data_cb(struct gsm0710_context *ctx, int channel, co
 
     // For Voice AT channel (channel 2), check for heartbeat response
     if (channel == GSM0710_CHANNEL_VOICE_AT) {
-        SYS_LOGD_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "GSM0710 MUX READ (ch=%d): %.*s", channel, len, (char *)data);
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> MUX VOICE AT CH: %d bytes: %.*s", len, len > 80 ? 80 : len, (char *)data);
 
         // Check if this is a heartbeat response
         if (g_gsm_mgr.heartbeat_waiting) {

@@ -796,6 +796,11 @@ void gatt_ota_server_disable(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA service disabled");
 }
 
+bool gatt_ota_server_is_enabled(void)
+{
+    return g_ota_service_enabled;
+}
+
 /**
  * @brief Check if OTA is in progress
  */

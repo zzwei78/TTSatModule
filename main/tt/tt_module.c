@@ -21,6 +21,7 @@
 #include "config/user_params.h"
 #include "bq27220.h"
 
+
 /* External variable for BLE connection subscriptions */
 /* Note: conn_handle_subs is not used in LED_TEST (no BLE) */
 
@@ -44,6 +45,7 @@ static tt_module_t g_tt_module = {
  */
 static bool g_tt_module_powered = false;              /* Power state */
 static uint8_t g_tt_error_code = TT_ERROR_NONE;       /* Current error code */
+static bool g_tt_force_on = false;                    /* Force on flag (phone call) */
 
 /* UART Configuration for Log Port */
 static const uart_config_t uart_log_config __attribute__((unused)) = {
@@ -281,7 +283,8 @@ static void handle_simst_detection(const char *found_simst,
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "TT module ready (^SIMST: detected), AT commands now allowed");
 
     // Notify MUX init task or create one if not running
-    if (sim_ready) {
+    // if (sim_ready) {
+    if (g_simst_detected) {
         if (g_mux_init_task_handle == NULL) {
             // Task not running (e.g., previous attempt exited after baud rate failure)
             // Create a new mux init task
@@ -702,9 +705,11 @@ static void tt_mux_init_task(void *pvParameters)
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Registered AT response routing callback with gsm0710_manager");
     }
 
+#if 0       
     // ===== Configure terminal type and voice rate before AT+CFUN=1 =====
     // These commands must be sent before CFUN=1 according to the AT command documentation.
-
+    vTaskDelay(pdMS_TO_TICKS(6000));
+ 
     // Step 1: Query current terminal type
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Querying terminal type (AT^TETYPE?)...");
     char tetype_response[128];
@@ -716,8 +721,8 @@ static void tt_mux_init_task(void *pvParameters)
         char *p = strstr(tetype_response, "^TETYPE:");
         if (p != NULL) {
             int type = atoi(p + strlen("^TETYPE:"));
-            if (type == 6) {
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Terminal type already 6 (降速语音), skip setting");
+            if (type == 1) {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Terminal type already 1 (降速语音), skip setting");
                 tetype_needs_set = false;
             } else {
                 SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Current terminal type is %d, need to set to 6", type);
@@ -731,14 +736,14 @@ static void tt_mux_init_task(void *pvParameters)
     if (tetype_needs_set) {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Setting terminal type to 6 (AT^TETYPE=6)...");
         char tetype_set_response[128];
-        tt_at_result_t tetype_set_result = tt_module_send_at_cmd_wait("^TETYPE=6", tetype_set_response, sizeof(tetype_set_response), 3000);
+        tt_at_result_t tetype_set_result = tt_module_send_at_cmd_wait("^TETYPE=1", tetype_set_response, sizeof(tetype_set_response), 3000);
         if (tetype_set_result == TT_AT_RESULT_OK) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^TETYPE=6 successful, rebooting system to take effect...");
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^TETYPE=1 successful, rebooting system to take effect...");
             vTaskDelay(pdMS_TO_TICKS(500));
             esp_restart();
             return;  // Never reached, but for clarity
         } else {
-            SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^TETYPE=6 failed (result=%d), continuing without reboot", tetype_set_result);
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^TETYPE=1 failed (result=%d), continuing without reboot", tetype_set_result);
         }
     }
 
@@ -758,7 +763,7 @@ static void tt_mux_init_task(void *pvParameters)
             bool has_1k = false;
             char *token = strtok(p, ", \r\n");
             while (token != NULL) {
-                if (atoi(token) == 5) {
+                if (atoi(token) == 2) {
                     has_1k = true;
                     break;
                 }
@@ -777,7 +782,7 @@ static void tt_mux_init_task(void *pvParameters)
     if (voicerate_needs_set) {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Setting voice rate to 1.0Kbps (AT^VOICERATE=5)...");
         char voicerate_set_response[128];
-        tt_at_result_t voicerate_set_result = tt_module_send_at_cmd_wait("^VOICERATE=5", voicerate_set_response, sizeof(voicerate_set_response), 3000);
+        tt_at_result_t voicerate_set_result = tt_module_send_at_cmd_wait("^VOICERATE=2", voicerate_set_response, sizeof(voicerate_set_response), 3000);
         if (voicerate_set_result == TT_AT_RESULT_OK) {
             SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT^VOICERATE=5 successful: %s", voicerate_set_response);
         } else {
@@ -786,6 +791,7 @@ static void tt_mux_init_task(void *pvParameters)
     }
 
     // ===== End of terminal type and voice rate configuration =====
+#endif
 
     // Send AT+CFUN=1 to enable full functionality after MUX mode initialization
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Sending AT+CFUN=1 to enable full functionality...");
@@ -1079,13 +1085,23 @@ esp_err_t tt_module_deinit(void)
 
     // Cleanup tasks
     if (g_tt_module.uart_at_task_handle != NULL) {
-        vTaskDelete(g_tt_module.uart_at_task_handle);
+        TaskHandle_t h = g_tt_module.uart_at_task_handle;
         g_tt_module.uart_at_task_handle = NULL;
+        vTaskDelete(h);
     }
 
     if (g_mux_init_task_handle != NULL) {
-        vTaskDelete(g_mux_init_task_handle);
+        TaskHandle_t h = g_mux_init_task_handle;
         g_mux_init_task_handle = NULL;
+        // Signal the task to stop by clearing the running flag
+        g_tt_module_running = false;
+        // Give the task a chance to exit gracefully
+        vTaskDelay(pdMS_TO_TICKS(100));
+        // Check if task already exited (handle may be stale if task deleted itself)
+        eTaskState state = eTaskGetState(h);
+        if (state != eDeleted && state != eInvalid) {
+            vTaskDelete(h);
+        }
     }
 
     g_tt_module.initialized = false;
@@ -1861,13 +1877,13 @@ void tt_module_route_at_response(const uint8_t *data, size_t len, void *user_dat
         default: {
             // No active command context - this is an unsolicited notification
             // Forward to GATT directly for notifications like incoming calls, network status, etc.
-            SYS_LOGD_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> ROUTE: Unsolicited notification (%d bytes)", len);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> URC (%d bytes): %.*s", len, len > 80 ? 80 : (int)len, (char *)data);
 
             // Forward to GATT if we have an active connection (use non-blocking async version)
             if (g_at_context.last_active_gatt_conn != 0) {
                 extern int spp_at_server_send_response_async(uint16_t conn_handle, const uint8_t *data, uint16_t len);
                 spp_at_server_send_response_async(g_at_context.last_active_gatt_conn, data, len);
-                SYS_LOGD_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> ROUTE: Sent notification to GATT conn=%d", g_at_context.last_active_gatt_conn);
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> URC forwarded to GATT conn=%d", g_at_context.last_active_gatt_conn);
             } else {
                 // Also try callback for MUX mode or other use cases
                 if (g_data_callback != NULL) {
@@ -2564,6 +2580,134 @@ bool tt_module_is_powered(void)
     return g_tt_module_powered;
 }
 
+esp_err_t tt_module_low_battery_shutdown(void)
+{
+    // Respect force_on flag
+    if (g_tt_force_on) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Low battery shutdown skipped (force_on active)");
+        return ESP_OK;
+    }
+
+    // Only shut down if currently powered
+    if (!g_tt_module_powered) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module Low Battery Auto-Shutdown ===");
+
+    esp_err_t ret = tt_module_full_shutdown();
+    if (ret == ESP_OK) {
+        g_tt_module_powered = false;
+        set_tt_state(TT_STATE_LOW_BATTERY_OFF);
+        g_tt_error_code = TT_ERROR_LOW_BATTERY;
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module Low Battery Shutdown Complete ===");
+    } else {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Low battery shutdown failed: %s", esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+/* ========== Force On/Off APIs (Phone Call Priority) ========== */
+
+esp_err_t tt_module_force_on(void)
+{
+    g_tt_force_on = true;
+
+    tt_state_t state = g_tt_module.state;
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module Force ON (current state: %d) ===", state);
+
+    // WORKING state - already good
+    if (state == TT_STATE_WORKING) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: already WORKING, skip");
+        return ESP_OK;
+    }
+
+    // OTA in progress - not allowed
+    if (state == TT_STATE_UPDATING) {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: rejected (OTA in progress)");
+        g_tt_force_on = false;
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
+    // INITIALIZING / WAITING_MUX_RESP - already starting up, just wait
+    if (state == TT_STATE_INITIALIZING || state == TT_STATE_WAITING_MUX_RESP) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: already initializing, waiting...");
+        return ESP_OK;
+    }
+
+    // LOW_BATTERY_OFF / USER_OFF / HARDWARE_FAULT → full restart
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: restarting from state %d", state);
+
+    // Clean up current state first (if powered)
+    if (g_tt_module_powered) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: shutting down current instance...");
+        tt_module_full_shutdown();
+        g_tt_module_powered = false;
+    }
+
+    // Clear NVS manual off flag
+    esp_err_t ret = user_params_set_tt_manual_off(false);
+    if (ret != ESP_OK) {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: failed to clear manual off flag: %s", esp_err_to_name(ret));
+    }
+
+    // Cleanup stale state
+    tt_module_cleanup();
+
+    // Full startup
+    ret = tt_module_full_startup();
+    if (ret == ESP_OK) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module Force ON success ===");
+    } else {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module Force ON failed: %s ===", esp_err_to_name(ret));
+        g_tt_force_on = false;
+    }
+
+    return ret;
+}
+
+esp_err_t tt_module_force_off(void)
+{
+    g_tt_force_on = false;
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module Force OFF (protection restored) ===");
+
+    // Immediately check battery voltage
+    bq27220_handle_t bq = power_manage_get_bq27220_handle();
+    if (bq != NULL && g_tt_module_powered) {
+        uint16_t voltage = bq27220_get_voltage(bq);
+        if (voltage > 0 && voltage < POWER_MANAGE_TT_MODULE_V_OFF_MV) {
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                "Force OFF: voltage %umV < threshold %umV, shutting down TT module",
+                voltage, POWER_MANAGE_TT_MODULE_V_OFF_MV);
+
+            tt_module_full_shutdown();
+            g_tt_module_powered = false;
+            set_tt_state(TT_STATE_LOW_BATTERY_OFF);
+            g_tt_error_code = TT_ERROR_LOW_BATTERY;
+        } else {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                "Force OFF: voltage %umV OK, TT module stays on", voltage);
+        }
+    }
+
+    return ESP_OK;
+}
+
+void tt_module_cancel_force_on(void)
+{
+    if (g_tt_force_on) {
+        g_tt_force_on = false;
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON canceled (flag only, monitor task will handle shutdown)");
+    }
+}
+
+bool tt_module_is_force_on(void)
+{
+    return g_tt_force_on;
+}
+
 /* ========== TT Module Status Query APIs ========== */
 
 tt_module_status_t tt_module_get_status(void)
@@ -2609,6 +2753,9 @@ esp_err_t tt_module_get_status_info(tt_status_info_t *info)
     if (info->state == TT_STATE_HARDWARE_FAULT) {
         info->error_code = g_tt_error_code;
     }
+
+    // Get flags
+    info->flags = g_tt_force_on ? 0x01 : 0x00;
 
     // Note: Working sub-states (SIM status, network registration) are managed by client
     // Client should query these via AT commands when needed:

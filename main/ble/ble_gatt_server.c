@@ -494,10 +494,17 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
     spp_at_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
     spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
     gatt_ota_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+    gatt_system_server_stop_service(SYS_SERVICE_ID_VOICE);
 
     MODLOG_DFLT(INFO, "All connections closed, restarting advertising\n");
     ble_spp_server_advertise();
 #endif
+
+    /* Auto-cancel force_on on BLE disconnect to prevent leaving TT module on.
+     * Use non-blocking cancel (clears flag only, no shutdown).
+     * bq27220_monitor_task will handle actual shutdown within 60s. */
+    extern void tt_module_cancel_force_on(void);
+    tt_module_cancel_force_on();
 
     /* Notify sleep manager of BLE disconnection */
     extern void sleep_manager_notify_ble_disconnected(void);

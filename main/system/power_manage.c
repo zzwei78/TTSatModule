@@ -624,6 +624,32 @@ static void __attribute__((unused)) bq27220_monitor_task(void *pvParameters)
             "[BATT] V=%umV, I_now=%dmA, I_avg=%dmA, SOC=%u%%, P_avg=%dmW, Coulomb=%u",
             voltage, instant_current, avg_current_ma, soc, avg_power, coulomb_count);
 
+        /* ========== Low Battery TT Module Auto-Shutdown Check ========== */
+        {
+            extern bool tt_module_is_force_on(void);
+            extern tt_state_t tt_module_get_state(void);
+            extern esp_err_t tt_module_low_battery_shutdown(void);
+
+            if (!tt_module_is_force_on()) {
+                tt_state_t tt_state = tt_module_get_state();
+
+                if (tt_state == TT_STATE_WORKING && voltage < POWER_MANAGE_TT_MODULE_V_OFF_MV) {
+                    SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                        "[BATT] Low battery: %umV < %umV, auto-shutdown TT module",
+                        voltage, POWER_MANAGE_TT_MODULE_V_OFF_MV);
+                    tt_module_low_battery_shutdown();
+                }
+                else if (tt_state == TT_STATE_LOW_BATTERY_OFF && voltage >= POWER_MANAGE_TT_MODULE_V_ON_MV) {
+                    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                        "[BATT] Battery recovered: %umV >= %umV, user can restart TT",
+                        voltage, POWER_MANAGE_TT_MODULE_V_ON_MV);
+                }
+            } else {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[BATT] Force ON active, skip low battery check (%umV)", voltage);
+            }
+        }
+
         /* Wait 60 seconds before next check (1s granularity for quick stop response) */
         for (int i = 0; i < 60 && g_bq27220_task_running; i++) {
             vTaskDelay(pdMS_TO_TICKS(1000));

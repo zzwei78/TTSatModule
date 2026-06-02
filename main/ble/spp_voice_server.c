@@ -41,7 +41,7 @@ typedef struct {
 
 static voice_server_context_t g_voice_server = {
     .initialized = false,
-    .enabled = true,
+    .enabled = false,
     .registered = false,
     .active_conn_handle = 0,
     .val_handle = 0,
@@ -82,7 +82,7 @@ static void spp_voice_output_callback(const uint8_t *data, size_t len, void *use
         return;
     }
 
-    SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Sending voice data to BLE: %d bytes", len);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "[UL] TT -> BLE: %d bytes", len);
 
     // Send to BLE GATT
     spp_voice_server_send(g_voice_server.active_conn_handle, data, len);
@@ -150,7 +150,7 @@ static void spp_voice_downlink_callback(const uint8_t *data, size_t len, void *u
         }
     }
 
-    SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
         "Sent %d frames (%d bytes) to MUX CH9", (int)frame_count, (int)len);
 #endif
 }
@@ -258,7 +258,7 @@ static int spp_voice_service_handler(uint16_t conn_handle, uint16_t attr_handle,
         {
             uint16_t data_len = ctxt->om->om_len;
 
-            SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "SPP Voice Service - Data received: len=%d", data_len);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "[DL] BLE -> decode queue: %d bytes", data_len);
 
             /* Check size limit */
             if (data_len > SPP_VOICE_MAX_DATA_SIZE) {
@@ -488,6 +488,12 @@ void spp_voice_server_cleanup_on_disconnect(uint16_t conn_handle)
         SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
             "Cleaning up voice server state (conn_handle=%d)", conn_handle);
         g_voice_server.active_conn_handle = 0;
+
+        // Disable voice service on disconnect to stop TT module from sending voice data
+        if (g_voice_server.enabled) {
+            g_voice_server.enabled = false;
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice service disabled on BLE disconnect");
+        }
     } else if (g_voice_server.active_conn_handle != 0) {
         SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
             "Disconnect conn_handle=%d does not match active voice connection=%d, not clearing",

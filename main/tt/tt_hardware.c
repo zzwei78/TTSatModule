@@ -84,7 +84,7 @@ esp_err_t tt_hw_init(void)
     gpio_set_pull_mode(TT_MODULE_RESET, GPIO_FLOATING);
     gpio_set_pull_mode(AP_WAKEUP_BB_PIN, GPIO_FLOATING);
 
-    gpio_set_level(TT_IOTL_GPIO, 0);
+    gpio_set_level(TT_IOTL_GPIO, 1);  /* HIGH = disabled (UART level shifter off) */
 
 #ifndef TT_PWR_PIN_INVERSE   
     gpio_set_level(GPIO_TTPWR_EN, 0);
@@ -163,11 +163,12 @@ esp_err_t tt_hw_power_on(void)
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Powering on Tiantong Module");
     //gpio_set_level(GPIO_TTPWR_EN, 1);
-#ifndef TT_PWR_PIN_INVERSE   
+#ifndef TT_PWR_PIN_INVERSE
     gpio_set_level(GPIO_TTPWR_EN, 1);
-#else 
+#else
     gpio_set_level(GPIO_TTPWR_EN, 0);
 #endif // TT_PWR_PIN_INVERSE
+    gpio_set_level(TT_IOTL_GPIO, 0);  /* LOW = enable UART level shifter */
 
     return ESP_OK;
 }
@@ -186,11 +187,12 @@ esp_err_t tt_hw_power_off(void)
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Powering off Tiantong Module");
     //gpio_set_level(GPIO_TTPWR_EN, 0);
-#ifndef TT_PWR_PIN_INVERSE   
+#ifndef TT_PWR_PIN_INVERSE
     gpio_set_level(GPIO_TTPWR_EN, 0);
-#else 
+#else
     gpio_set_level(GPIO_TTPWR_EN, 1);
-#endif // TT_PWR_PIN_INVERSE    
+#endif // TT_PWR_PIN_INVERSE
+    gpio_set_level(TT_IOTL_GPIO, 1);  /* HIGH = disable UART level shifter */
 
     return ESP_OK;
 }

@@ -25,6 +25,7 @@
 #include "audio/voice_packet_handler.h"
 #include "system/syslog.h"
 #include "tt/tt_module.h"
+#include "tt/tt_hardware.h"
 #include "system/power_manage.h"
 #include "system/ble_monitor.h"
 #include "system/sleep_manager.h"
@@ -234,20 +235,41 @@ void app_main(void)
     if (user_params_is_tt_manual_off()) {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
             "TT module was manually closed by user, skipping auto-start");
+        /* Init TT hardware GPIO and actively power off */
+        tt_hw_init();
+        tt_hw_power_off();
     } else {
-        /* Start TT module directly (phone call priority is highest) */
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Starting TT module...");
+        /* Check battery voltage before starting TT module */
+        bool skip_tt = false;
+        if (bq_handle != NULL) {
+            uint16_t boot_voltage = bq27220_get_voltage(bq_handle);
+            if (boot_voltage > 0 && boot_voltage < POWER_MANAGE_TT_MODULE_V_OFF_MV) {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "Battery too low (%umV < %umV), skip TT module start",
+                    boot_voltage, POWER_MANAGE_TT_MODULE_V_OFF_MV);
+                skip_tt = true;
+            }
+        }
 
-        ret = tt_module_init(10);  // 10 event queue size
-        if (ret != ESP_OK) {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to initialize TT module: %d", ret);
+        if (skip_tt) {
+            /* Init TT hardware GPIO and actively power off to save power */
+            tt_hw_init();
+            tt_hw_power_off();
         } else {
-            ret = tt_module_start();
+            /* Start TT module directly (phone call priority is highest) */
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Starting TT module...");
+
+            ret = tt_module_init(10);  // 10 event queue size
             if (ret != ESP_OK) {
-                SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to start TT module: %d", ret);
-                tt_module_deinit();
+                SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to initialize TT module: %d", ret);
             } else {
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "TT module initialized and started");
+                ret = tt_module_start();
+                if (ret != ESP_OK) {
+                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to start TT module: %d", ret);
+                    tt_module_deinit();
+                } else {
+                    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "TT module initialized and started");
+                }
             }
         }
     }

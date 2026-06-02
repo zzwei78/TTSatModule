@@ -88,8 +88,8 @@ typedef struct {
     tt_state_t state;              /* 主状态 */
     uint16_t voltage_mv;           /* 当前电池电压 */
     uint8_t error_code;            /* 错误码 (state=HARDWARE_FAULT时有效) */
-    uint8_t reserved1;             /* 预留 */
-    uint8_t reserved2;             /* 预留 */
+    uint8_t flags;                 /* 标志位 (bit0: force_on) */
+    uint8_t reserved;              /* 预留 */
 } tt_status_info_t;
 
 /* ========== Legacy Status Type (for backward compatibility) ========== */
@@ -389,6 +389,47 @@ esp_err_t tt_module_user_power_off(void);
 bool tt_module_is_user_control_allowed(void);
 
 /**
+ * @brief Force TT module on (for phone calls)
+ *
+ * This function forces the TT module on regardless of battery voltage or
+ * current state (except OTA). Used when the app initiates a phone call.
+ * Low battery auto-shutdown is bypassed while force_on is active.
+ *
+ * @return esp_err_t
+ *     - ESP_OK: Module powered on or already working
+ *     - ESP_ERR_NOT_ALLOWED: OTA in progress
+ *     - ESP_FAIL: Startup failed
+ */
+esp_err_t tt_module_force_on(void);
+
+/**
+ * @brief Cancel force on, restore low battery protection
+ *
+ * This function cancels the force_on state and restores normal low battery
+ * protection. If current battery voltage is below threshold, the TT module
+ * will be immediately shut down.
+ *
+ * @return ESP_OK always
+ */
+esp_err_t tt_module_force_off(void);
+
+/**
+ * @brief Cancel force on flag only (non-blocking, no shutdown)
+ *
+ * Lightweight version for calling from BLE disconnect handler.
+ * Only clears the force_on flag without checking voltage or shutting down.
+ * The bq27220_monitor_task will handle actual shutdown within 60s.
+ */
+void tt_module_cancel_force_on(void);
+
+/**
+ * @brief Check if TT module is in force_on mode
+ *
+ * @return true if force_on is active, false otherwise
+ */
+bool tt_module_is_force_on(void);
+
+/**
  * @brief Power On Tiantong Module (Internal)
  *
  * This function is for internal use by power management module.
@@ -457,6 +498,18 @@ esp_err_t tt_module_full_shutdown(void);
  * @return true if powered on, false otherwise
  */
 bool tt_module_is_powered(void);
+
+/**
+ * @brief Low battery auto-shutdown (called by power monitor)
+ *
+ * Performs complete shutdown and sets state to LOW_BATTERY_OFF.
+ * Respects force_on flag - will not shut down if force_on is active.
+ *
+ * @return esp_err_t
+ *     - ESP_OK: Shutdown successful or skipped (force_on)
+ *     - ESP_ERR_INVALID_STATE: Module not powered
+ */
+esp_err_t tt_module_low_battery_shutdown(void);
 
 /* ========== Utility APIs ========== */
 

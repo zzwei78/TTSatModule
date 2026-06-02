@@ -65,6 +65,10 @@
 #define SYS_CMD_SET_VOICE_FRAME_MODE    0x70  // Set uplink voice frame mode (1 or 3)
 #define SYS_CMD_GET_VOICE_FRAME_MODE    0x71  // Get uplink voice frame mode
 
+/* TT Module Force Control Commands (for phone calls) */
+#define SYS_CMD_TT_FORCE_ON             0x72  // Force TT module on (ignore low battery)
+#define SYS_CMD_TT_FORCE_OFF            0x73  // Cancel force, restore low battery protection
+
 /* System Command/Response Packet Configuration */
 #define SYS_CMD_PACKET_MAX_PARAMS       96      // Maximum parameter bytes
 #define SYS_CMD_PACKET_MAX_SIZE         (1 + 1 + SYS_CMD_PACKET_MAX_PARAMS + 2)  // seq + cmd + params + crc16

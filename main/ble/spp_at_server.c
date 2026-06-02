@@ -188,13 +188,11 @@ int spp_at_server_send_response(uint16_t conn_handle, const uint8_t *data, uint1
     // Use safe wrapper that ensures mbuf is always freed
     int rc = ble_gatts_send_safe_notify(conn_handle, spp_at_service_val_handle, data, len);
     if (rc != 0) {
-        // Change to DEBUG level - this is normal if client hasn't subscribed
-        // Common error: BLE_HS_EDONE (client not subscribed)
-        SYS_LOGD_MODULE(SYS_LOG_MODULE_SPP_AT, TAG, "Failed to send notification (client may not be subscribed): rc=%d", rc);
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_SPP_AT, TAG, "AT notify failed (rc=%d, conn=%d, len=%d)", rc, conn_handle, len);
         return rc;
     }
 
-    SYS_LOGD_MODULE(SYS_LOG_MODULE_SPP_AT, TAG, "AT response sent successfully: len=%d", len);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_SPP_AT, TAG, "AT notify sent: conn=%d, %d bytes", conn_handle, len);
     return 0;
 }
 

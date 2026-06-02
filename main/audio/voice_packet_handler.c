@@ -168,8 +168,8 @@ static void voice_decode_task(void *pvParameters)
             g_decode_empty_count = 0;  /* Reset empty counter */
             g_voice_stats.downlink_packets_total++;
 
-            SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
-                           "[Tick #%u] Processing packet (%u bytes)",
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                           "[DL] Tick #%u, raw %u bytes",
                            g_20ms_stats.total_ticks, raw_data.data_len);
 
             /* Validate AT command format: AT^AUDPCM="base64_data" */
@@ -258,9 +258,9 @@ static void voice_decode_task(void *pvParameters)
                 if (g_voice_downlink_callback != NULL) {
                     g_voice_downlink_callback(pcm_combined, total_pcm_len,
                                              g_voice_downlink_user_data);
-                    SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
-                        "[Tick #%u] %d/%d frames decoded (%d bytes PCM), sent via callback",
-                        g_20ms_stats.total_ticks, decoded_frames, frame_count, total_pcm_len);
+                    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                        "[DL] %d/%d frames decoded, %d bytes PCM -> BLE",
+                        decoded_frames, frame_count, total_pcm_len);
                 } else {
                     SYS_LOGW_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
                         "Downlink callback not registered, %d frames dropped", decoded_frames);
@@ -375,14 +375,16 @@ static void voice_encode_task(void *pvParameters)
                         int at_len = snprintf(at_cmd, sizeof(at_cmd),
                                               "AT^AUDPCM=\"%s\"", base64_buf);
 
-                        SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
-                            "Uplink: %d frames, %d bytes AMR -> AT cmd %d bytes",
+                        SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                            "[UL] %d frames, %d bytes AMR -> AT cmd %d bytes",
                             accumulated, total_amr_len, at_len);
 
                         /* Send via output callback */
                         if (g_voice_output_callback != NULL) {
                             g_voice_output_callback((const uint8_t *)at_cmd, at_len,
                                                     g_voice_output_user_data);
+                            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                                "[UL] Sent %d bytes to TT", at_len);
                         } else {
                             SYS_LOGW_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
                                 "Output callback not registered, packet dropped");

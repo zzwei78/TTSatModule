@@ -545,6 +545,20 @@ static void sleep_decision_task(void *pvParameters)
             continue;
         }
 
+        /* Check charging status — skip all sleep modes while charging */
+        {
+            uint8_t chg_flags = 0;
+            bool is_charging = false;
+            if (power_manage_get_charging_status(&chg_flags) == ESP_OK) {
+                is_charging = (chg_flags & 0x04) != 0;   /* bit2: charging */
+            }
+            bool is_wpc = power_manage_is_wpc_charging();
+            if (is_charging || is_wpc) {
+                g_deep_sleep_idle_sec = 0;  /* reset counter */
+                continue;  /* skip sleep while charging */
+            }
+        }
+
         /* Check BLE connection directly via NimBLE */
         int ble_count = 0;
         for (uint16_t h = 0; h < 2; h++) {
@@ -766,6 +780,26 @@ static void temp_awake_timeout_task(void *pvParameters)
         SYS_LOGW(TAG, "TEMP_AWAKE: Mode changed to %d, aborting deep sleep", g_current_mode);
         vTaskDelete(NULL);
         return;
+    }
+
+    /* Safety Check 5: Charging — skip deep sleep if charging */
+    {
+        uint8_t chg_flags = 0;
+        bool is_charging = false;
+        if (power_manage_get_charging_status(&chg_flags) == ESP_OK) {
+            is_charging = (chg_flags & 0x04) != 0;   /* bit2: charging */
+        }
+        bool is_wpc = power_manage_is_wpc_charging();
+        if (is_charging || is_wpc) {
+            SYS_LOGI(TAG, "TEMP_AWAKE: Charging (wired=%d, wpc=%d), aborting deep sleep",
+                     is_charging, is_wpc);
+            /* Switch to ACTIVE mode and start normal sleep decision task */
+            g_current_mode = SLEEP_MODE_ACTIVE;
+            g_deep_sleep_idle_sec = 0;
+            sleep_manager_task_start();
+            vTaskDelete(NULL);
+            return;
+        }
     }
 
     SYS_LOGI(TAG, "TEMP_AWAKE: All checks passed, entering deep sleep");

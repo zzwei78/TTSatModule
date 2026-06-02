@@ -204,3 +204,8 @@ void gatt_log_server_disable(void)
     g_log_service_enabled = false;
     SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Log service disabled");
 }
+
+bool gatt_log_server_is_enabled(void)
+{
+    return g_log_service_enabled;
+}
