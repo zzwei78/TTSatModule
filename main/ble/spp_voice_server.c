@@ -17,6 +17,7 @@
 #include "ble/spp_voice_server.h"
 #include "ble/ble_gatt_server.h"
 #include "audio/voice_packet_handler.h"
+#include "esp_timer.h"
 #include "audio/audiosvc.h"
 #include "tt/gsm0710_manager.h"
 #include "system/syslog.h"
@@ -25,6 +26,10 @@
 // #define CONFIG_VOICE_GATT_LOOPBACK  // Uncomment to enable GATT loopback test
 
 static const char *TAG = "SPP_VOICE_SERVER";
+
+#if ENABLE_VOICE_IDLE_TIMEOUT
+static esp_timer_handle_t g_voice_idle_timer = NULL;
+#endif
 
 /* Static buffer for voice data - avoids repeated malloc/free */
 #define SPP_VOICE_MAX_DATA_SIZE VOICE_BUFFER_SIZE  // Use constant from ble_gatt_server.h
@@ -46,6 +51,22 @@ static voice_server_context_t g_voice_server = {
     .active_conn_handle = 0,
     .val_handle = 0,
 };
+
+#if ENABLE_VOICE_IDLE_TIMEOUT
+static void voice_idle_timer_cb(void *arg)
+{
+    SYS_LOGW_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+        "Voice idle timeout (%d ms), auto disabling", VOICE_IDLE_TIMEOUT_MS);
+    spp_voice_server_disable();
+}
+
+void spp_voice_server_reset_idle_timer(void)
+{
+    if (g_voice_idle_timer != NULL && g_voice_server.enabled) {
+        esp_timer_restart(g_voice_idle_timer, VOICE_IDLE_TIMEOUT_MS * 1000ULL);
+    }
+}
+#endif
 
 /* Initialization check macro */
 #define VOICE_SERVER_CHECK_INIT() \
@@ -418,9 +439,21 @@ void spp_voice_server_enable(void)
 
     /* Request low-latency connection parameters for voice */
     if (g_voice_server.active_conn_handle != 0) {
+        /* Use different intervals based on frame mode:
+         * 1-frame (Android): more aggressive, lower latency
+         * 3-frame (iPhone): conservative, compatible with Apple guidelines */
+        uint8_t frame_mode = voice_packet_get_frame_mode();
+        uint16_t itvl_min, itvl_max;
+        if (frame_mode <= 1) {
+            itvl_min = 8;   // 10ms
+            itvl_max = 10;  // 12.5ms
+        } else {
+            itvl_min = 14;  // 17.5ms
+            itvl_max = 16;  // 20ms
+        }
         struct ble_gap_upd_params params = {
-            .itvl_min = 14,
-            .itvl_max = 16,
+            .itvl_min = itvl_min,
+            .itvl_max = itvl_max,
             .latency = 0,
             .supervision_timeout = 400,
             .min_ce_len = 0,
@@ -428,11 +461,24 @@ void spp_voice_server_enable(void)
         };
         rc = ble_gap_update_params(g_voice_server.active_conn_handle, &params);
         if (rc == 0) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice enabled: requested low-latency parameters (itvl=14-16)");
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                "Voice enabled: requested params (itvl=%d-%d, mode=%d-frame)",
+                itvl_min, itvl_max, frame_mode);
         } else {
-            SYS_LOGW_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice enabled: failed to update params: %d", rc);
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                "Voice enabled: failed to update params: %d", rc);
         }
     }
+
+#if ENABLE_VOICE_IDLE_TIMEOUT
+    /* Start idle timer */
+    if (g_voice_idle_timer == NULL) {
+        esp_timer_create(&(esp_timer_create_args_t){
+            .callback = voice_idle_timer_cb, .name = "voice_idle"
+        }, &g_voice_idle_timer);
+    }
+    esp_timer_start_once(g_voice_idle_timer, VOICE_IDLE_TIMEOUT_MS * 1000ULL);
+#endif
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice service enabled");
 }
@@ -445,6 +491,12 @@ void spp_voice_server_disable(void)
     int rc;
 
     g_voice_server.enabled = false;
+
+#if ENABLE_VOICE_IDLE_TIMEOUT
+    if (g_voice_idle_timer != NULL) {
+        esp_timer_stop(g_voice_idle_timer);
+    }
+#endif
 
     /* Restore default connection parameters */
     if (g_voice_server.active_conn_handle != 0) {
@@ -494,6 +546,12 @@ void spp_voice_server_cleanup_on_disconnect(uint16_t conn_handle)
             g_voice_server.enabled = false;
             SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice service disabled on BLE disconnect");
         }
+
+#if ENABLE_VOICE_IDLE_TIMEOUT
+        if (g_voice_idle_timer != NULL) {
+            esp_timer_stop(g_voice_idle_timer);
+        }
+#endif
     } else if (g_voice_server.active_conn_handle != 0) {
         SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
             "Disconnect conn_handle=%d does not match active voice connection=%d, not clearing",

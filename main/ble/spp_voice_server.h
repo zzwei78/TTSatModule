@@ -78,6 +78,17 @@ bool spp_voice_server_is_enabled(void);
  */
 void spp_voice_server_cleanup_on_disconnect(uint16_t conn_handle);
 
+/* Voice idle auto-disable feature (set to 0 to disable) */
+#define ENABLE_VOICE_IDLE_TIMEOUT        1
+#define VOICE_IDLE_TIMEOUT_MS            30000   // 30s no data → auto disable
+
+#if ENABLE_VOICE_IDLE_TIMEOUT
+/**
+ * @brief Reset voice idle timer (call on voice data activity)
+ */
+void spp_voice_server_reset_idle_timer(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

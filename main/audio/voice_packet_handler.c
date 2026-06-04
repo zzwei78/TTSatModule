@@ -21,6 +21,7 @@
 #include "tt/tt_module.h"
 #include "tt/gsm0710_manager.h"
 #include "system/syslog.h"
+#include "ble/spp_voice_server.h"
 
 static const char *TAG = "VOICE_PKT";
 
@@ -391,6 +392,9 @@ static void voice_encode_task(void *pvParameters)
                             g_voice_stats.uplink_packets_dropped++;
                         }
                         g_voice_stats.uplink_packets_total++;
+#if ENABLE_VOICE_IDLE_TIMEOUT
+                        spp_voice_server_reset_idle_timer();
+#endif
                     } else {
                         SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
                             "Base64 encoding failed");
@@ -738,6 +742,10 @@ int voice_downlink_enqueue(uint8_t *data, size_t data_len)
         g_voice_stats.downlink_packets_dropped++;
         return -1;
     }
+
+#if ENABLE_VOICE_IDLE_TIMEOUT
+    spp_voice_server_reset_idle_timer();
+#endif
 
     /* ===== Auto-start timer if not running ===== */
     if (!g_decode_timer_running) {

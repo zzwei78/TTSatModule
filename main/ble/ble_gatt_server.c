@@ -412,6 +412,19 @@ static int handle_gap_event_connect(struct ble_gap_event *event, void *arg)
     }
     ble_spp_server_print_conn_desc(&desc);
 
+    /* Request default connection parameters on new connection */
+    if (!spp_voice_server_is_enabled()) {
+        struct ble_gap_upd_params params = {
+            .itvl_min = BLE_DEFAULT_CONN_ITVL_MIN,
+            .itvl_max = BLE_DEFAULT_CONN_ITVL_MAX,
+            .latency = BLE_CONN_LATENCY_NONE,
+            .supervision_timeout = BLE_SUPERVISION_TIMEOUT_400,
+            .min_ce_len = 0,
+            .max_ce_len = 0,
+        };
+        ble_gap_update_params(event->connect.conn_handle, &params);
+    }
+
 #ifdef CONFIG_BLE_MULTI_CONN_ENABLE
     ble_conn_role_t role = ble_conn_manager_add_connection(
         event->connect.conn_handle,
@@ -538,6 +551,11 @@ static int handle_gap_event_subscribe(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
+/* Connection parameter auto-request policy toggle
+ * 1 = old behavior (auto-request on every conn update event)
+ * 0 = new behavior (only request on voice enable/disable) */
+#define SUPPORT_OLD_ITVL_POLICY  0
+
 /**
  * @brief Handle GAP connection update event
  */
@@ -554,6 +572,8 @@ static int handle_gap_event_conn_update(struct ble_gap_event *event, void *arg)
     MODLOG_DFLT(INFO, "conn update(%d)\n", desc.conn_itvl);
     ble_spp_server_print_conn_desc(&desc);
 
+#if SUPPORT_OLD_ITVL_POLICY
+    /* ========== Original policy: auto-request on conn update ========== */
     if (spp_voice_server_is_enabled()) {
         if (desc.conn_itvl < BLE_VOICE_CONN_ITVL_MIN || desc.conn_itvl > BLE_VOICE_CONN_ITVL_MAX) {
             struct ble_gap_upd_params params = {
@@ -573,7 +593,7 @@ static int handle_gap_event_conn_update(struct ble_gap_event *event, void *arg)
                         BLE_VOICE_CONN_ITVL_MIN, BLE_VOICE_CONN_ITVL_MAX);
         }
     } else {
-        if (desc.conn_itvl < BLE_VOICE_CONN_ITVL_MIN || desc.conn_itvl > BLE_VOICE_CONN_ITVL_MAX) {
+        if (desc.conn_itvl < BLE_DEFAULT_CONN_ITVL_MIN || desc.conn_itvl > BLE_DEFAULT_CONN_ITVL_MAX) {
             struct ble_gap_upd_params params = {
                 .itvl_min = BLE_DEFAULT_CONN_ITVL_MIN,
                 .itvl_max = BLE_DEFAULT_CONN_ITVL_MAX,
@@ -591,6 +611,7 @@ static int handle_gap_event_conn_update(struct ble_gap_event *event, void *arg)
                         BLE_DEFAULT_CONN_ITVL_MIN, BLE_DEFAULT_CONN_ITVL_MAX);
         }
     }
+#endif
 
     return 0;
 }
