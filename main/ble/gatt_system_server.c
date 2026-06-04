@@ -653,6 +653,21 @@ static void print_system_command(const uint8_t *data, size_t len)
         snprintf(param_str, sizeof(param_str), "Cancel force, restore low battery protection");
         break;
 
+    case SYS_CMD_GET_SENSOR_STATUS:
+        cmd_name = "GET_SENSOR_STATUS";
+        snprintf(param_str, sizeof(param_str), "Query sensor presence");
+        break;
+
+    case SYS_CMD_ENABLE_SENSOR_REPORT:
+        cmd_name = "ENABLE_SENSOR_REPORT";
+        snprintf(param_str, sizeof(param_str), "Enable periodic sensor data report");
+        break;
+
+    case SYS_CMD_DISABLE_SENSOR_REPORT:
+        cmd_name = "DISABLE_SENSOR_REPORT";
+        snprintf(param_str, sizeof(param_str), "Disable sensor data report");
+        break;
+
     default:
         snprintf(param_str, sizeof(param_str), "Unknown command (0x%02x)", cmd);
         break;
@@ -1435,6 +1450,53 @@ static const struct ble_gatt_svc_def system_service_defs[] = {
 };
 
 /**
+ * @brief Send sensor data notification via Control characteristic
+ *
+ * Called from sensor_monitor_task when report is enabled.
+ * Uses primary connection handle.
+ */
+int gatt_system_server_send_sensor_data(void)
+{
+    uint16_t conn_handle = ble_conn_manager_get_primary_handle();
+    if (conn_handle == 0) {
+        return BLE_HS_ENOTCONN;
+    }
+
+    uint8_t flags;
+    int16_t ax, ay, az;
+    int32_t mx, my, mz;
+    power_manage_get_sensor_data(&flags, &ax, &ay, &az, &mx, &my, &mz);
+
+    if (!flags) {
+        return ESP_OK;  /* No valid data */
+    }
+
+    /* Build notification payload: [0x74][flags][ax_lo][ax_hi]... */
+    uint8_t buf[14];
+    buf[0] = SYS_CMD_GET_SENSOR_STATUS;  /* Report ID */
+    buf[1] = flags;
+    buf[2] = (uint8_t)(ax & 0xFF);
+    buf[3] = (uint8_t)((ax >> 8) & 0xFF);
+    buf[4] = (uint8_t)(ay & 0xFF);
+    buf[5] = (uint8_t)((ay >> 8) & 0xFF);
+    buf[6] = (uint8_t)(az & 0xFF);
+    buf[7] = (uint8_t)((az >> 8) & 0xFF);
+    buf[8] = (uint8_t)(mx & 0xFF);
+    buf[9] = (uint8_t)((mx >> 8) & 0xFF);
+    buf[10] = (uint8_t)(my & 0xFF);
+    buf[11] = (uint8_t)((my >> 8) & 0xFF);
+    buf[12] = (uint8_t)(mz & 0xFF);
+    buf[13] = (uint8_t)((mz >> 8) & 0xFF);
+
+    struct os_mbuf *txom = ble_hs_mbuf_from_flat(buf, sizeof(buf));
+    if (!txom) {
+        return BLE_HS_ENOMEM;
+    }
+
+    return ble_gatts_notify_custom(conn_handle, system_control_val_handle, txom);
+}
+
+/**
  * @brief Send command response via BLE GATT notification
  *
  * @param conn_handle BLE connection handle
@@ -2166,6 +2228,29 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
             resp_data[1] = (uint8_t)(v & 0xFF);
             resp_data[2] = (uint8_t)((v >> 8) & 0xFF);
             resp_len = 3;
+        }
+        break;
+
+    case SYS_CMD_GET_SENSOR_STATUS:
+        {
+            resp_data[0] = power_manage_get_sensor_flags();
+            resp_len = 1;
+        }
+        break;
+
+    case SYS_CMD_ENABLE_SENSOR_REPORT:
+        {
+            power_manage_set_sensor_report(true);
+            resp_data[0] = SYS_RESP_OK;
+            resp_len = 1;
+        }
+        break;
+
+    case SYS_CMD_DISABLE_SENSOR_REPORT:
+        {
+            power_manage_set_sensor_report(false);
+            resp_data[0] = SYS_RESP_OK;
+            resp_len = 1;
         }
         break;
 

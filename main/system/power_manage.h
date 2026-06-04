@@ -10,6 +10,8 @@
 #include "esp_err.h"
 #include "IP5561.h"
 #include "bq27220.h"
+#include "da228ec.h"
+#include "mmc5603.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -148,6 +150,44 @@ bq27220_handle_t power_manage_get_bq27220_handle(void);
  * @return I2C bus handle, or NULL if not initialized
  */
 i2c_master_bus_handle_t power_manage_get_i2c_bus(void);
+
+/**
+ * @brief Get DA228EC accelerometer handle
+ *
+ * @return DA228EC handle, or NULL if not detected at boot
+ */
+da228ec_handle_t power_manage_get_da228ec_handle(void);
+
+/**
+ * @brief Get MMC5603 magnetometer handle
+ *
+ * @return MMC5603 handle, or NULL if not detected at boot
+ */
+mmc5603_handle_t power_manage_get_mmc5603_handle(void);
+
+/**
+ * @brief Get sensor presence flags
+ *
+ * @return bitmask: bit0=accel, bit1=mag
+ */
+uint8_t power_manage_get_sensor_flags(void);
+
+/**
+ * @brief Get cached sensor data
+ *
+ * @param[out] flags sensor valid flags (bit0=accel, bit1=mag)
+ * @param[out] ax,ay,az accelerometer data in mg (NULL ok if not needed)
+ * @param[out] mx,my,mz magnetometer data in mG (NULL ok if not needed)
+ */
+void power_manage_get_sensor_data(uint8_t *flags,
+                                   int16_t *ax, int16_t *ay, int16_t *az,
+                                   int32_t *mx, int32_t *my, int32_t *mz);
+
+/**
+ * @brief Enable/disable sensor data report via BLE
+ */
+void power_manage_set_sensor_report(bool enable);
+bool power_manage_is_sensor_report_enabled(void);
 
 /* ========== PowerBank API (IP5561) ========== */
 

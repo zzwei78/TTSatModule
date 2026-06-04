@@ -11,10 +11,12 @@
 #include "esp_intr_alloc.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "esp_bt.h"
 #include "IP5561.h"
 #include "system/power_manage.h"
 #include "syslog.h"
 #include "tt/tt_module.h"
+#include "ble/gatt_system_server.h"
 #include "ble/spp_at_server.h"
 #include "config/user_params.h"
 
@@ -37,6 +39,20 @@ static ip5561_handle_t g_ip5561_handle = NULL;
 
 /* BQ27220 device handle (Battery fuel gauge) */
 static bq27220_handle_t g_bq27220_handle = NULL;
+
+/* DA228EC device handle (3-axis accelerometer) */
+static da228ec_handle_t g_da228ec_handle = NULL;
+
+/* MMC5603 device handle (3-axis magnetometer) */
+static mmc5603_handle_t g_mmc5603_handle = NULL;
+
+/* Cached sensor data */
+static struct {
+    int16_t ax, ay, az;         /* mg */
+    int32_t mx, my, mz;         /* mG */
+    uint8_t flags;               /* bit0=accel_valid, bit1=mag_valid */
+    bool report_enabled;
+} g_sensor_cache = {0};
 
 /* Monitor task handles */
 static TaskHandle_t g_ip5561_task_handle = NULL;
@@ -232,6 +248,7 @@ static const __attribute__((unused)) gauging_config_t default_bq27220_config = {
  * Periodically reads IP5561 register status to verify communication
  * on both I2C addresses (0xE8 and 0xEA)
  */
+static void __attribute__((unused)) sensor_monitor_task(void *pvParameters);
 static void __attribute__((unused)) ip5561_monitor_task(void *pvParameters)
 {
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task started");
@@ -650,6 +667,12 @@ static void __attribute__((unused)) bq27220_monitor_task(void *pvParameters)
             }
         }
 
+        /* Print BLE TX power */
+        {
+            int8_t ble_pwr = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[BATT] BLE TX power: %d dBm", ble_pwr);
+        }
+
         /* Wait 60 seconds before next check (1s granularity for quick stop response) */
         for (int i = 0; i < 60 && g_bq27220_task_running; i++) {
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -879,11 +902,125 @@ esp_err_t power_manage_init(void)
     /* Step 6: Print initialization summary */
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "========================================");
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Power Management Init Summary:");
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  IP5561 (Charging):  %s", ip5561_ok ? "✓ OK" : "✗ FAIL");
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  BQ27220 (Battery):  %s", bq27220_ok ? "✓ OK" : "✗ FAIL");
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  IP5561 (Charging):  %s", ip5561_ok ? "OK" : "FAIL");
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  BQ27220 (Battery):  %s", bq27220_ok ? "OK" : "FAIL");
+
+    /* Step 7: Initialize DA228EC accelerometer (dynamic detect) */
+    {
+        da228ec_config_t da228ec_cfg = {
+            .i2c_bus = g_i2c_bus_handle,
+            .scl_freq_hz = POWER_I2C_FREQ_HZ,
+        };
+        g_da228ec_handle = da228ec_create(&da228ec_cfg);
+        if (g_da228ec_handle != NULL) {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  DA228EC (Accel):    OK");
+        } else {
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  DA228EC (Accel):    not found");
+        }
+    }
+
+    /* Step 8: Initialize MMC5603 magnetometer (dynamic detect) */
+    {
+        mmc5603_config_t mmc5603_cfg = {
+            .i2c_bus = g_i2c_bus_handle,
+            .scl_freq_hz = POWER_I2C_FREQ_HZ,
+        };
+        g_mmc5603_handle = mmc5603_create(&mmc5603_cfg);
+        if (g_mmc5603_handle != NULL) {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  MMC5603 (Mag):      OK");
+        } else {
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  MMC5603 (Mag):      not found");
+        }
+    }
+
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "========================================");
 
+    /* Start sensor monitor task if any sensor detected */
+    if (g_da228ec_handle != NULL || g_mmc5603_handle != NULL) {
+        xTaskCreate(sensor_monitor_task, "sensor_mon", 3072, NULL, 1, NULL);
+    }
+
     return ESP_OK;
+}
+
+/**
+ * @brief Shared sensor monitor task (DA228EC + MMC5603)
+ *
+ * Reads sensors, caches data, sends BLE notification if report enabled.
+ */
+static void sensor_monitor_task(void *pvParameters)
+{
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Sensor monitor task started");
+
+    while (1) {
+        uint8_t flags = 0;
+
+        if (g_da228ec_handle != NULL) {
+            int16_t x, y, z;
+            if (da228ec_read_xyz(g_da228ec_handle, &x, &y, &z) == ESP_OK) {
+                g_sensor_cache.ax = x;
+                g_sensor_cache.ay = y;
+                g_sensor_cache.az = z;
+                flags |= 0x01;
+            }
+        }
+
+        if (g_mmc5603_handle != NULL) {
+            int32_t x, y, z;
+            if (mmc5603_read_xyz(g_mmc5603_handle, &x, &y, &z) == ESP_OK) {
+                g_sensor_cache.mx = x;
+                g_sensor_cache.my = y;
+                g_sensor_cache.mz = z;
+                flags |= 0x02;
+            }
+        }
+
+        g_sensor_cache.flags = flags;
+
+        /* Debug log */
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG",
+            g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
+            g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
+
+        /* Send BLE notification if report enabled */
+        if (g_sensor_cache.report_enabled && flags) {
+            gatt_system_server_send_sensor_data();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+uint8_t power_manage_get_sensor_flags(void)
+{
+    uint8_t flags = 0;
+    if (g_da228ec_handle != NULL) flags |= 0x01;
+    if (g_mmc5603_handle != NULL) flags |= 0x02;
+    return flags;
+}
+
+void power_manage_get_sensor_data(uint8_t *flags,
+                                   int16_t *ax, int16_t *ay, int16_t *az,
+                                   int32_t *mx, int32_t *my, int32_t *mz)
+{
+    if (flags) *flags = g_sensor_cache.flags;
+    if (ax) *ax = g_sensor_cache.ax;
+    if (ay) *ay = g_sensor_cache.ay;
+    if (az) *az = g_sensor_cache.az;
+    if (mx) *mx = g_sensor_cache.mx;
+    if (my) *my = g_sensor_cache.my;
+    if (mz) *mz = g_sensor_cache.mz;
+}
+
+void power_manage_set_sensor_report(bool enable)
+{
+    g_sensor_cache.report_enabled = enable;
+}
+
+bool power_manage_is_sensor_report_enabled(void)
+{
+    return g_sensor_cache.report_enabled;
 }
 
 esp_err_t power_manage_deinit(void)
@@ -908,6 +1045,18 @@ esp_err_t power_manage_deinit(void)
         bq27220_delete(g_bq27220_handle);
         g_bq27220_handle = NULL;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 device deleted");
+    }
+
+    /* Delete DA228EC device */
+    if (g_da228ec_handle != NULL) {
+        da228ec_delete(g_da228ec_handle);
+        g_da228ec_handle = NULL;
+    }
+
+    /* Delete MMC5603 device */
+    if (g_mmc5603_handle != NULL) {
+        mmc5603_delete(g_mmc5603_handle);
+        g_mmc5603_handle = NULL;
     }
 
     /* Delete I2C bus */
@@ -1026,6 +1175,16 @@ bq27220_handle_t power_manage_get_bq27220_handle(void)
 i2c_master_bus_handle_t power_manage_get_i2c_bus(void)
 {
     return g_i2c_bus_handle;
+}
+
+da228ec_handle_t power_manage_get_da228ec_handle(void)
+{
+    return g_da228ec_handle;
+}
+
+mmc5603_handle_t power_manage_get_mmc5603_handle(void)
+{
+    return g_mmc5603_handle;
 }
 
 bool power_manage_task_is_running(void)

@@ -69,6 +69,11 @@
 #define SYS_CMD_TT_FORCE_ON             0x72  // Force TT module on (ignore low battery)
 #define SYS_CMD_TT_FORCE_OFF            0x73  // Cancel force, restore low battery protection
 
+/* Sensor Commands */
+#define SYS_CMD_GET_SENSOR_STATUS       0x74  // Get sensor presence status
+#define SYS_CMD_ENABLE_SENSOR_REPORT    0x75  // Enable periodic sensor data report
+#define SYS_CMD_DISABLE_SENSOR_REPORT   0x76  // Disable periodic sensor data report
+
 /* System Command/Response Packet Configuration */
 #define SYS_CMD_PACKET_MAX_PARAMS       96      // Maximum parameter bytes
 #define SYS_CMD_PACKET_MAX_SIZE         (1 + 1 + SYS_CMD_PACKET_MAX_PARAMS + 2)  // seq + cmd + params + crc16
@@ -157,6 +162,21 @@ typedef struct {
     char build_datetime[16];      // Build date and time (YYYY-MM-DD)
 } __attribute__((packed)) system_version_info_t;
 
+/* Sensor Status Flags */
+#define SYS_SENSOR_FLAG_ACCEL           0x01  // DA228EC accelerometer present
+#define SYS_SENSOR_FLAG_MAG             0x02  // MMC5603 magnetometer present
+
+/* Sensor Data Structure (for notification report) */
+typedef struct {
+    uint8_t flags;                 // bit0=accel valid, bit1=mag valid
+    int16_t accel_x;               // mg
+    int16_t accel_y;               // mg
+    int16_t accel_z;               // mg
+    int16_t mag_x;                 // mG
+    int16_t mag_y;                 // mG
+    int16_t mag_z;                 // mG
+} __attribute__((packed)) system_sensor_data_t;
+
 /**
  * @brief Initialize the GATT System server
  *
@@ -198,5 +218,13 @@ int gatt_system_server_stop_service(uint8_t service_id);
  * @return 1 if running, 0 if stopped, -1 if error
  */
 int gatt_system_server_get_service_status(uint8_t service_id);
+
+/**
+ * @brief Send sensor data notification to connected app
+ *
+ * Called from sensor_monitor_task when report is enabled.
+ * @return 0 on success, negative error code otherwise
+ */
+int gatt_system_server_send_sensor_data(void);
 
 #endif /* GATT_SYSTEM_SERVER_H */

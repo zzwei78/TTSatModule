@@ -62,6 +62,8 @@ idf_component_register(
         app_update
         bq27220
         IP5561
+        da228ec
+        mmc5603
         openthread
         libgsm0710
 )

@@ -17,6 +17,7 @@
 #include "ble/gatt_log_server.h"
 #include "audio/voice_packet_handler.h"
 #include "system/syslog.h"
+#include "esp_bt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -651,6 +652,11 @@ ble_spp_server_on_sync(void)
         MODLOG_DFLT(ERROR, "error determining address type; rc=%d\n", rc);
         return;
     }
+
+    /* BLE TX power: default (0 dBm) */
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P12);
+    int8_t tx_pwr = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT);
+    MODLOG_DFLT(INFO, "BLE TX power: %d dBm\n", tx_pwr);
 
     /* Printing ADDR */
     uint8_t addr_val[6] = {0};
