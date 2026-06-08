@@ -21,6 +21,7 @@
 #include "audio/audiosvc.h"
 #include "tt/gsm0710_manager.h"
 #include "system/syslog.h"
+#include "sim/sat_call_sim.h"
 
 /* GATT Voice Loopback Test Mode */
 // #define CONFIG_VOICE_GATT_LOOPBACK  // Uncomment to enable GATT loopback test
@@ -103,7 +104,7 @@ static void spp_voice_output_callback(const uint8_t *data, size_t len, void *use
         return;
     }
 
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "[UL] TT -> BLE: %d bytes", len);
+    SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "[UL] TT -> BLE: %d bytes", len);
 
     // Send to BLE GATT
     spp_voice_server_send(g_voice_server.active_conn_handle, data, len);
@@ -171,7 +172,7 @@ static void spp_voice_downlink_callback(const uint8_t *data, size_t len, void *u
         }
     }
 
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+    SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
         "Sent %d frames (%d bytes) to MUX CH9", (int)frame_count, (int)len);
 #endif
 }
@@ -214,8 +215,7 @@ static void spp_voice_mux9_callback(const uint8_t *data, size_t len, void *user_
     size_t complete_frames = len / audio_frame_size;
     size_t remainder = len % audio_frame_size;
 
-    /* Debug: always log MUX9 received size to diagnose 3-frame mode */
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+    SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
         "MUX9: Received %d bytes (%d complete frames, %d remainder)",
         len, complete_frames, remainder);
 
@@ -279,7 +279,7 @@ static int spp_voice_service_handler(uint16_t conn_handle, uint16_t attr_handle,
         {
             uint16_t data_len = ctxt->om->om_len;
 
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "[DL] BLE -> decode queue: %d bytes", data_len);
+            SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "[DL] BLE -> decode queue: %d bytes", data_len);
 
             /* Check size limit */
             if (data_len > SPP_VOICE_MAX_DATA_SIZE) {
@@ -304,7 +304,19 @@ static int spp_voice_service_handler(uint16_t conn_handle, uint16_t attr_handle,
              * 2. Base64 decode
              * 3. AMRNB decode
              * 4. Send PCM to MUX channel 9
+             *
+             * During simulation, drop downlink data until call is ACTIVE.
+             * Simulated voice is injected via voice_data_queue, not MUX.
              */
+#if ENABLE_SAT_CALL_SIM
+            if (sat_call_sim_is_enabled() &&
+                sat_call_sim_get_state() != SIM_CALL_ACTIVE) {
+                SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                    "[DL] Dropped: sim active but call not connected (state=%d)",
+                    sat_call_sim_get_state());
+                return 0;
+            }
+#endif
             int ret = voice_downlink_enqueue(g_voice_server.data_buffer, data_len);
             if (ret != 0) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Failed to enqueue voice packet: %d", ret);
@@ -480,6 +492,10 @@ void spp_voice_server_enable(void)
     esp_timer_start_once(g_voice_idle_timer, VOICE_IDLE_TIMEOUT_MS * 1000ULL);
 #endif
 
+#if ENABLE_SAT_CALL_SIM
+    sat_call_sim_voice_enabled();
+#endif
+
     SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice service enabled");
 }
 
@@ -491,6 +507,10 @@ void spp_voice_server_disable(void)
     int rc;
 
     g_voice_server.enabled = false;
+
+#if ENABLE_SAT_CALL_SIM
+    sat_call_sim_voice_disabled();
+#endif
 
 #if ENABLE_VOICE_IDLE_TIMEOUT
     if (g_voice_idle_timer != NULL) {
@@ -544,6 +564,9 @@ void spp_voice_server_cleanup_on_disconnect(uint16_t conn_handle)
         // Disable voice service on disconnect to stop TT module from sending voice data
         if (g_voice_server.enabled) {
             g_voice_server.enabled = false;
+#if ENABLE_SAT_CALL_SIM
+            sat_call_sim_voice_disabled();
+#endif
             SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "Voice service disabled on BLE disconnect");
         }
 

@@ -456,8 +456,9 @@ static int handle_gap_event_connect(struct ble_gap_event *event, void *arg)
         MODLOG_DFLT(INFO, "Max connections reached, stopping advertising\n");
         ble_gap_adv_stop();
     } else {
-        MODLOG_DFLT(INFO, "Waiting for more connections (%d/%d)\n",
+        MODLOG_DFLT(INFO, "Waiting for more connections (%d/%d), restarting advertising\n",
                     ble_conn_manager_get_connection_count(), BLE_MAX_CONNECTIONS);
+        ble_spp_server_advertise();
     }
 #else
     BLE_CONN_COUNT_INC();
@@ -497,8 +498,9 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
         MODLOG_DFLT(INFO, "All connections closed, restarting advertising\n");
         ble_spp_server_advertise();
     } else {
-        MODLOG_DFLT(INFO, "Still have %d active connection(s), advertising remains off\n",
+        MODLOG_DFLT(INFO, "Still have %d active connection(s), restarting advertising for new connection\n",
                     ble_conn_manager_get_connection_count());
+        ble_spp_server_advertise();
     }
 #else
     BLE_CONN_COUNT_RESET();

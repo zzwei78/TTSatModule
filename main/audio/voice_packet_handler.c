@@ -169,7 +169,7 @@ static void voice_decode_task(void *pvParameters)
             g_decode_empty_count = 0;  /* Reset empty counter */
             g_voice_stats.downlink_packets_total++;
 
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+            SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
                            "[DL] Tick #%u, raw %u bytes",
                            g_20ms_stats.total_ticks, raw_data.data_len);
 
@@ -259,7 +259,7 @@ static void voice_decode_task(void *pvParameters)
                 if (g_voice_downlink_callback != NULL) {
                     g_voice_downlink_callback(pcm_combined, total_pcm_len,
                                              g_voice_downlink_user_data);
-                    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                    SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
                         "[DL] %d/%d frames decoded, %d bytes PCM -> BLE",
                         decoded_frames, frame_count, total_pcm_len);
                 } else {
@@ -376,7 +376,7 @@ static void voice_encode_task(void *pvParameters)
                         int at_len = snprintf(at_cmd, sizeof(at_cmd),
                                               "AT^AUDPCM=\"%s\"", base64_buf);
 
-                        SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                        SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
                             "[UL] %d frames, %d bytes AMR -> AT cmd %d bytes",
                             accumulated, total_amr_len, at_len);
 
@@ -384,7 +384,7 @@ static void voice_encode_task(void *pvParameters)
                         if (g_voice_output_callback != NULL) {
                             g_voice_output_callback((const uint8_t *)at_cmd, at_len,
                                                     g_voice_output_user_data);
-                            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                            SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
                                 "[UL] Sent %d bytes to TT", at_len);
                         } else {
                             SYS_LOGW_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,

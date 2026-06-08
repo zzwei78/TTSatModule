@@ -21,6 +21,8 @@
 #include "config/user_params.h"
 #include "bq27220.h"
 
+/* Satellite call simulation (GATT-only interception) */
+#include "sim/sat_call_sim.h"
 
 /* External variable for BLE connection subscriptions */
 /* Note: conn_handle_subs is not used in LED_TEST (no BLE) */
@@ -973,6 +975,10 @@ esp_err_t tt_module_init(int event_queue_size)
     g_tt_module.initialized = true;
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Tiantong Module Control initialized successfully");
 
+#if ENABLE_SAT_CALL_SIM
+    sat_call_sim_init();
+#endif
+
     return ret;
 
 cleanup:
@@ -1685,6 +1691,14 @@ static tt_at_result_t tt_module_send_at_cmd_local(const char *cmd, char *respons
  */
 static tt_at_result_t tt_module_send_at_cmd_gatt_internal(const char *cmd, uint16_t conn_handle)
 {
+#if ENABLE_SAT_CALL_SIM
+    /* Simulation interception: handle AT command locally if sim is enabled */
+    if (sat_call_sim_is_enabled()) {
+        int ret = sat_call_sim_handle_at_gatt(cmd, conn_handle);
+        return (ret == 0) ? TT_AT_RESULT_OK : TT_AT_RESULT_ERROR;
+    }
+#endif
+
     if (!g_tt_module.initialized) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Tiantong Module not initialized");
         return TT_AT_RESULT_ERROR;
@@ -1878,6 +1892,14 @@ void tt_module_route_at_response(const uint8_t *data, size_t len, void *user_dat
             // No active command context - this is an unsolicited notification
             // Forward to GATT directly for notifications like incoming calls, network status, etc.
             SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> URC (%d bytes): %.*s", len, len > 80 ? 80 : (int)len, (char *)data);
+
+#if ENABLE_SAT_CALL_SIM
+            // In simulation mode, suppress real module URCs to avoid confusing the app
+            if (sat_call_sim_is_enabled()) {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, ">>> URC suppressed (simulation active)");
+                break;
+            }
+#endif
 
             // Forward to GATT if we have an active connection (use non-blocking async version)
             if (g_at_context.last_active_gatt_conn != 0) {

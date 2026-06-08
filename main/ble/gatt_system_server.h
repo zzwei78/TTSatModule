@@ -74,6 +74,12 @@
 #define SYS_CMD_ENABLE_SENSOR_REPORT    0x75  // Enable periodic sensor data report
 #define SYS_CMD_DISABLE_SENSOR_REPORT   0x76  // Disable periodic sensor data report
 
+/* Simulation Commands */
+#define SYS_CMD_SIM_CTRL                0x77  // Simulation control (enable/disable + scenario)
+#define SYS_CMD_SIM_INCOMING            0x78  // Trigger simulated incoming call
+#define SYS_CMD_SIM_SET_NET             0x79  // Set simulated network parameters (CSQ, CREG)
+#define SYS_CMD_SIM_GET_STATE           0x7A  // Get simulation state
+
 /* System Command/Response Packet Configuration */
 #define SYS_CMD_PACKET_MAX_PARAMS       96      // Maximum parameter bytes
 #define SYS_CMD_PACKET_MAX_SIZE         (1 + 1 + SYS_CMD_PACKET_MAX_PARAMS + 2)  // seq + cmd + params + crc16

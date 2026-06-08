@@ -40,8 +40,11 @@ static ip5561_handle_t g_ip5561_handle = NULL;
 /* BQ27220 device handle (Battery fuel gauge) */
 static bq27220_handle_t g_bq27220_handle = NULL;
 
-/* DA228EC device handle (3-axis accelerometer) */
+/* DA228EC device handle (3-axis accelerometer, primary) */
 static da228ec_handle_t g_da228ec_handle = NULL;
+
+/* SC7A20H device handle (3-axis accelerometer, second source) */
+static sc7a20h_handle_t g_sc7a20h_handle = NULL;
 
 /* MMC5603 device handle (3-axis magnetometer) */
 static mmc5603_handle_t g_mmc5603_handle = NULL;
@@ -905,7 +908,7 @@ esp_err_t power_manage_init(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  IP5561 (Charging):  %s", ip5561_ok ? "OK" : "FAIL");
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  BQ27220 (Battery):  %s", bq27220_ok ? "OK" : "FAIL");
 
-    /* Step 7: Initialize DA228EC accelerometer (dynamic detect) */
+    /* Step 7: Initialize accelerometer (DA228EC primary, SC7A20H fallback) */
     {
         da228ec_config_t da228ec_cfg = {
             .i2c_bus = g_i2c_bus_handle,
@@ -915,7 +918,17 @@ esp_err_t power_manage_init(void)
         if (g_da228ec_handle != NULL) {
             SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  DA228EC (Accel):    OK");
         } else {
-            SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  DA228EC (Accel):    not found");
+            /* Try SC7A20H as second source */
+            sc7a20h_config_t sc7a20h_cfg = {
+                .i2c_bus = g_i2c_bus_handle,
+                .scl_freq_hz = POWER_I2C_FREQ_HZ,
+            };
+            g_sc7a20h_handle = sc7a20h_create(&sc7a20h_cfg);
+            if (g_sc7a20h_handle != NULL) {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  SC7A20H (Accel):   OK");
+            } else {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  Accel:             not found");
+            }
         }
     }
 
@@ -936,7 +949,7 @@ esp_err_t power_manage_init(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "========================================");
 
     /* Start sensor monitor task if any sensor detected */
-    if (g_da228ec_handle != NULL || g_mmc5603_handle != NULL) {
+    if (g_da228ec_handle != NULL || g_sc7a20h_handle != NULL || g_mmc5603_handle != NULL) {
         xTaskCreate(sensor_monitor_task, "sensor_mon", 3072, NULL, 1, NULL);
     }
 
@@ -958,6 +971,14 @@ static void sensor_monitor_task(void *pvParameters)
         if (g_da228ec_handle != NULL) {
             int16_t x, y, z;
             if (da228ec_read_xyz(g_da228ec_handle, &x, &y, &z) == ESP_OK) {
+                g_sensor_cache.ax = x;
+                g_sensor_cache.ay = y;
+                g_sensor_cache.az = z;
+                flags |= 0x01;
+            }
+        } else if (g_sc7a20h_handle != NULL) {
+            int16_t x, y, z;
+            if (sc7a20h_read_xyz(g_sc7a20h_handle, &x, &y, &z) == ESP_OK) {
                 g_sensor_cache.ax = x;
                 g_sensor_cache.ay = y;
                 g_sensor_cache.az = z;
@@ -995,7 +1016,7 @@ static void sensor_monitor_task(void *pvParameters)
 uint8_t power_manage_get_sensor_flags(void)
 {
     uint8_t flags = 0;
-    if (g_da228ec_handle != NULL) flags |= 0x01;
+    if (g_da228ec_handle != NULL || g_sc7a20h_handle != NULL) flags |= 0x01;
     if (g_mmc5603_handle != NULL) flags |= 0x02;
     return flags;
 }
@@ -1051,6 +1072,12 @@ esp_err_t power_manage_deinit(void)
     if (g_da228ec_handle != NULL) {
         da228ec_delete(g_da228ec_handle);
         g_da228ec_handle = NULL;
+    }
+
+    /* Delete SC7A20H device */
+    if (g_sc7a20h_handle != NULL) {
+        sc7a20h_delete(g_sc7a20h_handle);
+        g_sc7a20h_handle = NULL;
     }
 
     /* Delete MMC5603 device */

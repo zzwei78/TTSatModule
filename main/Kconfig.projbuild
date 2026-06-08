@@ -4,4 +4,12 @@ menu "Example Configuration"
         int "IO Type"
         default 3
 
+    config BLE_MULTI_CONN_ENABLE
+        bool "Enable BLE multi-connection support"
+        default y
+        help
+            Enable support for two simultaneous BLE connections.
+            First connection gets PRIMARY role (full access).
+            Second connection gets DEBUG role (restricted access).
+
 endmenu

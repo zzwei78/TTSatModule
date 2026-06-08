@@ -33,6 +33,11 @@ set(AUDIO_SRCS
     "audio/base64.c"
 )
 
+# Simulation source files
+set(SIM_SRCS
+    "sim/sat_call_sim.c"
+)
+
 # System management source files
 set(SYSTEM_SRCS
     "system/power_manage.c"
@@ -48,8 +53,8 @@ set(CONFIG_SRCS
 )
 
 idf_component_register(
-    SRCS "${MAIN_SRCS}" "${BLE_SRCS}" "${TT_SRCS}" "${AUDIO_SRCS}" "${SYSTEM_SRCS}" "${CONFIG_SRCS}"
-    INCLUDE_DIRS "." "ble" "tt" "audio" "system" "config"
+    SRCS "${MAIN_SRCS}" "${BLE_SRCS}" "${TT_SRCS}" "${AUDIO_SRCS}" "${SYSTEM_SRCS}" "${CONFIG_SRCS}" "${SIM_SRCS}"
+    INCLUDE_DIRS "." "ble" "tt" "audio" "system" "config" "sim"
     PRIV_REQUIRES
         audio_codec2
         nvs_flash
@@ -63,6 +68,7 @@ idf_component_register(
         bq27220
         IP5561
         da228ec
+        sc7a20h
         mmc5603
         openthread
         libgsm0710

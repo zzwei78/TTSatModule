@@ -36,6 +36,9 @@
 #include "IP5561.h"
 #include "ble/ble_conn_manager.h"
 
+/* Simulation support */
+#include "sim/sat_call_sim.h"
+
 /* Tag for logging */
 static const char *TAG = "GATT_SYSTEM";
 
@@ -84,6 +87,12 @@ static const uint8_t DEBUG_ALLOWED_COMMANDS[] = {
     0x5A,  // SET_9V_UNDERVOLT_THRESHOLD
     0x5C,  // SET_VBUS_9V_CURRENT
     0x5E,  // SET_WIRELESS_CHARGE
+
+    // ===== Simulation Control Commands =====
+    0x77,  // SIM_CTRL (enable/disable + scenario)
+    0x78,  // SIM_INCOMING (trigger incoming call)
+    0x79,  // SIM_SET_NET (set simulated CSQ/CREG)
+    0x7A,  // SIM_GET_STATE (query simulation state)
 
     // ===== Limited System Control Commands =====
     0x21,  // RESET_TO_FACTORY (requires additional verification)
@@ -668,6 +677,26 @@ static void print_system_command(const uint8_t *data, size_t len)
         snprintf(param_str, sizeof(param_str), "Disable sensor data report");
         break;
 
+    case SYS_CMD_SIM_CTRL:
+        cmd_name = "SIM_CTRL";
+        snprintf(param_str, sizeof(param_str), "Simulation control");
+        break;
+
+    case SYS_CMD_SIM_INCOMING:
+        cmd_name = "SIM_INCOMING";
+        snprintf(param_str, sizeof(param_str), "Trigger incoming call simulation");
+        break;
+
+    case SYS_CMD_SIM_SET_NET:
+        cmd_name = "SIM_SET_NET";
+        snprintf(param_str, sizeof(param_str), "Set simulated network params");
+        break;
+
+    case SYS_CMD_SIM_GET_STATE:
+        cmd_name = "SIM_GET_STATE";
+        snprintf(param_str, sizeof(param_str), "Get simulation state");
+        break;
+
     default:
         snprintf(param_str, sizeof(param_str), "Unknown command (0x%02x)", cmd);
         break;
@@ -1052,6 +1081,21 @@ static esp_err_t handle_system_control_command(uint16_t conn_handle, const uint8
             }
         }
         break;
+
+#if ENABLE_SAT_CALL_SIM
+    case SYS_CMD_SIM_CTRL:
+    case SYS_CMD_SIM_INCOMING:
+    case SYS_CMD_SIM_SET_NET:
+        /* Simulation commands are handled asynchronously */
+        response = SYS_RESP_OK;
+        resp_len = 1;
+        break;
+    case SYS_CMD_SIM_GET_STATE:
+        /* Handled asynchronously */
+        response = SYS_RESP_OK;
+        resp_len = 1;
+        break;
+#endif
 
     default:
         SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Unknown system command: 0x%02x", cmd);
@@ -2253,6 +2297,66 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
             resp_len = 1;
         }
         break;
+
+#if ENABLE_SAT_CALL_SIM
+    case SYS_CMD_SIM_CTRL:
+        {
+            /* params[0] = enable (1=on, 0=off)
+             * params[1] = scenario (0=normal, 1=busy, 2=no_answer, 3=net_drop, 5=reject) */
+            if (param_len < 1) {
+                resp_code = SYS_RESP_INVALID_PARAM;
+                break;
+            }
+            bool enable = (cmd_params[0] != 0);
+            sim_scenario_t scenario = SIM_SCENARIO_NORMAL;
+            if (param_len >= 2) {
+                scenario = (sim_scenario_t)cmd_params[1];
+            }
+            int ret = sat_call_sim_set_enabled(enable, scenario);
+            if (ret != 0) {
+                resp_code = SYS_RESP_ERROR;
+            } else {
+                resp_data[0] = sat_call_sim_is_enabled() ? 1 : 0;
+                resp_data[1] = (uint8_t)sat_call_sim_get_scenario();
+                resp_len = 2;
+            }
+        }
+        break;
+
+    case SYS_CMD_SIM_INCOMING:
+        {
+            /* params[0..1] = delay_ms (little-endian, 0=immediate) */
+            uint32_t delay_ms = 0;
+            if (param_len >= 2) {
+                delay_ms = cmd_params[0] | (cmd_params[1] << 8);
+            }
+            int ret = sat_call_sim_trigger_incoming(delay_ms);
+            resp_code = (ret == 0) ? SYS_RESP_OK : SYS_RESP_ERROR;
+        }
+        break;
+
+    case SYS_CMD_SIM_SET_NET:
+        {
+            /* params[0] = CSQ (0-31, 99=unknown)
+             * params[1] = CREG (0-5) */
+            if (param_len < 2) {
+                resp_code = SYS_RESP_INVALID_PARAM;
+                break;
+            }
+            sat_call_sim_set_network(cmd_params[0], cmd_params[1]);
+        }
+        break;
+
+    case SYS_CMD_SIM_GET_STATE:
+        {
+            /* Response: [enabled][scenario][call_state] */
+            resp_data[0] = sat_call_sim_is_enabled() ? 1 : 0;
+            resp_data[1] = (uint8_t)sat_call_sim_get_scenario();
+            resp_data[2] = (uint8_t)sat_call_sim_get_state();
+            resp_len = 3;
+        }
+        break;
+#endif /* ENABLE_SAT_CALL_SIM */
 
     default:
         SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Unknown system command: 0x%02x", cmd_code);

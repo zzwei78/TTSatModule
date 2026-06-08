@@ -11,6 +11,7 @@
 #include "IP5561.h"
 #include "bq27220.h"
 #include "da228ec.h"
+#include "sc7a20h.h"
 #include "mmc5603.h"
 
 #ifdef __cplusplus
