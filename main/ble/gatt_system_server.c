@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_chip_info.h"
 #include "esp_timer.h"
+#include "esp_bt.h"
 #include "esp_private/esp_clk.h"
 #include "host/ble_hs.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -32,7 +33,7 @@
 #include "config/user_params.h"
 #include "ble/gatt_ota_server.h"
 #include "audio/voice_packet_handler.h"
-#include "bq27220.h"
+#include "fuel_gauge.h"
 #include "IP5561.h"
 #include "ble/ble_conn_manager.h"
 
@@ -41,6 +42,12 @@
 
 /* Tag for logging */
 static const char *TAG = "GATT_SYSTEM";
+
+/* BLE TX power temporary override with timeout */
+#define BLE_TX_POWER_DEFAULT    ESP_PWR_LVL_P12   /* 12 dBm - default production power */
+static esp_timer_handle_t g_ble_tx_power_timer = NULL;
+static esp_power_level_t g_ble_tx_power_original = BLE_TX_POWER_DEFAULT;
+static bool g_ble_tx_power_overridden = false;
 
 // ============================================================
 // Debug Connection Permission Control
@@ -73,6 +80,7 @@ static const uint8_t DEBUG_ALLOWED_COMMANDS[] = {
     0x52,  // GET_WIRELESS_CHARGE_STATUS
     0x54,  // GET_VBUS_VOLTAGE_CURRENT
     0x55,  // GET_NTC_TEMPERATURE
+    0x7B,  // BLE_TX_POWER_TEMP (test only)
     0x60,  // GET_TT_MODULE_STATE
 
     // ===== Log Configuration Commands =====
@@ -93,6 +101,22 @@ static const uint8_t DEBUG_ALLOWED_COMMANDS[] = {
     0x78,  // SIM_INCOMING (trigger incoming call)
     0x79,  // SIM_SET_NET (set simulated CSQ/CREG)
     0x7A,  // SIM_GET_STATE (query simulation state)
+    
+    // ===== BLE Test Commands =====
+    0x7B, // Set BLE TX power temporarily with timeout
+
+    // ===== Service Control Commands =====
+    0x10,  // SERVICE_START
+    0x11,  // SERVICE_STOP
+    0x12,  // SERVICE_STATUS
+
+    // ===== Voice Configuration Commands =====
+    0x70,  // SET_VOICE_FRAME_MODE
+    0x71,  // GET_VOICE_FRAME_MODE
+
+    // ===== TT Module Force Control =====
+    0x72,  // TT_FORCE_ON
+    0x73,  // TT_FORCE_OFF
 
     // ===== Limited System Control Commands =====
     0x21,  // RESET_TO_FACTORY (requires additional verification)
@@ -209,18 +233,18 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
 
     memset(info, 0, sizeof(system_battery_info_t));
 
-    bq27220_handle_t battery_handle = power_manage_get_bq27220_handle();
+    fuel_gauge_handle_t battery_handle = power_manage_get_fuel_gauge_handle();
     if (battery_handle == NULL) {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Battery handle not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
     /* Step 1: Read core battery data in sequence */
-    uint16_t voltage = bq27220_get_voltage(battery_handle);
-    int16_t current = bq27220_get_current(battery_handle);
+    uint16_t voltage = fuel_gauge_get_voltage(battery_handle);
+    int16_t current = fuel_gauge_get_current(battery_handle);
     battery_status_t bat_status;
     memset(&bat_status, 0, sizeof(bat_status));
-    bq27220_get_battery_status(battery_handle, &bat_status);
+    fuel_gauge_get_battery_status(battery_handle, &bat_status);
 
     /* Step 2: Validate core data */
     if (voltage < 2500 || voltage > 4500) {
@@ -254,15 +278,15 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
 
     /* Step 5: Set current (average from power_manage cache) and charging status */
     //info->current_ma = power_manage_get_avg_current();
-    info->current_ma = bq27220_get_current(battery_handle);
+    info->current_ma = fuel_gauge_get_current(battery_handle);
     info->charging = is_charging ? 1 : 0;
     info->full_charged = bat_status.FC ? 1 : 0;
 
     /* Step 6: Read remaining battery parameters */
-    info->soh_percent = bq27220_get_state_of_health(battery_handle);
-    info->temperature_0_1k = bq27220_get_temperature(battery_handle);
-    info->full_charge_capacity_mah = bq27220_get_full_charge_capacity(battery_handle);
-    info->remaining_capacity_mah = bq27220_get_remaining_capacity(battery_handle);
+    info->soh_percent = fuel_gauge_get_state_of_health(battery_handle);
+    info->temperature_0_1k = fuel_gauge_get_temperature(battery_handle);
+    info->full_charge_capacity_mah = fuel_gauge_get_full_charge_capacity(battery_handle);
+    info->remaining_capacity_mah = fuel_gauge_get_remaining_capacity(battery_handle);
 
     /* Step 7: Validate and clamp values */
     if (info->soh_percent > 100) {
@@ -304,20 +328,20 @@ static esp_err_t get_charge_status(system_charge_status_t *status)
 
     memset(status, 0, sizeof(system_charge_status_t));
 
-    bq27220_handle_t battery_handle = power_manage_get_bq27220_handle();
+    fuel_gauge_handle_t battery_handle = power_manage_get_fuel_gauge_handle();
     if (battery_handle == NULL) {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Battery handle not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
-    int16_t current = bq27220_get_current(battery_handle);
+    int16_t current = fuel_gauge_get_current(battery_handle);
     status->is_charging = (current > 0) ? 1 : 0;
-    status->charge_voltage_mv = bq27220_get_charge_voltage(battery_handle);
-    status->charge_current_ma = bq27220_get_charge_current(battery_handle);
-    status->time_to_full_min = bq27220_get_time_to_full(battery_handle);
+    status->charge_voltage_mv = fuel_gauge_get_charge_voltage(battery_handle);
+    status->charge_current_ma = fuel_gauge_get_charge_current(battery_handle);
+    status->time_to_full_min = fuel_gauge_get_time_to_full(battery_handle);
 
     battery_status_t bat_status;
-    if (bq27220_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
+    if (fuel_gauge_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
         status->is_full = bat_status.FC ? 1 : 0;
     }
 
@@ -325,24 +349,133 @@ static esp_err_t get_charge_status(system_charge_status_t *status)
 }
 
 /**
- * @brief Get BLE TX power
+ * @brief Get BLE TX power (in dBm)
  */
 static int8_t get_ble_tx_power(void)
 {
-    // TODO: Implement BLE TX power reading
-    // This requires accessing NimBLE's TX power configuration
-    return 0;  // Default/unknown
+    return esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT);
 }
 
 /**
- * @brief Set BLE TX power
+ * @brief Set BLE TX power (raw esp_power_level_t)
  */
-static esp_err_t set_ble_tx_power(int8_t power)
+static esp_err_t set_ble_tx_power_level(esp_power_level_t level)
 {
-    // TODO: Implement BLE TX power setting
-    // This requires configuring NimBLE's TX power
-    SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "BLE TX power setting not yet implemented");
-    return ESP_ERR_NOT_SUPPORTED;
+    esp_err_t ret = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, level);
+    if (ret == ESP_OK) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+            "BLE TX power set to level %d (%d dBm)", level,
+            esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT));
+    } else {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+            "Failed to set BLE TX power level %d: %s", level, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+/**
+ * @brief Convert dBm value to esp_power_level_t
+ *
+ * ESP32-S3 uses the esp32c3 family BT controller which supports:
+ * -24, -21, -18, -15, -12, -9, -6, -3, 0, +3, +6, +9, +12, +15, +18, +20 dBm
+ *
+ * Returns -1 if the value doesn't map to a valid power level.
+ */
+static int8_t dbm_to_power_level(int8_t dbm)
+{
+    switch (dbm) {
+    case -24: return ESP_PWR_LVL_N24;
+    case -21: return ESP_PWR_LVL_N21;
+    case -18: return ESP_PWR_LVL_N18;
+    case -15: return ESP_PWR_LVL_N15;
+    case -12: return ESP_PWR_LVL_N12;
+    case  -9: return ESP_PWR_LVL_N9;
+    case  -6: return ESP_PWR_LVL_N6;
+    case  -3: return ESP_PWR_LVL_N3;
+    case   0: return ESP_PWR_LVL_N0;
+    case   3: return ESP_PWR_LVL_P3;
+    case   6: return ESP_PWR_LVL_P6;
+    case   9: return ESP_PWR_LVL_P9;
+    case  12: return ESP_PWR_LVL_P12;
+    case  15: return ESP_PWR_LVL_P15;
+    case  18: return ESP_PWR_LVL_P18;
+    case  20: return ESP_PWR_LVL_P20;
+    default:  return -1;
+    }
+}
+
+/**
+ * @brief Set BLE TX power (dBm value)
+ */
+static esp_err_t set_ble_tx_power(int8_t power_dbm)
+{
+    int8_t level = dbm_to_power_level(power_dbm);
+    if (level < 0) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+            "Invalid TX power %d dBm (valid: -24,-21,-18,-15,-12,-9,-6,-3,0,3,6,9,12,15,18,20)", power_dbm);
+        return ESP_ERR_INVALID_ARG;
+    }
+    return set_ble_tx_power_level((esp_power_level_t)level);
+}
+
+/**
+ * @brief Timer callback: restore BLE TX power to default after temporary override
+ */
+static void ble_tx_power_timeout_cb(void *arg)
+{
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+        "BLE TX power timeout, restoring to default (level %d)", g_ble_tx_power_original);
+    set_ble_tx_power_level(g_ble_tx_power_original);
+    g_ble_tx_power_overridden = false;
+}
+
+/**
+ * @brief Set BLE TX power temporarily with auto-restore timeout
+ *
+ * @param power_dbm TX power in dBm (-12 to 12, steps of 3)
+ * @param timeout_sec Timeout in seconds (0 = permanent, no auto-restore)
+ * @return ESP_OK on success
+ */
+static esp_err_t set_ble_tx_power_temp(int8_t power_dbm, uint32_t timeout_sec)
+{
+    esp_err_t ret = set_ble_tx_power(power_dbm);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Stop any existing timer */
+    if (g_ble_tx_power_timer != NULL) {
+        esp_timer_stop(g_ble_tx_power_timer);
+    }
+
+    if (timeout_sec == 0) {
+        /* Permanent change, no timer needed */
+        g_ble_tx_power_overridden = false;
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+            "BLE TX power set to %d dBm (permanent)", power_dbm);
+        return ESP_OK;
+    }
+
+    /* Create timer if first time */
+    if (g_ble_tx_power_timer == NULL) {
+        esp_timer_create(&(esp_timer_create_args_t){
+            .callback = ble_tx_power_timeout_cb,
+            .name = "ble_tx_pwr",
+        }, &g_ble_tx_power_timer);
+    }
+
+    /* Save original power (only if not already overridden) */
+    if (!g_ble_tx_power_overridden) {
+        g_ble_tx_power_original = (esp_power_level_t)dbm_to_power_level(
+            esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT));
+    }
+
+    g_ble_tx_power_overridden = true;
+    esp_timer_start_once(g_ble_tx_power_timer, (uint64_t)timeout_sec * 1000000ULL);
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+        "BLE TX power set to %d dBm, auto-restore in %lu s", power_dbm, timeout_sec);
+    return ESP_OK;
 }
 
 
@@ -697,6 +830,17 @@ static void print_system_command(const uint8_t *data, size_t len)
         snprintf(param_str, sizeof(param_str), "Get simulation state");
         break;
 
+    case SYS_CMD_BLE_TX_POWER_TEMP:
+        cmd_name = "BLE_TX_POWER_TEMP";
+        if (len >= 4) {
+            int8_t power = (int8_t)data[1];
+            uint32_t timeout = data[2] | ((uint32_t)data[3] << 8) |
+                               ((uint32_t)(len > 4 ? data[4] : 0) << 16) |
+                               ((uint32_t)(len > 5 ? data[5] : 0) << 24);
+            snprintf(param_str, sizeof(param_str), "Set TX power %d dBm, timeout %lu s", power, timeout);
+        }
+        break;
+
     default:
         snprintf(param_str, sizeof(param_str), "Unknown command (0x%02x)", cmd);
         break;
@@ -794,7 +938,7 @@ static esp_err_t handle_system_control_command(uint16_t conn_handle, const uint8
                 break;
             }
             uint8_t service_id = data[1];
-            int ret = gatt_system_server_start_service(service_id);
+            int ret = gatt_system_server_start_service(service_id, conn_handle);
             if (ret == 0) {
                 resp_data[1] = service_id;
                 resp_len = 2;
@@ -1325,7 +1469,7 @@ int gatt_system_server_send_status(uint16_t conn_handle, uint8_t status, const u
 /**
  * @brief Start a GATT service dynamically
  */
-int gatt_system_server_start_service(uint8_t service_id)
+int gatt_system_server_start_service(uint8_t service_id, uint16_t conn_handle)
 {
     int ret = 0;
 
@@ -1371,7 +1515,7 @@ int gatt_system_server_start_service(uint8_t service_id)
             return -3;  // Custom error code for OTA in progress
         }
         // Service is already initialized during startup, just enable it
-        spp_voice_server_enable();
+        spp_voice_server_enable(conn_handle);
         SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Voice GATT service started");
         break;
 
@@ -1712,7 +1856,7 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
                 break;
             }
             uint8_t service_id = cmd_params[0];
-            int ret = gatt_system_server_start_service(service_id);
+            int ret = gatt_system_server_start_service(service_id, conn_handle);
             if (ret == 0) {
                 resp_data[0] = service_id;
                 resp_len = 1;
@@ -2240,8 +2384,8 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
             esp_err_t ret = tt_module_force_on();
             tt_state_t state = tt_module_get_state();
             uint16_t v = 0;
-            bq27220_handle_t bq = power_manage_get_bq27220_handle();
-            if (bq) v = bq27220_get_voltage(bq);
+            fuel_gauge_handle_t bq = power_manage_get_fuel_gauge_handle();
+            if (bq) v = fuel_gauge_get_voltage(bq);
 
             if (ret == ESP_OK) {
                 resp_code = SYS_RESP_OK;
@@ -2264,8 +2408,8 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
             tt_module_force_off();
             tt_state_t state = tt_module_get_state();
             uint16_t v = 0;
-            bq27220_handle_t bq = power_manage_get_bq27220_handle();
-            if (bq) v = bq27220_get_voltage(bq);
+            fuel_gauge_handle_t bq = power_manage_get_fuel_gauge_handle();
+            if (bq) v = fuel_gauge_get_voltage(bq);
 
             // Response: [state][voltage_lo][voltage_hi]
             resp_data[0] = (uint8_t)state;
@@ -2357,6 +2501,37 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
         }
         break;
 #endif /* ENABLE_SAT_CALL_SIM */
+
+    case SYS_CMD_BLE_TX_POWER_TEMP:
+        {
+            /* params[0] = power (dBm, int8_t): -24,-21,-18,-15,-12,-9,-6,-3,0,3,6,9,12,15,18,20
+             * params[1..4] = timeout (uint32_t, little-endian, seconds)
+             *                0 = permanent change (no auto-restore)
+             * Response: [current_power_dbm, timeout_sec_lo, timeout_sec_hi,
+             *            timeout_sec_hi2, timeout_sec_hi3, original_power_dbm] */
+            if (param_len < 1) {
+                resp_code = SYS_RESP_INVALID_PARAM;
+                break;
+            }
+            int8_t power_dbm = (int8_t)cmd_params[0];
+            uint32_t timeout_sec = 0;
+            if (param_len >= 5) {
+                timeout_sec = cmd_params[1] | ((uint32_t)cmd_params[2] << 8) |
+                              ((uint32_t)cmd_params[3] << 16) | ((uint32_t)cmd_params[4] << 24);
+            }
+            if (set_ble_tx_power_temp(power_dbm, timeout_sec) == ESP_OK) {
+                resp_data[0] = (uint8_t)esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT);
+                resp_data[1] = (uint8_t)(timeout_sec & 0xFF);
+                resp_data[2] = (uint8_t)((timeout_sec >> 8) & 0xFF);
+                resp_data[3] = (uint8_t)((timeout_sec >> 16) & 0xFF);
+                resp_data[4] = (uint8_t)((timeout_sec >> 24) & 0xFF);
+                resp_data[5] = (uint8_t)g_ble_tx_power_original;
+                resp_len = 6;
+            } else {
+                resp_code = SYS_RESP_INVALID_PARAM;
+            }
+        }
+        break;
 
     default:
         SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Unknown system command: 0x%02x", cmd_code);

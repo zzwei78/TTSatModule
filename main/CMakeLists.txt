@@ -65,7 +65,7 @@ idf_component_register(
         mbedtls
         esp_partition
         app_update
-        bq27220
+        fuel_gauge
         IP5561
         da228ec
         sc7a20h

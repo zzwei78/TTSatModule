@@ -9,7 +9,7 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "IP5561.h"
-#include "bq27220.h"
+#include "fuel_gauge.h"
 #include "da228ec.h"
 #include "sc7a20h.h"
 #include "mmc5603.h"
@@ -139,11 +139,11 @@ esp_err_t power_manage_task_stop(void);
 ip5561_handle_t power_manage_get_ip5561_handle(void);
 
 /**
- * @brief Get BQ27220 device handle
+ * @brief Get fuel gauge device handle
  *
- * @return BQ27220 handle, or NULL if not initialized
+ * @return Fuel gauge handle, or NULL if not initialized
  */
-bq27220_handle_t power_manage_get_bq27220_handle(void);
+fuel_gauge_handle_t power_manage_get_fuel_gauge_handle(void);
 
 /**
  * @brief Get I2C bus handle

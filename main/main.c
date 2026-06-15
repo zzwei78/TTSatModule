@@ -30,7 +30,7 @@
 #include "system/ble_monitor.h"
 #include "system/sleep_manager.h"
 #include "config/user_params.h"
-#include "bq27220.h"
+#include "fuel_gauge.h"
 
 static const char *TAG = "MAIN";
 
@@ -221,11 +221,11 @@ void app_main(void)
 
     /* Step 2: Initialize TT Module (phone call has highest priority, no voltage check) */
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[2/4] Initializing TT module...");
-    bq27220_handle_t bq_handle = power_manage_get_bq27220_handle();
+    fuel_gauge_handle_t bq_handle = power_manage_get_fuel_gauge_handle();
 
     /* Log battery voltage if available */
     if (bq_handle != NULL) {
-        uint16_t battery_voltage = bq27220_get_voltage(bq_handle);
+        uint16_t battery_voltage = fuel_gauge_get_voltage(bq_handle);
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Battery voltage: %u mV", battery_voltage);
     } else {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 not available");
@@ -242,7 +242,7 @@ void app_main(void)
         /* Check battery voltage before starting TT module */
         bool skip_tt = false;
         if (bq_handle != NULL) {
-            uint16_t boot_voltage = bq27220_get_voltage(bq_handle);
+            uint16_t boot_voltage = fuel_gauge_get_voltage(bq_handle);
             if (boot_voltage > 0 && boot_voltage < POWER_MANAGE_TT_MODULE_V_OFF_MV) {
                 SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
                     "Battery too low (%umV < %umV), skip TT module start",

@@ -23,7 +23,7 @@
 #include "tt/tt_module.h"
 #include "system/power_manage.h"
 #include "tt/tt_hardware.h"
-#include "bq27220.h"
+#include "fuel_gauge.h"
 #include "audio/audiosvc.h"
 #include "config/user_params.h"
 #include "system/ble_monitor.h"
@@ -504,7 +504,7 @@ static void deferred_full_init_task(void *pvParameters)
     }
 
     /* Step 3: Start Power Monitor Task */
-    bq27220_handle_t bq = power_manage_get_bq27220_handle();
+    fuel_gauge_handle_t bq = power_manage_get_fuel_gauge_handle();
     if (bq != NULL) {
         esp_err_t ret = power_manage_task_start();
         if (ret != ESP_OK) {
@@ -689,9 +689,9 @@ static void enter_deep_sleep_internal(void)
     rtc_data.sleep_timestamp = esp_timer_get_time();
 
     /* Read battery voltage BEFORE stopping power tasks (need I2C alive) */
-    bq27220_handle_t bq = power_manage_get_bq27220_handle();
+    fuel_gauge_handle_t bq = power_manage_get_fuel_gauge_handle();
     if (bq != NULL) {
-        rtc_data.last_battery_mv = bq27220_get_voltage(bq);
+        rtc_data.last_battery_mv = fuel_gauge_get_voltage(bq);
     } else {
         rtc_data.last_battery_mv = 0;  /* No battery data available */
     }

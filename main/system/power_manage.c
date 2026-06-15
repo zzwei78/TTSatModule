@@ -37,8 +37,8 @@ static i2c_master_bus_handle_t g_i2c_bus_handle = NULL;
 /* IP5561 device handle (Charging management) */
 static ip5561_handle_t g_ip5561_handle = NULL;
 
-/* BQ27220 device handle (Battery fuel gauge) */
-static bq27220_handle_t g_bq27220_handle = NULL;
+/* Fuel gauge device handle (auto-detected BQ27220 or CW2217E) */
+static fuel_gauge_handle_t g_fuel_gauge_handle = NULL;
 
 /* DA228EC device handle (3-axis accelerometer, primary) */
 static da228ec_handle_t g_da228ec_handle = NULL;
@@ -59,11 +59,11 @@ static struct {
 
 /* Monitor task handles */
 static TaskHandle_t g_ip5561_task_handle = NULL;
-static TaskHandle_t g_bq27220_task_handle = NULL;
+static TaskHandle_t g_fuel_gauge_task_handle = NULL;
 
 /* Monitor task running flags */
 static bool g_ip5561_task_running = false;
-static bool g_bq27220_task_running = false;
+static bool g_fuel_gauge_task_running = false;
 
 /* Cached average current (calculated from CoulombCounter delta, updated every 60s) */
 static int16_t g_avg_current_ma = 0;
@@ -137,13 +137,13 @@ static void ip5561_wakeup_sequence(void)
  */
 static void update_battery_cache(void)
 {
-    if (g_bq27220_handle == NULL) {
+    if (g_fuel_gauge_handle == NULL) {
         return;
     }
 
     /* Read battery data */
-    uint16_t voltage = bq27220_get_voltage(g_bq27220_handle);
-    int16_t current = bq27220_get_current(g_bq27220_handle);
+    uint16_t voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
+    int16_t current = fuel_gauge_get_current(g_fuel_gauge_handle);
 
     /* Determine charging state */
     bool is_charging = (current < -200);
@@ -174,10 +174,10 @@ static uint16_t safe_get_battery_voltage(void)
         return g_battery_cache.voltage_mv;
     }
     /* In normal context - read from I2C directly */
-    if (g_bq27220_handle == NULL) {
+    if (g_fuel_gauge_handle == NULL) {
         return 0;
     }
-    return bq27220_get_voltage(g_bq27220_handle);
+    return fuel_gauge_get_voltage(g_fuel_gauge_handle);
 }
 
 /**
@@ -193,10 +193,10 @@ static int16_t safe_get_battery_current(void)
         return g_battery_cache.current_ma;
     }
     /* In normal context - read from I2C directly */
-    if (g_bq27220_handle == NULL) {
+    if (g_fuel_gauge_handle == NULL) {
         return 0;
     }
-    return bq27220_get_current(g_bq27220_handle);
+    return fuel_gauge_get_current(g_fuel_gauge_handle);
 }
 
 /* Enable/disable detailed diagnostics in monitor task */
@@ -468,41 +468,41 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
     esp_err_t ret;
     uint16_t voltage = 0;
     int16_t current = 0;
-    bool bq27220_charging = false;
+    bool fg_charging = false;
     bool ip5561_charging = false;
     bool ip5561_available = false;
 
     /* ========== Step 1: Read BQ27220 data (primary source) ========== */
-    voltage = bq27220_get_voltage(g_bq27220_handle);
+    voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
     if (voltage == 0) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220: Failed to read voltage");
         return ESP_FAIL;
     }
 
-    current = bq27220_get_current(g_bq27220_handle);
+    current = fuel_gauge_get_current(g_fuel_gauge_handle);
     /* current > 0 means charging, < 0 means discharging */
 
     battery_status_t batt_status;
-    ret = bq27220_get_battery_status(g_bq27220_handle, &batt_status);
+    ret = fuel_gauge_get_battery_status(g_fuel_gauge_handle, &batt_status);
     if (ret == ESP_OK) {
         /* Calculate BQ27220 charging state: prioritize current over DSG flag
          * Current is real-time, DSG flag may have lag during charge/discharge transitions
          */
         if (current < -200) {
             /* Clearly charging: current < -200mA */
-            bq27220_charging = true;
+            fg_charging = true;
         } else if (current > 200) {
             /* Clearly discharging: current > 200mA */
-            bq27220_charging = false;
+            fg_charging = false;
         } else {
             /* Small current zone (-200mA ~ +200mA): use DSG flag */
-            bq27220_charging = !batt_status.DSG;
+            fg_charging = !batt_status.DSG;
         }
     }
 
     SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
         "BQ27220: V=%umV, I=%dmA, DSG=%d → Charging=%d",
-        voltage, current, batt_status.DSG, bq27220_charging);
+        voltage, current, batt_status.DSG, fg_charging);
 
     /* ========== Step 2: Read IP5561 charging status (secondary source) ========== */
     if (g_ip5561_handle != NULL) {
@@ -544,11 +544,11 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
         }
 
         /* Triple verification for logging */
-        if (current_charging && bq27220_charging && ip5561_charging) {
+        if (current_charging && fg_charging && ip5561_charging) {
             /* All agree: charging */
             *is_charging = true;
             SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG, "State: CONFIRMED CHARGING (all 3 agree)");
-        } else if (!current_charging && !bq27220_charging && !ip5561_charging) {
+        } else if (!current_charging && !fg_charging && !ip5561_charging) {
             /* All agree: discharging */
             *is_charging = false;
             SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG, "State: CONFIRMED DISCHARGING (all 3 agree)");
@@ -557,7 +557,7 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
             *is_charging = current_charging;
             SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
                 "State MISMATCH! BQ27220_charging=%d (DSG=%d), I=%dmA, IP5561=%d → Using CURRENT (Charging=%d)",
-                bq27220_charging, batt_status.DSG, current, ip5561_charging, current_charging);
+                fg_charging, batt_status.DSG, current, ip5561_charging, current_charging);
         }
     } else {
         /* IP5561 not available - trust current */
@@ -567,7 +567,7 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
             *is_charging = false;
         } else {
             /* Small current: use DSG flag */
-            *is_charging = bq27220_charging;
+            *is_charging = fg_charging;
             SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
                 "State: Low current zone, using DSG=%d (IP5561 unavailable)", *is_charging);
         }
@@ -588,24 +588,24 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
     return ESP_OK;
 }
 
-static void __attribute__((unused)) bq27220_monitor_task(void *pvParameters)
+static void __attribute__((unused)) fuel_gauge_monitor_task(void *pvParameters)
 {
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 monitor task started (60s period)");
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge monitor task started (60s period)");
 
     int error_count = 0;
     uint16_t prev_coulomb_count = 0;
     bool first_read = true;
 
-    while (g_bq27220_task_running) {
+    while (g_fuel_gauge_task_running) {
         /* ========== Read all BQ27220 data ========== */
-        uint16_t voltage = bq27220_get_voltage(g_bq27220_handle);
+        uint16_t voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
         if (voltage == 0) {
             error_count++;
             if (error_count > 3) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
                     "BQ27220 read failed %d times", error_count);
             }
-            for (int i = 0; i < 60 && g_bq27220_task_running; i++) {
+            for (int i = 0; i < 60 && g_fuel_gauge_task_running; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
             }
             continue;
@@ -613,10 +613,10 @@ static void __attribute__((unused)) bq27220_monitor_task(void *pvParameters)
 
         error_count = 0;
 
-        int16_t instant_current = bq27220_get_current(g_bq27220_handle);
-        uint16_t coulomb_count = bq27220_get_raw_coulomb_count(g_bq27220_handle);
-        uint16_t soc = bq27220_get_state_of_charge(g_bq27220_handle);
-        int16_t avg_power = bq27220_get_average_power(g_bq27220_handle);
+        int16_t instant_current = fuel_gauge_get_current(g_fuel_gauge_handle);
+        uint16_t coulomb_count = fuel_gauge_get_raw_coulomb_count(g_fuel_gauge_handle);
+        uint16_t soc = fuel_gauge_get_state_of_charge(g_fuel_gauge_handle);
+        int16_t avg_power = fuel_gauge_get_average_power(g_fuel_gauge_handle);
 
         /* ========== Update battery cache for interrupt context ========== */
         update_battery_cache();
@@ -677,20 +677,20 @@ static void __attribute__((unused)) bq27220_monitor_task(void *pvParameters)
         }
 
         /* Wait 60 seconds before next check (1s granularity for quick stop response) */
-        for (int i = 0; i < 60 && g_bq27220_task_running; i++) {
+        for (int i = 0; i < 60 && g_fuel_gauge_task_running; i++) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
-    SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 monitor task exiting");
-    g_bq27220_task_handle = NULL;
+    SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge monitor task exiting");
+    g_fuel_gauge_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
 int16_t power_manage_get_avg_current(void)
 {
-    if (g_avg_current_ma == 0 && g_bq27220_handle != NULL) {
-        return bq27220_get_current(g_bq27220_handle);
+    if (g_avg_current_ma == 0 && g_fuel_gauge_handle != NULL) {
+        return fuel_gauge_get_current(g_fuel_gauge_handle);
     }
     return g_avg_current_ma;
 }
@@ -804,37 +804,37 @@ static esp_err_t power_manage_init_ip5561(void)
  *
  * @return ESP_OK on success, ESP_FAIL on failure (non-fatal, allows other devices to init)
  */
-static esp_err_t power_manage_init_bq27220(void)
+static esp_err_t power_manage_init_fuel_gauge(void)
 {
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "=== Initializing BQ27220 (Battery Fuel Gauge) ===");
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "=== Initializing Fuel Gauge (auto-detect BQ27220/CW2217E) ===");
 
-    bq27220_config_t bq27220_cfg = {
+    fuel_gauge_config_t fg_cfg = {
         .i2c_bus = g_i2c_bus_handle,
-        .cfg = &default_bq27220_config,
-        .cedv = &default_bq27220_cedv,
+        .gauging_config = &default_bq27220_config,
+        .cedv_params = &default_bq27220_cedv,
     };
 
-    g_bq27220_handle = bq27220_create(&bq27220_cfg);
-    if (g_bq27220_handle == NULL) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220: Device not found on I2C bus (0x55)");
+    g_fuel_gauge_handle = fuel_gauge_create(&fg_cfg);
+    if (g_fuel_gauge_handle == NULL) {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge: No device detected (probed 0x55 and 0x64)");
         return ESP_FAIL;
     }
 
     /* Test communication with retry */
     uint16_t voltage = 0;
     for (int i = 0; i < 3; i++) {
-        voltage = bq27220_get_voltage(g_bq27220_handle);
+        voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
         if (voltage > 0) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220: ✓ Communication OK, Voltage: %u mV", voltage);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge: ✓ Communication OK, Voltage: %u mV", voltage);
             return ESP_OK;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     /* All retries failed */
-    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220: Communication failed after 3 retries");
-    bq27220_delete(g_bq27220_handle);
-    g_bq27220_handle = NULL;
+    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge: Communication failed after 3 retries");
+    fuel_gauge_delete(g_fuel_gauge_handle);
+    g_fuel_gauge_handle = NULL;
     return ESP_FAIL;
 }
 
@@ -842,7 +842,7 @@ esp_err_t power_manage_init(void)
 {
     esp_err_t ret;
     bool ip5561_ok = false;
-    bool bq27220_ok = false;
+    bool fuel_gauge_ok = false;
 
     if (g_i2c_bus_handle != NULL) {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Power management already initialized");
@@ -884,16 +884,16 @@ esp_err_t power_manage_init(void)
         SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 initialization failed - continuing without it");
     }
 
-    /* Step 4: Initialize BQ27220 (independent, non-blocking) */
-    ret = power_manage_init_bq27220();
+    /* Step 4: Initialize Fuel Gauge (auto-detect BQ27220/CW2217E, non-blocking) */
+    ret = power_manage_init_fuel_gauge();
     if (ret == ESP_OK) {
-        bq27220_ok = true;
+        fuel_gauge_ok = true;
     } else {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 initialization failed - continuing without it");
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge initialization failed - continuing without it");
     }
 
     /* Step 5: Check if at least one device initialized successfully */
-    if (!ip5561_ok && !bq27220_ok) {
+    if (!ip5561_ok && !fuel_gauge_ok) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "========================================");
         SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "CRITICAL: Both devices failed to init!");
         SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "========================================");
@@ -906,7 +906,7 @@ esp_err_t power_manage_init(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "========================================");
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Power Management Init Summary:");
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  IP5561 (Charging):  %s", ip5561_ok ? "OK" : "FAIL");
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  BQ27220 (Battery):  %s", bq27220_ok ? "OK" : "FAIL");
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "  Fuel Gauge (Batt):  %s", fuel_gauge_ok ? "OK" : "FAIL");
 
     /* Step 7: Initialize accelerometer (DA228EC primary, SC7A20H fallback) */
     {
@@ -1061,11 +1061,11 @@ esp_err_t power_manage_deinit(void)
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 device deleted");
     }
 
-    /* Delete BQ27220 device */
-    if (g_bq27220_handle != NULL) {
-        bq27220_delete(g_bq27220_handle);
-        g_bq27220_handle = NULL;
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 device deleted");
+    /* Delete fuel gauge device */
+    if (g_fuel_gauge_handle != NULL) {
+        fuel_gauge_delete(g_fuel_gauge_handle);
+        g_fuel_gauge_handle = NULL;
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge device deleted");
     }
 
     /* Delete DA228EC device */
@@ -1101,7 +1101,7 @@ esp_err_t power_manage_deinit(void)
 
 esp_err_t power_manage_task_start(void)
 {
-    if (g_ip5561_handle == NULL && g_bq27220_handle == NULL) {
+    if (g_ip5561_handle == NULL && g_fuel_gauge_handle == NULL) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "No devices initialized");
         return ESP_ERR_INVALID_ARG;
     }
@@ -1126,24 +1126,24 @@ esp_err_t power_manage_task_start(void)
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task started");
     }
 
-    /* Start BQ27220 monitor task */
-    if (g_bq27220_handle != NULL && g_bq27220_task_handle == NULL) {
-        g_bq27220_task_running = true;
+    /* Start fuel gauge monitor task */
+    if (g_fuel_gauge_handle != NULL && g_fuel_gauge_task_handle == NULL) {
+        g_fuel_gauge_task_running = true;
         BaseType_t ret = xTaskCreate(
-            bq27220_monitor_task,
-            "bq27220_monitor",
+            fuel_gauge_monitor_task,
+            "fuel_gauge_monitor",
             4096,
             NULL,
             5,  /* Priority */
-            &g_bq27220_task_handle
+            &g_fuel_gauge_task_handle
         );
 
         if (ret != pdPASS) {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to create BQ27220 monitor task");
-            g_bq27220_task_running = false;
-            /* Continue without BQ27220 monitor */
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to create fuel gauge monitor task");
+            g_fuel_gauge_task_running = false;
+            /* Continue without fuel gauge monitor */
         } else {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 monitor task started");
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge monitor task started");
         }
     }
 
@@ -1169,20 +1169,20 @@ esp_err_t power_manage_task_stop(void)
         }
     }
 
-    /* Stop BQ27220 monitor task */
-    if (g_bq27220_task_handle != NULL) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Stopping BQ27220 monitor task...");
-        g_bq27220_task_running = false;
+    /* Stop fuel gauge monitor task */
+    if (g_fuel_gauge_task_handle != NULL) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Stopping fuel gauge monitor task...");
+        g_fuel_gauge_task_running = false;
 
         int timeout = 20;  /* 2 second timeout */
-        while (g_bq27220_task_handle != NULL && timeout-- > 0) {
+        while (g_fuel_gauge_task_handle != NULL && timeout-- > 0) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
 
-        if (g_bq27220_task_handle != NULL) {
-            SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 monitor task stop timeout");
+        if (g_fuel_gauge_task_handle != NULL) {
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge monitor task stop timeout");
         } else {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220 monitor task stopped");
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge monitor task stopped");
         }
     }
 
@@ -1194,9 +1194,9 @@ ip5561_handle_t power_manage_get_ip5561_handle(void)
     return g_ip5561_handle;
 }
 
-bq27220_handle_t power_manage_get_bq27220_handle(void)
+fuel_gauge_handle_t power_manage_get_fuel_gauge_handle(void)
 {
-    return g_bq27220_handle;
+    return g_fuel_gauge_handle;
 }
 
 i2c_master_bus_handle_t power_manage_get_i2c_bus(void)
@@ -1216,7 +1216,7 @@ mmc5603_handle_t power_manage_get_mmc5603_handle(void)
 
 bool power_manage_task_is_running(void)
 {
-    return g_ip5561_task_running || g_bq27220_task_running;
+    return g_ip5561_task_running || g_fuel_gauge_task_running;
 }
 
 /* ========== Wireless Charger Control Functions ========== */
@@ -2098,7 +2098,7 @@ esp_err_t power_manage_get_calibrated_soc(uint16_t *soc_percent)
         return ESP_ERR_INVALID_ARG;
     }
 
-    bq27220_handle_t battery_handle = g_bq27220_handle;
+    fuel_gauge_handle_t battery_handle = g_fuel_gauge_handle;
     if (battery_handle == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -2174,7 +2174,7 @@ esp_err_t power_manage_get_battery_voltage_compensated(uint16_t *voltage_mv, boo
         return ESP_ERR_INVALID_ARG;
     }
 
-    bq27220_handle_t battery_handle = g_bq27220_handle;
+    fuel_gauge_handle_t battery_handle = g_fuel_gauge_handle;
     if (battery_handle == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -2194,7 +2194,7 @@ esp_err_t power_manage_get_battery_voltage_compensated(uint16_t *voltage_mv, boo
     if (!xPortInIsrContext() && battery_handle != NULL) {
         /* Not in interrupt context - we can read battery status */
         battery_status_t bat_status;
-        if (bq27220_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
+        if (fuel_gauge_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
             if (current < -200) {
                 /* Clearly charging: current < -200mA */
                 charging = true;

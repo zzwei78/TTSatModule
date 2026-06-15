@@ -19,7 +19,7 @@
 #include "syslog.h"
 #include "system/power_manage.h"
 #include "config/user_params.h"
-#include "bq27220.h"
+#include "fuel_gauge.h"
 
 /* Satellite call simulation (GATT-only interception) */
 #include "sim/sat_call_sim.h"
@@ -1101,12 +1101,20 @@ esp_err_t tt_module_deinit(void)
         g_mux_init_task_handle = NULL;
         // Signal the task to stop by clearing the running flag
         g_tt_module_running = false;
-        // Give the task a chance to exit gracefully
-        vTaskDelay(pdMS_TO_TICKS(100));
-        // Check if task already exited (handle may be stale if task deleted itself)
-        eTaskState state = eTaskGetState(h);
-        if (state != eDeleted && state != eInvalid) {
-            vTaskDelete(h);
+        if (h == xTaskGetCurrentTaskHandle()) {
+            // MUX init task is calling deinit from within itself (e.g. SIMST timeout).
+            // Cannot delete ourselves here - the caller will vTaskDelete(NULL) after return.
+            // Just mark handle as NULL (already done above) and skip.
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                "MUX init task is calling deinit on itself, skipping self-delete");
+        } else {
+            // Give the task a chance to exit gracefully
+            vTaskDelay(pdMS_TO_TICKS(100));
+            // Check if task already exited (handle may be stale if task deleted itself)
+            eTaskState state = eTaskGetState(h);
+            if (state != eDeleted && state != eInvalid) {
+                vTaskDelete(h);
+            }
         }
     }
 
@@ -2493,9 +2501,9 @@ esp_err_t tt_module_user_power_on(void)
     // Get battery voltage for logging (no blocking - phone call has highest priority)
     uint16_t voltage_mv = 0;
     bool voltage_read_ok = false;
-    bq27220_handle_t battery_handle = power_manage_get_bq27220_handle();
+    fuel_gauge_handle_t battery_handle = power_manage_get_fuel_gauge_handle();
     if (battery_handle != NULL) {
-        voltage_mv = bq27220_get_voltage(battery_handle);
+        voltage_mv = fuel_gauge_get_voltage(battery_handle);
         voltage_read_ok = true;
     }
 
@@ -2696,9 +2704,9 @@ esp_err_t tt_module_force_off(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module Force OFF (protection restored) ===");
 
     // Immediately check battery voltage
-    bq27220_handle_t bq = power_manage_get_bq27220_handle();
+    fuel_gauge_handle_t bq = power_manage_get_fuel_gauge_handle();
     if (bq != NULL && g_tt_module_powered) {
-        uint16_t voltage = bq27220_get_voltage(bq);
+        uint16_t voltage = fuel_gauge_get_voltage(bq);
         if (voltage > 0 && voltage < POWER_MANAGE_TT_MODULE_V_OFF_MV) {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
                 "Force OFF: voltage %umV < threshold %umV, shutting down TT module",
@@ -2766,9 +2774,9 @@ esp_err_t tt_module_get_status_info(tt_status_info_t *info)
     info->state = g_tt_module.state;
 
     // Get battery voltage
-    bq27220_handle_t battery_handle = power_manage_get_bq27220_handle();
+    fuel_gauge_handle_t battery_handle = power_manage_get_fuel_gauge_handle();
     if (battery_handle != NULL) {
-        info->voltage_mv = bq27220_get_voltage(battery_handle);
+        info->voltage_mv = fuel_gauge_get_voltage(battery_handle);
     }
 
     // Get error code (only when state is HARDWARE_FAULT)
