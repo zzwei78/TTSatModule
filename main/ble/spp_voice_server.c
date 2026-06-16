@@ -22,6 +22,7 @@
 #include "tt/gsm0710_manager.h"
 #include "system/syslog.h"
 #include "sim/sat_call_sim.h"
+#include "tt/tt_module.h"
 
 /* GATT Voice Loopback Test Mode */
 // #define CONFIG_VOICE_GATT_LOOPBACK  // Uncomment to enable GATT loopback test
@@ -31,6 +32,13 @@ static const char *TAG = "SPP_VOICE_SERVER";
 #if ENABLE_VOICE_IDLE_TIMEOUT
 static esp_timer_handle_t g_voice_idle_timer = NULL;
 #endif
+
+/* BLE disconnect call hold: preserve active call for 30s waiting for reconnect */
+#define BLE_DISCONNECT_CALL_HOLD_MS  30000  /* 30 seconds */
+
+static esp_timer_handle_t g_ble_disconnect_timer = NULL;
+static bool g_call_preserved = false;
+static uint16_t g_preserved_conn_handle = 0;
 
 /* Static buffer for voice data - avoids repeated malloc/free */
 #define SPP_VOICE_MAX_DATA_SIZE VOICE_BUFFER_SIZE  // Use constant from ble_gatt_server.h
@@ -443,11 +451,16 @@ uint16_t spp_voice_server_get_val_handle(void)
 /**
  * @brief Enable Voice service
  */
-void spp_voice_server_enable(void)
+void spp_voice_server_enable(uint16_t conn_handle)
 {
     int rc;
 
     g_voice_server.enabled = true;
+
+    /* Save active connection handle for voice data output */
+    if (conn_handle != 0) {
+        g_voice_server.active_conn_handle = conn_handle;
+    }
 
     /* Request low-latency connection parameters for voice */
     if (g_voice_server.active_conn_handle != 0) {
@@ -580,4 +593,199 @@ void spp_voice_server_cleanup_on_disconnect(uint16_t conn_handle)
             "Disconnect conn_handle=%d does not match active voice connection=%d, not clearing",
             conn_handle, g_voice_server.active_conn_handle);
     }
+}
+
+/**
+ * @brief Check if there is an active call (normal or simulated)
+ *
+ * Covers all in-progress call states: dialing, alerting, active, incoming.
+ * For normal calls, relies on voice service being enabled (set after call connects).
+ * Note: Normal call DIALING/ALERTING before voice enable is NOT detected —
+ * this is a known limitation (voice not yet enabled during call setup).
+ */
+bool spp_voice_server_is_call_active(void)
+{
+#if ENABLE_SAT_CALL_SIM
+    if (sat_call_sim_is_enabled()) {
+        sim_call_state_t sim_state = sat_call_sim_get_state();
+        if (sim_state == SIM_CALL_DIALING ||
+            sim_state == SIM_CALL_ALERTING ||
+            sim_state == SIM_CALL_ACTIVE ||
+            sim_state == SIM_CALL_INCOMING) {
+            return true;
+        }
+    }
+#endif
+
+    /* Normal call: TT module WORKING + voice service enabled = call in progress */
+    if (g_voice_server.enabled) {
+        if (tt_module_is_powered() && tt_module_get_state() == TT_STATE_WORKING) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief 30-second timeout callback: hang up the call after BLE reconnect window expires
+ *
+ * Also cancels TT module force_on so the power monitor can shut it down
+ * (normally done in BLE disconnect handler, but was skipped to preserve the call).
+ */
+static void ble_disconnect_timeout_cb(void *arg)
+{
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+        "BLE reconnect timeout (%d ms), hanging up call", BLE_DISCONNECT_CALL_HOLD_MS);
+
+    /* Hang up normal call: send AT+CHUP to TT module */
+    if (tt_module_is_powered() && tt_module_get_state() == TT_STATE_WORKING) {
+        tt_at_result_t ret = tt_module_send_at_cmd("AT+CHUP");
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+            "AT+CHUP sent (timeout hangup): result=%d", ret);
+    }
+
+    /* Hang up simulated call */
+#if ENABLE_SAT_CALL_SIM
+    if (sat_call_sim_is_enabled()) {
+        sim_call_state_t sim_state = sat_call_sim_get_state();
+        if (sim_state != SIM_CALL_IDLE) {
+            sat_call_sim_handle_at_gatt("AT+CHUP", 0);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                "Sim call CHUP sent (timeout hangup)");
+        }
+    }
+#endif
+
+    /* Cancel force_on — was skipped during BLE disconnect to preserve the call,
+     * but now the call is ending so TT module should be allowed to power down. */
+    tt_module_cancel_force_on();
+
+    g_call_preserved = false;
+    g_preserved_conn_handle = 0;
+}
+
+/**
+ * @brief Handle BLE disconnect with call preservation logic
+ *
+ * Called from ble_gatt_server GAP disconnect handler.
+ * If BLE disconnect is due to signal loss and there is an active call,
+ * preserves the call for 30 seconds waiting for app reconnect.
+ *
+ * The reason parameter is a NimBLE host return code (int), not a raw HCI error code.
+ * NimBLE encodes HCI errors as: BLE_HS_ERR_HCI_BASE (0x200) + hci_error_code.
+ * For example:
+ *   Phone turns off BT: reason = 0x213 = BLE_HS_HCI_ERR(0x13) = remote user terminated
+ *   Supervision timeout: reason = 0x208 = BLE_HS_HCI_ERR(0x08)
+ *   LMP response timeout: reason = 0x222 = BLE_HS_HCI_ERR(0x22)
+ *
+ * Signal loss reasons (peer did NOT send graceful disconnect → preserve call):
+ *   0x208 BLE_HS_HCI_ERR(BLE_ERR_CONN_SPVN_TMO)  — Connection supervision timeout
+ *   0x222 BLE_HS_HCI_ERR(BLE_ERR_LMP_LL_RSP_TMO) — LMP/LL response timeout
+ *
+ * User-initiated reasons (peer sent graceful disconnect → hang up immediately):
+ *   0x213 BLE_HS_HCI_ERR(BLE_ERR_REM_USER_CONN_TERM) — Remote user terminated (phone BT off)
+ *   0x215 BLE_HS_HCI_ERR(BLE_ERR_RD_CONN_TERM_PWROFF) — Remote device power off
+ *   0x216 BLE_HS_HCI_ERR(BLE_ERR_CONN_TERM_LOCAL) — Local host terminated
+ *
+ * @param conn_handle Disconnected connection handle
+ * @param reason NimBLE host return code (BLE_HS_HCI_ERR encoded)
+ * @return true if call is preserved (caller should NOT hang up), false if normal disconnect
+ */
+bool spp_voice_server_on_ble_disconnect(uint16_t conn_handle, int reason)
+{
+    /* Only preserve call on unexpected signal loss (no graceful disconnect from peer).
+     * NimBLE encodes HCI errors as 0x200 + hci_code, so we compare using the macro. */
+    if (reason != BLE_HS_HCI_ERR(BLE_ERR_CONN_SPVN_TMO) &&   /* 0x208: supervision timeout */
+        reason != BLE_HS_HCI_ERR(BLE_ERR_LMP_LL_RSP_TMO)) {   /* 0x222: LMP response timeout */
+        /* User-initiated or known reason: caller should handle normally */
+        return false;
+    }
+
+    /* Check if there is an active call to preserve */
+    if (!spp_voice_server_is_call_active()) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+            "BLE signal loss (reason=%d/0x%x) but no active call, normal cleanup",
+            reason, reason);
+        return false;
+    }
+
+    /* Active call + signal loss: preserve the call */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+        "BLE signal loss (reason=%d/0x%x) during active call, preserving call for %d ms",
+        reason, reason, BLE_DISCONNECT_CALL_HOLD_MS);
+
+    /* Clean up voice transport (stop data flow) but don't disable the call */
+    if (g_voice_server.active_conn_handle == conn_handle) {
+        g_voice_server.active_conn_handle = 0;
+        if (g_voice_server.enabled) {
+            g_voice_server.enabled = false;
+#if ENABLE_SAT_CALL_SIM
+            sat_call_sim_voice_disabled();
+#endif
+        }
+#if ENABLE_VOICE_IDLE_TIMEOUT
+        if (g_voice_idle_timer != NULL) {
+            esp_timer_stop(g_voice_idle_timer);
+        }
+#endif
+    }
+
+    g_preserved_conn_handle = conn_handle;
+    g_call_preserved = true;
+
+    /* Start 30-second timeout timer (create if first time) */
+    if (g_ble_disconnect_timer == NULL) {
+        esp_err_t ret = esp_timer_create(&(esp_timer_create_args_t){
+            .callback = ble_disconnect_timeout_cb,
+            .name = "ble_disc_hold",
+        }, &g_ble_disconnect_timer);
+        if (ret != ESP_OK) {
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+                "Failed to create disconnect timer: %s, falling back to normal cleanup",
+                esp_err_to_name(ret));
+            g_call_preserved = false;
+            g_preserved_conn_handle = 0;
+            return false;
+        }
+    }
+    esp_timer_stop(g_ble_disconnect_timer);
+    esp_timer_start_once(g_ble_disconnect_timer, BLE_DISCONNECT_CALL_HOLD_MS * 1000ULL);
+
+    return true;
+}
+
+/**
+ * @brief Handle BLE reconnect after call preservation
+ *
+ * Called from ble_gatt_server GAP connect handler.
+ * If a call was preserved, cancels the timeout timer and waits
+ * for the app to re-enable voice service via SERVICE_START VOICE.
+ *
+ * @param conn_handle New connection handle
+ */
+void spp_voice_server_on_ble_reconnect(uint16_t conn_handle)
+{
+    if (!g_call_preserved) {
+        return;
+    }
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG,
+        "BLE reconnected while call preserved (new conn_handle=%d), canceling timeout",
+        conn_handle);
+
+    /* Stop the timeout timer */
+    if (g_ble_disconnect_timer != NULL) {
+        esp_timer_stop(g_ble_disconnect_timer);
+    }
+
+    g_preserved_conn_handle = 0;
+    g_call_preserved = false;
+
+    /* Do NOT re-enable voice here — the app must:
+     * 1. Discover services
+     * 2. Subscribe to notifications
+     * 3. Send SERVICE_START VOICE
+     * spp_voice_server_enable(conn_handle) will be called by the app flow.
+     */
 }

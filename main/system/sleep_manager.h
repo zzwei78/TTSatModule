@@ -27,6 +27,7 @@ typedef enum {
     SLEEP_WAKEUP_NONE = 0,
     SLEEP_WAKEUP_TIMER,          /* Periodic timer wakeup -> TEMP_AWAKE */
     SLEEP_WAKEUP_GPIO21,         /* BB_WAKEUP_AP_PIN -> full init */
+    SLEEP_WAKEUP_PWRKEY,         /* GPIO9 pwrkey press -> full init */
     SLEEP_WAKEUP_OTHER
 } sleep_wakeup_cause_t;
 

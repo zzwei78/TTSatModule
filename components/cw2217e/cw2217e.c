@@ -98,18 +98,23 @@ static volatile bool s_chip_id_task_running = false;
 
 static esp_err_t cw_i2c_read_byte(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *data)
 {
-    return i2c_master_transmit_receive(dev, &reg, 1, data, 1, -1);
+    return i2c_master_transmit_receive(dev, &reg, 1, data, 1, 200);
 }
 
 static esp_err_t cw_i2c_read_nbyte(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *data, uint8_t len)
 {
-    return i2c_master_transmit_receive(dev, &reg, 1, data, len, -1);
+    return i2c_master_transmit_receive(dev, &reg, 1, data, len, 200);
 }
 
 static esp_err_t cw_i2c_write_byte(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t data)
 {
     uint8_t buf[2] = { reg, data };
-    return i2c_master_transmit(dev, buf, 2, -1);
+    esp_err_t ret = i2c_master_transmit(dev, buf, 2, 200);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "I2C write failed: reg=0x%02X val=0x%02X err=%s",
+                 reg, data, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 /**
@@ -159,12 +164,40 @@ static int cw2217e_read_ic_state(cw2217e_data_t *data, uint8_t *state)
 
 static int cw2217e_enter_sleep(cw2217e_data_t *data)
 {
-    if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_RESTART) != ESP_OK)
-        return -1;
-    delay_ms(20);
+    /* Read current mode before writing */
+    uint8_t cur_mode = 0;
+    cw_i2c_read_byte(data->i2c_dev, CW_REG_MODE_CONFIG, &cur_mode);
+    ESP_LOGI(TAG, "enter_sleep: current MODE_CONFIG=0x%02X", cur_mode);
 
-    if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_SLEEP) != ESP_OK)
+    /* If already in SLEEP mode, no need to re-enter */
+    if (cur_mode == CW_CONFIG_MODE_SLEEP) {
+        ESP_LOGI(TAG, "Already in SLEEP mode, skipping");
+        return 0;
+    }
+
+    /* If already in ACTIVE mode, we can directly enter SLEEP */
+    if (cur_mode == CW_CONFIG_MODE_ACTIVE) {
+        ESP_LOGI(TAG, "In ACTIVE mode, entering SLEEP directly");
+        if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_SLEEP) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to write SLEEP mode");
+            return -1;
+        }
+        delay_ms(10);
+        return 0;
+    }
+
+    /* Unknown mode: use RESTART -> SLEEP sequence */
+    ESP_LOGI(TAG, "Unknown mode, doing RESTART -> SLEEP");
+    if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_RESTART) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write RESTART command");
         return -1;
+    }
+    delay_ms(50);  /* Increased from 20ms to allow full restart */
+
+    if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_SLEEP) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write SLEEP mode after RESTART");
+        return -1;
+    }
     delay_ms(10);
 
     return 0;
@@ -172,9 +205,20 @@ static int cw2217e_enter_sleep(cw2217e_data_t *data)
 
 static int cw2217e_enter_active(cw2217e_data_t *data)
 {
+    /* Read current mode */
+    uint8_t cur_mode = 0;
+    cw_i2c_read_byte(data->i2c_dev, CW_REG_MODE_CONFIG, &cur_mode);
+
+    /* If already active, skip */
+    if (cur_mode == CW_CONFIG_MODE_ACTIVE) {
+        ESP_LOGI(TAG, "Already in ACTIVE mode");
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "Entering ACTIVE mode (current=0x%02X)", cur_mode);
     if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_RESTART) != ESP_OK)
         return -1;
-    delay_ms(20);
+    delay_ms(50);  /* Increased from 20ms */
 
     if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_ACTIVE) != ESP_OK)
         return -1;
@@ -200,6 +244,8 @@ static int cw2217e_check_state(cw2217e_data_t *data)
     /* Check if active */
     ret = cw_i2c_read_byte(data->i2c_dev, CW_REG_MODE_CONFIG, &reg_val);
     if (ret != ESP_OK) return -1;
+    ESP_LOGI(TAG, "check_state: MODE_CONFIG=0x%02X (ACTIVE=0x%02X SLEEP=0x%02X)",
+             reg_val, CW_CONFIG_MODE_ACTIVE, CW_CONFIG_MODE_SLEEP);
     if (reg_val != CW_CONFIG_MODE_ACTIVE) return 1;  /* NOT_ACTIVE */
 
     /* Check update flag */
@@ -407,16 +453,29 @@ cw2217e_handle_t cw2217e_create(const cw2217e_config_t *config)
     if (state != 0) {
         ESP_LOGI(TAG, "IC state=%d, configuring battery profile...", state);
         /* Retry init up to 3 times */
+        bool configured = false;
         for (int i = 0; i < 3; i++) {
             if (cw2217e_config_start_ic(handle) == 0) {
                 ESP_LOGI(TAG, "Battery profile configured successfully");
+                configured = true;
                 break;
             }
-            if (i == 2) {
-                ESP_LOGE(TAG, "Failed to configure battery profile after 3 attempts");
-                goto err;
+            if (i < 2) delay_ms(100);
+        }
+
+        /* Fallback: if config failed, try direct ACTIVATE (profile may already be in OTP) */
+        if (!configured) {
+            ESP_LOGW(TAG, "Config failed, trying direct ACTIVATE (OTP profile)...");
+            delay_ms(200);  /* Wait for chip to recover from failed attempts */
+            if (cw2217e_enter_active(handle) == 0) {
+                ESP_LOGI(TAG, "Direct ACTIVATE succeeded");
+                configured = true;
             }
-            delay_ms(100);
+        }
+
+        if (!configured) {
+            ESP_LOGE(TAG, "Failed to configure and activate CW2217E");
+            goto err;
         }
     } else {
         ESP_LOGI(TAG, "Battery profile already configured, skipping update");

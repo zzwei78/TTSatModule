@@ -13,6 +13,7 @@
 #include "da228ec.h"
 #include "sc7a20h.h"
 #include "mmc5603.h"
+#include "config/hardware_version.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -408,6 +409,37 @@ esp_err_t power_manage_get_battery_voltage_compensated(uint16_t *voltage_mv, boo
  * @return int16_t Average current in mA, 0 if not yet calculated
  */
 int16_t power_manage_get_avg_current(void);
+
+/* ========== Boost Power Manager (V2.0 only) ========== */
+#ifdef SUPPORT_HARDWARE_V2
+
+typedef enum {
+    BOOST_CONSUMER_TT_MODULE = 0,   /* Tiantong module */
+    BOOST_CONSUMER_MCU       = 1,   /* ESP32 low-battery survival */
+    BOOST_CONSUMER_COUNT
+} boost_consumer_t;
+
+/**
+ * @brief Request boost power (increments ref count, turns on boost if first)
+ */
+esp_err_t power_manage_boost_request(boost_consumer_t who);
+
+/**
+ * @brief Release boost power (decrements ref count, turns off if last)
+ */
+esp_err_t power_manage_boost_release(boost_consumer_t who);
+
+/**
+ * @brief Check if boost power is currently active
+ */
+bool power_manage_boost_is_active(void);
+
+/**
+ * @brief Prepare boost GPIOs for deep sleep (turn off + hold state)
+ */
+void power_manage_boost_deep_sleep_prepare(void);
+
+#endif /* SUPPORT_HARDWARE_V2 */
 
 #ifdef __cplusplus
 }

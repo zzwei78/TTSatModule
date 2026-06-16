@@ -80,6 +80,9 @@
 #define SYS_CMD_SIM_SET_NET             0x79  // Set simulated network parameters (CSQ, CREG)
 #define SYS_CMD_SIM_GET_STATE           0x7A  // Get simulation state
 
+/* BLE Test Commands */
+#define SYS_CMD_BLE_TX_POWER_TEMP       0x7B  // Set BLE TX power temporarily with timeout
+
 /* System Command/Response Packet Configuration */
 #define SYS_CMD_PACKET_MAX_PARAMS       96      // Maximum parameter bytes
 #define SYS_CMD_PACKET_MAX_SIZE         (1 + 1 + SYS_CMD_PACKET_MAX_PARAMS + 2)  // seq + cmd + params + crc16
@@ -207,7 +210,7 @@ int gatt_system_server_send_status(uint16_t conn_handle, uint8_t status, const u
  * @param service_id Service ID (SYS_SERVICE_ID_*)
  * @return 0 on success, negative error code otherwise
  */
-int gatt_system_server_start_service(uint8_t service_id);
+int gatt_system_server_start_service(uint8_t service_id, uint16_t conn_handle);
 
 /**
  * @brief Stop a GATT service dynamically

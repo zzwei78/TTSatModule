@@ -20,6 +20,8 @@
 #include "esp_bt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "tt/tt_module.h"
+#include "sim/sat_call_sim.h"
 
 static const char *TAG = "BLE_GATT_SERVER";
 
@@ -412,6 +414,9 @@ static int handle_gap_event_connect(struct ble_gap_event *event, void *arg)
     }
     ble_spp_server_print_conn_desc(&desc);
 
+    /* Check if this is a reconnect after call preservation */
+    spp_voice_server_on_ble_reconnect(event->connect.conn_handle);
+
     /* Request default connection parameters on new connection */
     if (!spp_voice_server_is_enabled()) {
         struct ble_gap_upd_params params = {
@@ -482,6 +487,10 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
 {
     MODLOG_DFLT(INFO, "disconnect; reason=%d\n", event->disconnect.reason);
 
+    /* Check if call should be preserved (signal loss during active call) */
+    bool call_preserved = spp_voice_server_on_ble_disconnect(
+        event->disconnect.conn.conn_handle, event->disconnect.reason);
+
 #ifdef CONFIG_BLE_MULTI_CONN_ENABLE
     ble_conn_role_t role = ble_conn_manager_get_role(event->disconnect.conn.conn_handle);
     ble_conn_manager_remove_connection(event->disconnect.conn.conn_handle);
@@ -489,7 +498,9 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
     syslog_clear_gatt_conn_handle();
     conn_set_subscribed(event->disconnect.conn.conn_handle, false);
     spp_at_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-    spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+    if (!call_preserved) {
+        spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+    }
     gatt_ota_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
 
     ble_conn_manager_print_info();
@@ -508,9 +519,11 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
     syslog_clear_gatt_conn_handle();
     conn_set_subscribed(event->disconnect.conn.conn_handle, false);
     spp_at_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-    spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+    if (!call_preserved) {
+        spp_voice_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
+        gatt_system_server_stop_service(SYS_SERVICE_ID_VOICE);
+    }
     gatt_ota_server_cleanup_on_disconnect(event->disconnect.conn.conn_handle);
-    gatt_system_server_stop_service(SYS_SERVICE_ID_VOICE);
 
     MODLOG_DFLT(INFO, "All connections closed, restarting advertising\n");
     ble_spp_server_advertise();
@@ -518,9 +531,36 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
 
     /* Auto-cancel force_on on BLE disconnect to prevent leaving TT module on.
      * Use non-blocking cancel (clears flag only, no shutdown).
-     * bq27220_monitor_task will handle actual shutdown within 60s. */
-    extern void tt_module_cancel_force_on(void);
-    tt_module_cancel_force_on();
+     * bq27220_monitor_task will handle actual shutdown within 60s.
+     * Skip if call is preserved — TT module must stay on for the active call. */
+    if (!call_preserved) {
+        extern void tt_module_cancel_force_on(void);
+        tt_module_cancel_force_on();
+
+        /* If there is an active call but we're NOT preserving it (user-initiated
+         * disconnect like phone BT off), hang up the call immediately.
+         * Without this, the call on the TT module / sim would be orphaned. */
+        if (spp_voice_server_is_call_active()) {
+            /* Hang up normal call */
+            if (tt_module_is_powered() &&
+                tt_module_get_state() == TT_STATE_WORKING) {
+                tt_module_send_at_cmd("AT+CHUP");
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                    "Active call on user disconnect, sent AT+CHUP");
+            }
+
+            /* Hang up simulated call */
+#if ENABLE_SAT_CALL_SIM
+            if (sat_call_sim_is_enabled()) {
+                if (sat_call_sim_get_state() != SIM_CALL_IDLE) {
+                    sat_call_sim_handle_at_gatt("AT+CHUP", 0);
+                    SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                        "Active sim call on user disconnect, sent CHUP");
+                }
+            }
+#endif
+        }
+    }
 
     /* Notify sleep manager of BLE disconnection */
     extern void sleep_manager_notify_ble_disconnected(void);

@@ -30,28 +30,47 @@ typedef struct {
 
 /* ========== I2C Probe ========== */
 
-/* Try to read 1 byte from the given address to check if a device responds.
- * Adds a temporary I2C device, attempts a register read, then removes it. */
+/* Scan I2C bus for debugging: prints all responding addresses */
+static void scan_i2c_bus(i2c_master_bus_handle_t bus)
+{
+    ESP_LOGW(TAG, "Scanning I2C bus for all devices...");
+    for (uint8_t addr = 1; addr < 128; addr++) {
+        i2c_master_dev_handle_t dev = NULL;
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = 200000,
+        };
+        if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) != ESP_OK) {
+            continue;
+        }
+        uint8_t dummy = 0;
+        esp_err_t ret = i2c_master_transmit_receive(dev, &dummy, 1, &dummy, 1, 100);
+        i2c_master_bus_rm_device(dev);
+        if (ret == ESP_OK) {
+            ESP_LOGW(TAG, "  Found device at 0x%02X", addr);
+        }
+    }
+}
+
+/* Probe I2C address using transmit_receive (same method as boardtest reference) */
 static bool probe_i2c(i2c_master_bus_handle_t bus, uint16_t addr)
 {
     i2c_master_dev_handle_t dev = NULL;
-    i2c_device_config_t dev_config = {
+    i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = addr,
-        .scl_speed_hz = PROBE_I2C_FREQ_HZ,
+        .scl_speed_hz = 200000,
     };
 
-    if (i2c_master_bus_add_device(bus, &dev_config, &dev) != ESP_OK) {
+    if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) != ESP_OK) {
         return false;
     }
 
-    uint8_t reg = 0x00;
-    uint8_t data = 0;
-    /* transmit_receive returns ESP_OK on ACK, ESP_ERR_TIMEOUT on NAK */
-    esp_err_t ret = i2c_master_transmit_receive(dev, &reg, 1, &data, 1, pdMS_TO_TICKS(50));
+    uint8_t dummy = 0;
+    esp_err_t ret = i2c_master_transmit_receive(dev, &dummy, 1, &dummy, 1, 100);
 
     i2c_master_bus_rm_device(dev);
-
     return (ret == ESP_OK);
 }
 
@@ -104,6 +123,7 @@ fuel_gauge_handle_t fuel_gauge_create(const fuel_gauge_config_t *config)
 
     ESP_LOGE(TAG, "No fuel gauge detected (probed 0x%02X and 0x%02X)",
              BQ27220_I2C_ADDR, CW2217E_I2C_ADDR);
+    scan_i2c_bus(config->i2c_bus);
     free(fg);
     return NULL;
 }

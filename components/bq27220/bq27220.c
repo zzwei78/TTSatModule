@@ -54,7 +54,7 @@ static esp_err_t bq27220_i2c_read(i2c_master_dev_handle_t handle,
                                  size_t len,
                                  uint8_t *data)
 {
-    return i2c_master_transmit_receive(handle, &reg, 1, data, len, -1);
+    return i2c_master_transmit_receive(handle, &reg, 1, data, len, pdMS_TO_TICKS(200));
 }
 
 static esp_err_t bq27220_i2c_write(i2c_master_dev_handle_t handle,
@@ -66,7 +66,7 @@ static esp_err_t bq27220_i2c_write(i2c_master_dev_handle_t handle,
     buf[0] = reg;
     memcpy(&buf[1], data, len);
 
-    return i2c_master_transmit(handle, buf, sizeof(buf), -1);
+    return i2c_master_transmit(handle, buf, sizeof(buf), pdMS_TO_TICKS(100));
 }
 
 static uint16_t bq27220_read_u16(bq27220_handle_t bq_handle, uint8_t address)

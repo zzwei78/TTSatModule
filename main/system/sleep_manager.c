@@ -268,10 +268,29 @@ esp_err_t sleep_manager_init(void)
         rtc_data.deep_sleep_count++;
         rtc_data_update_crc();  /* Update CRC after modification */
     } else if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+        /* Legacy ext0 (V1 or older firmware): GPIO21 wakeup */
         g_wakeup_cause = SLEEP_WAKEUP_GPIO21;
         g_current_mode = SLEEP_MODE_ACTIVE;
         rtc_data.deep_sleep_count++;
-        rtc_data_update_crc();  /* Update CRC after modification */
+        rtc_data_update_crc();
+    } else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+        /* ext1: check which pin triggered wakeup */
+        uint64_t ext1_status = esp_sleep_get_ext1_wakeup_status();
+        rtc_data.deep_sleep_count++;
+        rtc_data_update_crc();
+#ifdef SUPPORT_HARDWARE_V2
+        if (ext1_status & (1ULL << GPIO_PWRKEY)) {
+            g_wakeup_cause = SLEEP_WAKEUP_PWRKEY;
+            g_current_mode = SLEEP_MODE_ACTIVE;
+        } else
+#endif
+        if (ext1_status & (1ULL << BB_WAKEUP_AP_PIN)) {
+            g_wakeup_cause = SLEEP_WAKEUP_GPIO21;
+            g_current_mode = SLEEP_MODE_ACTIVE;
+        } else {
+            g_wakeup_cause = SLEEP_WAKEUP_OTHER;
+            g_current_mode = SLEEP_MODE_ACTIVE;
+        }
     } else if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
         g_wakeup_cause = SLEEP_WAKEUP_NONE;
         g_current_mode = SLEEP_MODE_ACTIVE;
@@ -300,7 +319,10 @@ void sleep_manager_print_wakeup_info(void)
                  (unsigned)rtc_data.deep_sleep_count,
                  rtc_data.sleep_timestamp > 0 ? (esp_timer_get_time() - rtc_data.sleep_timestamp) : 0);
     } else if (g_wakeup_cause == SLEEP_WAKEUP_GPIO21) {
-        SYS_LOGI(TAG, "Deep sleep EXT0 (GPIO21) wakeup (count=%u)",
+        SYS_LOGI(TAG, "Deep sleep GPIO21 wakeup (count=%u)",
+                 (unsigned)rtc_data.deep_sleep_count);
+    } else if (g_wakeup_cause == SLEEP_WAKEUP_PWRKEY) {
+        SYS_LOGI(TAG, "Deep sleep PWRKEY (GPIO9) wakeup (count=%u)",
                  (unsigned)rtc_data.deep_sleep_count);
     } else if (g_wakeup_cause == SLEEP_WAKEUP_NONE) {
         SYS_LOGI(TAG, "Normal boot (boot_count=%u)", (unsigned)rtc_data.boot_count);
@@ -643,6 +665,9 @@ static void enter_light_sleep(void)
     esp_sleep_enable_bt_wakeup();
     esp_sleep_enable_gpio_wakeup();
     gpio_wakeup_enable(BB_WAKEUP_AP_PIN, GPIO_INTR_LOW_LEVEL);
+#ifdef SUPPORT_HARDWARE_V2
+    gpio_wakeup_enable(GPIO_PWRKEY, GPIO_INTR_LOW_LEVEL);  /* Pwrkey wakes from light sleep */
+#endif
     esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_LIGHT_TIMER_SEC * 1000000ULL);
 
     /* Enter light sleep - CPU pauses, RAM preserved, BLE stays connected */
@@ -665,8 +690,16 @@ static void configure_gpio_for_deep_sleep(void)
      */
 
     /* TT module power: ensure OFF and hold state during deep sleep */
+#ifdef SUPPORT_HARDWARE_V2
+    /* V2: GPIO1/GPIO36 managed by boost manager, prepare for deep sleep */
+    power_manage_boost_deep_sleep_prepare();
+    /* V2: GPIO38 LDO off and hold */
+    gpio_set_level(GPIO_TT_LDO_EN, 0);
+    gpio_hold_en(GPIO_TT_LDO_EN);
+#else
     gpio_set_level(GPIO_TTPWR_EN, 0);
     gpio_hold_en(GPIO_TTPWR_EN);
+#endif
 
     /* AP_WAKEUP_BB_PIN: set HIGH to tell BB "AP is sleeping"
      * BB will pull GPIO21 LOW to wake AP when it has messages */
@@ -676,6 +709,12 @@ static void configure_gpio_for_deep_sleep(void)
     /* BB_WAKEUP_AP_PIN: pull-up (HIGH = BB sleeping, we wake on LOW) */
     rtc_gpio_pullup_en(BB_WAKEUP_AP_PIN);
     rtc_gpio_pulldown_dis(BB_WAKEUP_AP_PIN);
+
+#ifdef SUPPORT_HARDWARE_V2
+    /* GPIO9 pwrkey: pull-up (resting HIGH, user press → LOW triggers wakeup) */
+    rtc_gpio_pullup_en(GPIO_PWRKEY);
+    rtc_gpio_pulldown_dis(GPIO_PWRKEY);
+#endif
 
     /* Hold GPIO states during deep sleep */
     gpio_deep_sleep_hold_en();
@@ -724,10 +763,22 @@ static void enter_deep_sleep_internal(void)
     /* Configure wakeup sources */
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 
-    /* GPIO21 wakeup only when TT module is powered (BB alive and can signal us)
-     * When TT is off, BB is off too — no point listening on GPIO21 */
-    if (g_tt_powered) {
-        esp_sleep_enable_ext0_wakeup(BB_WAKEUP_AP_PIN, 0);
+    /*
+     * ext1 wakeup: monitor multiple RTC GPIOs, wake on ANY going LOW.
+     * - GPIO9 (pwrkey): always monitored, user press → full ACTIVE boot
+     * - GPIO21 (BB_WAKEUP_AP): only when TT was powered (BB can signal)
+     */
+    {
+        uint64_t ext1_pin_mask = 0;
+#ifdef SUPPORT_HARDWARE_V2
+        ext1_pin_mask |= (1ULL << GPIO_PWRKEY);  /* Always: pwrkey (active low) */
+#endif
+        if (g_tt_powered) {
+            ext1_pin_mask |= (1ULL << BB_WAKEUP_AP_PIN);  /* BB wakeup (active low) */
+        }
+        if (ext1_pin_mask) {
+            esp_sleep_enable_ext1_wakeup(ext1_pin_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+        }
     }
 
     /* Periodic timer wakeup for BLE advertising */

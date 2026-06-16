@@ -12,9 +12,22 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "config/hardware_version.h"
 
 /* GPIO Definitions */
 #define GPIO_TTPWR_EN       GPIO_NUM_1      /* Power Enable */
+
+#ifdef SUPPORT_HARDWARE_V2
+/* V2.0: GPIO1 is active-low boost IC enable, managed by power_manage boost manager */
+#define GPIO_TT_LDO_EN      GPIO_NUM_38     /* V2 LDO Enable (active HIGH, TT module private) */
+#define GPIO_PWRKEY         GPIO_NUM_9      /* V2 Power Key input (active LOW) */
+#define TT_PWR_ON_LEVEL     0               /* LOW = power on */
+#define TT_PWR_OFF_LEVEL    1               /* HIGH = power off */
+#else
+/* V1.0: GPIO1 is active-high power enable, managed directly by tt_hardware */
+#define TT_PWR_ON_LEVEL     1               /* HIGH = power on */
+#define TT_PWR_OFF_LEVEL    0               /* LOW = power off */
+#endif
 #define USB_SEL_GPIO        GPIO_NUM_48     /* USB Switch */
 #define TT_IOTL_GPIO        GPIO_NUM_47     /* IOTL Control */
 #define TT_UART_BOOT        GPIO_NUM_46     /* UART Boot Mode */

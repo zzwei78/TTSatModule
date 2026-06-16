@@ -52,8 +52,10 @@ uint16_t spp_voice_server_get_val_handle(void);
 
 /**
  * @brief Enable Voice service
+ *
+ * @param conn_handle Active BLE connection handle for voice data
  */
-void spp_voice_server_enable(void);
+void spp_voice_server_enable(uint16_t conn_handle);
 
 /**
  * @brief Disable Voice service
@@ -77,6 +79,35 @@ bool spp_voice_server_is_enabled(void);
  * @param conn_handle BLE connection handle that disconnected
  */
 void spp_voice_server_cleanup_on_disconnect(uint16_t conn_handle);
+
+/**
+ * @brief Check if there is an active call (normal or simulated)
+ *
+ * @return true if there is an active call, false otherwise
+ */
+bool spp_voice_server_is_call_active(void);
+
+/**
+ * @brief Handle BLE disconnect with call preservation logic
+ *
+ * If BLE disconnects due to signal loss during an active call,
+ * preserves the call for 30 seconds waiting for the app to reconnect.
+ *
+ * @param conn_handle Disconnected connection handle
+ * @param reason NimBLE host return code (BLE_HS_HCI_ERR encoded, not raw HCI error)
+ * @return true if call is preserved (caller should NOT hang up), false otherwise
+ */
+bool spp_voice_server_on_ble_disconnect(uint16_t conn_handle, int reason);
+
+/**
+ * @brief Handle BLE reconnect after call preservation
+ *
+ * Cancels the 30-second timeout timer. The app must re-enable voice
+ * service via its normal flow (discover services, subscribe, SERVICE_START VOICE).
+ *
+ * @param conn_handle New connection handle
+ */
+void spp_voice_server_on_ble_reconnect(uint16_t conn_handle);
 
 /* Voice idle auto-disable feature (set to 0 to disable) */
 #define ENABLE_VOICE_IDLE_TIMEOUT        1

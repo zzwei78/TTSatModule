@@ -125,6 +125,48 @@ bool ip5561_get_charge_enable(ip5561_handle_t handle);
 esp_err_t ip5561_set_boost_enable(ip5561_handle_t handle, bool enable);
 
 /**
+ * @brief Configure VBUS port for power output (boost mode to charge external devices)
+ *
+ * Enables VBUS MOS output path, DCP/QC fast charge output protocols, and disables
+ * light-load shutdown that would auto-close the output when idle.
+ *
+ * @param handle[in] Handle to the IP5561 device
+ * @param enable[in] true to enable VBUS output, false to disable
+ */
+esp_err_t ip5561_configure_vbus_output(ip5561_handle_t handle, bool enable);
+
+/**
+ * @brief Disable VOUT port (unused on V2.0 hardware)
+ *
+ * Closes all VOUT MOS/DCP/QC paths to save power.
+ */
+esp_err_t ip5561_disable_vout(ip5561_handle_t handle);
+
+/**
+ * @brief Disable all NTC temperature protection
+ *
+ * Use when NTC thermistor is not connected. Writes 0x00 to NTC_CTL1 (0xFD)
+ * to disable hardware auto mode and all charge/boost temperature limits.
+ */
+esp_err_t ip5561_disable_ntc(ip5561_handle_t handle);
+
+/**
+ * @brief Set 5V input charging current limit
+ *
+ * @param handle[in] Handle to the IP5561 device
+ * @param current_ma Charging current in mA (250-3175mA)
+ */
+esp_err_t ip5561_set_5v_charge_current(ip5561_handle_t handle, uint16_t current_ma);
+
+/**
+ * @brief Configure VBUS input fast charge (QC/FCP/AFC/PD)
+ *
+ * @param handle[in] Handle to the IP5561 device
+ * @param enable[in] true to enable input fast charge protocols
+ */
+esp_err_t ip5561_configure_vbus_input(ip5561_handle_t handle, bool enable);
+
+/**
  * @brief Get system control register 0
  *
  * @param handle[in] Handle to the IP5561 device

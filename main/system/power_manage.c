@@ -5,6 +5,7 @@
  */
 
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -19,6 +20,7 @@
 #include "ble/gatt_system_server.h"
 #include "ble/spp_at_server.h"
 #include "config/user_params.h"
+#include "config/hardware_version.h"
 
 static const char *TAG = "POWER_MANAGE";
 
@@ -80,11 +82,40 @@ typedef struct {
 
 static ip5561_config_fingerprint_t g_ip5561_fingerprint = {0};
 
+#ifdef SUPPORT_HARDWARE_V2
+/* V2.0: Second I2C bus for IP5561 */
+static i2c_master_bus_handle_t g_i2c_bus_handle_ip5561 = NULL;
+
+/* V2.0: Boost power manager state */
+static volatile uint8_t g_boost_ref_count = 0;
+static volatile bool g_boost_consumer_active[BOOST_CONSUMER_COUNT] = {false};
+static volatile bool g_mcu_low_battery_boost = false;  /* MCU holds boost for low-battery survival */
+
+/* Forward declarations */
+static void boost_gpio_init(void);
+static void boost_update_gpio(void);
+#endif
+
 /* I2C pin definitions */
 #define POWER_I2C_SCL_IO        GPIO_NUM_2      /* I2C SCL */
 #define POWER_I2C_SDA_IO        GPIO_NUM_3      /* I2C SDA */
 #define POWER_I2C_PORT_NUM      I2C_NUM_0       /* I2C port */
 #define POWER_I2C_FREQ_HZ       200000          /* 200kHz */
+
+#ifdef SUPPORT_HARDWARE_V2
+/* V2.0: IP5561 on separate I2C1 bus */
+#define IP5561_I2C_SCL_IO       GPIO_NUM_6
+#define IP5561_I2C_SDA_IO       GPIO_NUM_14
+#define IP5561_I2C_PORT_NUM     I2C_NUM_1
+
+/* V2.0: Boost IC GPIO definitions */
+#define BOOST_PWR_EN_GPIO       GPIO_NUM_1      /* Active LOW: LOW=boost on */
+#define BOOST_PWR_MODE_GPIO     GPIO_NUM_36     /* HIGH=normal, LOW=low-power */
+
+/* V2.0: Low-battery boost thresholds (hysteresis) */
+#define LOW_BAT_BOOST_OFF_MV    3300            /* Falling: TT off, MCU requests boost */
+#define LOW_BAT_BOOST_ON_MV     3400            /* Rising: TT can restart, MCU releases boost */
+#endif
 
 /* IP5561 wakeup GPIO definition */
 #define IP5561_WAKEUP_GPIO      GPIO_NUM_8      /* GPIO8 for IP5561 wakeup */
@@ -126,6 +157,89 @@ static void ip5561_wakeup_sequence(void)
     gpio_set_level(IP5561_WAKEUP_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(IP5561_WAKEUP_DELAY_MS / 2));  /* 5ms stabilization */
 }
+
+/* ========== Boost Power Manager (V2.0 only) ========== */
+#ifdef SUPPORT_HARDWARE_V2
+
+static void boost_gpio_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BOOST_PWR_EN_GPIO) | (1ULL << BOOST_PWR_MODE_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    /* Default: boost off, low-power mode */
+    gpio_set_level(BOOST_PWR_MODE_GPIO, 0);
+    gpio_set_level(BOOST_PWR_EN_GPIO, 1);  /* HIGH = off (active low) */
+}
+
+static void boost_update_gpio(void)
+{
+    if (g_boost_ref_count > 0) {
+        /* At least one consumer: boost on, normal mode */
+        gpio_set_level(BOOST_PWR_MODE_GPIO, 1);  /* Normal mode */
+        gpio_set_level(BOOST_PWR_EN_GPIO, 0);    /* LOW = on */
+    } else {
+        /* No consumers: low-power mode, boost off */
+        gpio_set_level(BOOST_PWR_MODE_GPIO, 0);  /* Low-power mode */
+        gpio_set_level(BOOST_PWR_EN_GPIO, 1);    /* HIGH = off */
+    }
+}
+
+esp_err_t power_manage_boost_request(boost_consumer_t who)
+{
+    if (who < 0 || who >= BOOST_CONSUMER_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!g_boost_consumer_active[who]) {
+        g_boost_consumer_active[who] = true;
+        g_boost_ref_count++;
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[BOOST] request by %d, ref_count=%u", who, g_boost_ref_count);
+        boost_update_gpio();
+    }
+    return ESP_OK;
+}
+
+esp_err_t power_manage_boost_release(boost_consumer_t who)
+{
+    if (who < 0 || who >= BOOST_CONSUMER_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (g_boost_consumer_active[who]) {
+        g_boost_consumer_active[who] = false;
+        if (g_boost_ref_count > 0) {
+            g_boost_ref_count--;
+        }
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[BOOST] release by %d, ref_count=%u", who, g_boost_ref_count);
+        boost_update_gpio();
+    }
+    return ESP_OK;
+}
+
+bool power_manage_boost_is_active(void)
+{
+    return g_boost_ref_count > 0;
+}
+
+void power_manage_boost_deep_sleep_prepare(void)
+{
+    /* Turn off boost and hold GPIO state for deep sleep */
+    gpio_set_level(BOOST_PWR_MODE_GPIO, 0);  /* Low-power mode */
+    gpio_set_level(BOOST_PWR_EN_GPIO, 1);    /* HIGH = off (active low) */
+    gpio_hold_en(BOOST_PWR_MODE_GPIO);
+    gpio_hold_en(BOOST_PWR_EN_GPIO);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[BOOST] Deep sleep: boost OFF, GPIOs held");
+}
+
+#endif /* SUPPORT_HARDWARE_V2 */
 
 /* ========== Interrupt-Safe Battery Data Access ========== */
 
@@ -252,6 +366,7 @@ static const __attribute__((unused)) gauging_config_t default_bq27220_config = {
  * on both I2C addresses (0xE8 and 0xEA)
  */
 static void __attribute__((unused)) sensor_monitor_task(void *pvParameters);
+static esp_err_t power_manage_apply_ip5561_config(void);  /* Forward decl for monitor reset recovery */
 static void __attribute__((unused)) ip5561_monitor_task(void *pvParameters)
 {
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task started");
@@ -339,7 +454,21 @@ static void __attribute__((unused)) ip5561_monitor_task(void *pvParameters)
 
                 if (config_changed) {
                     SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                             "[IP5561] 🔴 IP5561 likely RESET or config lost!");
+                             "[IP5561] 🔴 IP5561 RESET detected! Re-applying configuration...");
+
+                    /* Read reset cause indicators before recovery */
+                    uint8_t sys_state0 = 0, sys_state1 = 0;
+                    ip5561_read_reg(g_ip5561_handle, 0xC4, &sys_state0, true);
+                    ip5561_read_reg(g_ip5561_handle, 0xC5, &sys_state1, true);
+                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                             "[IP5561] Reset cause: SYS_STATE0=0x%02X [VBUSOV:%d VBUSOK:%d] SYS_STATE1=0x%02X [VBATLOW:%d VSYS_OV:%d]",
+                             sys_state0, (sys_state0 >> 5) & 1, (sys_state0 >> 4) & 1,
+                             sys_state1, (sys_state1 >> 2) & 1, (sys_state1 >> 1) & 1);
+
+                    /* Full re-initialization of all IP5561 registers */
+                    power_manage_apply_ip5561_config();
+                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                             "[IP5561] ✅ Configuration re-applied after reset");
                 }
             }
         }
@@ -366,13 +495,73 @@ static void __attribute__((unused)) ip5561_monitor_task(void *pvParameters)
         /* ========== Visual Separator ========== */
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "------------------------------------------------");
 
-#if POWER_MANAGE_ENABLE_DIAGNOSTICS
-        /* Print full diagnostics - controlled by POWER_MANAGE_ENABLE_DIAGNOSTICS */
-        //power_manage_ip5561_print_diagnostics();
-#endif
+        /* ========== VBUS Output Diagnostics ========== */
+        {
+            uint8_t mos_state = 0, ocp_state = 0, sys_state3 = 0;
 
-        /* Read every 60 seconds (1s granularity for quick stop response) */
-        for (int i = 0; i < 60 && g_ip5561_task_running; i++) {
+            /* MOS_STATE (0xEB @ 0xEA): bit6=VBUS MOS, bit4=VOUT MOS */
+            ip5561_read_reg(g_ip5561_handle, 0xEB, &mos_state, true);
+
+            /* OCP_STATE (0xFC @ 0xEA): bit2=boost_uv, bit0=boost_scdt */
+            ip5561_read_reg(g_ip5561_handle, 0xFC, &ocp_state, true);
+
+            /* SYS_STATE3 (0xD0 @ 0xEA): bit4=Boost_en, bits2:0=sys_state */
+            ip5561_read_reg(g_ip5561_handle, 0xD0, &sys_state3, true);
+
+            /* SYS_STATE0 (0xC4 @ 0xEA): bit5=VBUSOV, bit4=VBUSOK */
+            uint8_t sys_state0 = 0;
+            ip5561_read_reg(g_ip5561_handle, 0xC4, &sys_state0, true);
+
+            /* VBUS output current (0x5A-0x5B @ 0xEA) */
+            uint8_t vbus_il = 0, vbus_ih = 0;
+            ip5561_read_reg(g_ip5561_handle, 0x5A, &vbus_il, true);
+            ip5561_read_reg(g_ip5561_handle, 0x5B, &vbus_ih, true);
+            uint16_t vbus_iadc = ((uint16_t)vbus_ih << 8) | vbus_il;
+            int16_t vbus_out_ma = (int16_t)(vbus_iadc * 0.671387f);
+
+            /* VBUS voltage (0x62-0x63 @ 0xEA) */
+            uint8_t vbus_vl = 0, vbus_vh = 0;
+            ip5561_read_reg(g_ip5561_handle, 0x62, &vbus_vl, true);
+            ip5561_read_reg(g_ip5561_handle, 0x63, &vbus_vh, true);
+            uint16_t vbus_vadc = ((uint16_t)vbus_vh << 8) | vbus_vl;
+            uint16_t vbus_out_mv = (uint16_t)(vbus_vadc * 1.611328f);
+
+            bool vbus_mos_on = (mos_state & (1 << 6)) != 0;
+            bool boost_en = (sys_state3 & (1 << 4)) != 0;
+            uint8_t sys_state = sys_state3 & 0x07;
+
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                "[IP5561] VBUS: MOS=%s Boost=%s Sys=%d V=%umV I=%dmA | MOS_REG=0x%02X OCP=0x%02X STATE0=0x%02X[VBUSOV:%d VBUSOK:%d]",
+                vbus_mos_on ? "ON" : "OFF",
+                boost_en ? "EN" : "DIS",
+                sys_state,
+                vbus_out_mv, vbus_out_ma,
+                mos_state, ocp_state,
+                sys_state0, (sys_state0 >> 5) & 1, (sys_state0 >> 4) & 1);
+
+            /* ========== OCP Auto-Clear ========== */
+            /* bit5 (0x20): reserved, ignore */
+            /* bit2 (0x04): boost UV (overcurrent) */
+            /* bit0 (0x01): boost short circuit */
+            if (ocp_state & 0x05) {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[IP5561] ⚠️ OCP triggered! (uv=%d, scdt=%d) Clearing...",
+                    (ocp_state >> 2) & 1, ocp_state & 1);
+                ip5561_write_reg(g_ip5561_handle, 0xFC, ocp_state | 0x05, true);
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+
+            /* ========== VBUS MOS Auto-Recovery ========== */
+            /* If boost is enabled but VBUS MOS went off, try to re-enable VBUS output */
+            if (boost_en && !vbus_mos_on) {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[IP5561] ⚠️ Boost enabled but VBUS MOS OFF! Attempting recovery...");
+                ip5561_configure_vbus_output(g_ip5561_handle, true);
+            }
+        }
+
+        /* Read every 10 seconds (1s granularity for quick stop response) */
+        for (int i = 0; i < 10 && g_ip5561_task_running; i++) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
@@ -650,6 +839,25 @@ static void __attribute__((unused)) fuel_gauge_monitor_task(void *pvParameters)
             extern tt_state_t tt_module_get_state(void);
             extern esp_err_t tt_module_low_battery_shutdown(void);
 
+#ifdef SUPPORT_HARDWARE_V2
+            /* V2.0: Boost power arbitration with hysteresis (3.3V off / 3.4V on) */
+            if (!g_mcu_low_battery_boost && voltage < LOW_BAT_BOOST_OFF_MV) {
+                /* Battery critically low: MCU requests boost to stay alive */
+                g_mcu_low_battery_boost = true;
+                power_manage_boost_request(BOOST_CONSUMER_MCU);
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[BATT] Low battery %umV < %umV: MCU requesting boost for survival",
+                    voltage, LOW_BAT_BOOST_OFF_MV);
+            } else if (g_mcu_low_battery_boost && voltage >= LOW_BAT_BOOST_ON_MV) {
+                /* Battery recovered: MCU releases boost */
+                g_mcu_low_battery_boost = false;
+                power_manage_boost_release(BOOST_CONSUMER_MCU);
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[BATT] Battery recovered %umV >= %umV: MCU releasing boost",
+                    voltage, LOW_BAT_BOOST_ON_MV);
+            }
+#endif
+
             if (!tt_module_is_force_on()) {
                 tt_state_t tt_state = tt_module_get_state();
 
@@ -698,6 +906,64 @@ int16_t power_manage_get_avg_current(void)
 /* ========== Independent Device Initialization Functions ========== */
 
 /**
+ * @brief Apply full IP5561 register configuration and save fingerprint.
+ *
+ * Called during init and after reset recovery to re-apply all settings.
+ */
+static esp_err_t power_manage_apply_ip5561_config(void)
+{
+    /* WPC: disabled (not used, will be developed separately) */
+    ip5561_set_wpc_enable(g_ip5561_handle, false);
+
+    /* NTC: disabled (thermistor not connected on current board) */
+    ip5561_disable_ntc(g_ip5561_handle);
+
+    /* VOUT: disabled (unused port, save power) */
+    ip5561_disable_vout(g_ip5561_handle);
+
+    /* Light load detection: disabled (prevent auto-shutdown of outputs) */
+    ip5561_configure_light_load(g_ip5561_handle, false, false, 0);
+
+    /* Charge voltage and current */
+    ip5561_set_charge_voltage(g_ip5561_handle, 4350);
+    ip5561_set_5v_charge_current(g_ip5561_handle, 3500);
+    ip5561_set_9v_charge_current(g_ip5561_handle, 1500);
+    ip5561_set_9v_uv_threshold(g_ip5561_handle, 7500);
+
+    /* Input fast charge: enable QC/FCP/AFC/PD */
+    ip5561_configure_vbus_input(g_ip5561_handle, true);
+
+    /* VBUS boost output: enabled with QC/PD fast charge support */
+    ip5561_configure_vbus_output(g_ip5561_handle, true);
+
+    /* VBUS output current limits (50mA * N, 7-bit)
+     *   5V: N=60 → 3000mA (calibrated max ~3.3A)
+     *   9V: N=40 → 2000mA (calibrated max ~2.3A) */
+    ip5561_write_reg(g_ip5561_handle, 0xB9, 60, false);   /* VBUS_5V */
+    ip5561_write_reg(g_ip5561_handle, 0xBB, 40, false);   /* VBUS_9V */
+
+    ip5561_disable_boost_protections(g_ip5561_handle, false);
+
+    /* Save configuration fingerprint (re-read AFTER all config applied) */
+    uint8_t sys_ctl0 = 0, sys_ctl1 = 0;
+    uint8_t qc_ctrl0 = 0, pd_ctrl = 0, chg_tmo = 0;
+    ip5561_get_sys_ctl0(g_ip5561_handle, &sys_ctl0);
+    ip5561_get_sys_ctl1(g_ip5561_handle, &sys_ctl1);
+    ip5561_read_reg(g_ip5561_handle, 0x81, &qc_ctrl0, false);
+    ip5561_read_reg(g_ip5561_handle, 0xD4, &pd_ctrl, false);
+    ip5561_read_reg(g_ip5561_handle, 0x21, &chg_tmo, false);
+
+    g_ip5561_fingerprint.sys_ctl0 = sys_ctl0;
+    g_ip5561_fingerprint.sys_ctl1 = sys_ctl1;
+    g_ip5561_fingerprint.qc_ctrl0 = qc_ctrl0;
+    g_ip5561_fingerprint.pd_ctrl = pd_ctrl;
+    g_ip5561_fingerprint.chg_tmo_ctl1 = chg_tmo;
+    g_ip5561_fingerprint.initialized = true;
+
+    return ESP_OK;
+}
+
+/**
  * @brief Initialize IP5561 device independently
  *
  * @return ESP_OK on success, ESP_FAIL on failure (non-fatal, allows other devices to init)
@@ -713,7 +979,11 @@ static esp_err_t power_manage_init_ip5561(void)
 
     /* Create IP5561 device */
     ip5561_config_t ip5561_cfg = {
+#ifdef SUPPORT_HARDWARE_V2
+        .i2c_bus = g_i2c_bus_handle_ip5561,
+#else
         .i2c_bus = g_i2c_bus_handle,
+#endif
         .scl_freq_hz = POWER_I2C_FREQ_HZ,
     };
 
@@ -737,63 +1007,8 @@ static esp_err_t power_manage_init_ip5561(void)
     }
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Communication OK, SYS_CTL0: 0x%02X", sys_ctl0);
 
-    /* Configure IP5561 */
-    ret = ip5561_set_wpc_enable(g_ip5561_handle, false);
-    if (ret != ESP_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Failed to disable WPC");
-    }
-
-    ret = ip5561_configure_light_load(g_ip5561_handle, false, false, 0);
-    if (ret != ESP_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Failed to configure light load");
-    }
-
-    ret = ip5561_configure_ntc1(g_ip5561_handle, 3);
-    if (ret != ESP_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Failed to configure NTC1");
-    }
-
-#if !POWER_MANAGE_CONFIG_ENABLE_FAST_CHARGE
-    ret = ip5561_disable_fast_charge(g_ip5561_handle);
-    if (ret != ESP_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Failed to disable fast charge");
-    }
-#endif
-
-    ret = ip5561_set_charge_voltage(g_ip5561_handle, 4350);
-    if (ret != ESP_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Failed to set charge voltage");
-    }
-
-    ret = ip5561_set_9v_charge_current(g_ip5561_handle, 3500);
-    if (ret != ESP_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Failed to set 9V charge current");
-    }
-
-    ret = ip5561_set_9v_uv_threshold(g_ip5561_handle, 7500);
-    if (ret != ESP_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Failed to set 9V UV threshold");
-    }
-
-    ret = ip5561_disable_boost_protections(g_ip5561_handle, false);
-    if (ret != ESP_OK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Failed to disable boost protections");
-    }
-
-    /* Save configuration fingerprint */
-    uint8_t sys_ctl1 = 0;
-    ip5561_get_sys_ctl1(g_ip5561_handle, &sys_ctl1);
-    uint8_t qc_ctrl0 = 0, pd_ctrl = 0, chg_tmo = 0;
-    ip5561_read_reg(g_ip5561_handle, 0x81, &qc_ctrl0, false);
-    ip5561_read_reg(g_ip5561_handle, 0xD4, &pd_ctrl, false);
-    ip5561_read_reg(g_ip5561_handle, 0x21, &chg_tmo, false);
-
-    g_ip5561_fingerprint.sys_ctl0 = sys_ctl0;
-    g_ip5561_fingerprint.sys_ctl1 = sys_ctl1;
-    g_ip5561_fingerprint.qc_ctrl0 = qc_ctrl0;
-    g_ip5561_fingerprint.pd_ctrl = pd_ctrl;
-    g_ip5561_fingerprint.chg_tmo_ctl1 = chg_tmo;
-    g_ip5561_fingerprint.initialized = true;
+    /* Apply full register configuration */
+    power_manage_apply_ip5561_config();
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: ✓ Initialization complete");
     return ESP_OK;
@@ -850,7 +1065,7 @@ esp_err_t power_manage_init(void)
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "========================================");
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Power Management Initialization Start");
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Power Management Initialization Start (%s)", HW_VERSION_STRING);
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "========================================");
 
     /* Step 1: Initialize IP5561 wakeup GPIO */
@@ -858,7 +1073,14 @@ esp_err_t power_manage_init(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 wakeup GPIO initialized (GPIO%d, %dms pulse)",
                     IP5561_WAKEUP_GPIO, IP5561_WAKEUP_DELAY_MS);
 
-    /* Step 2: Initialize I2C bus */
+#ifdef SUPPORT_HARDWARE_V2
+    /* V2.0: Initialize boost IC GPIOs */
+    boost_gpio_init();
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Boost IC GPIOs initialized (EN: GPIO%d, MODE: GPIO%d)",
+                    BOOST_PWR_EN_GPIO, BOOST_PWR_MODE_GPIO);
+#endif
+
+    /* Step 2: Initialize I2C bus (fuel gauge + sensors) */
     i2c_master_bus_config_t bus_config = {
         .i2c_port = POWER_I2C_PORT_NUM,
         .sda_io_num = POWER_I2C_SDA_IO,
@@ -873,8 +1095,28 @@ esp_err_t power_manage_init(void)
         SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to initialize I2C bus: %s", esp_err_to_name(ret));
         return ret;
     }
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "I2C bus initialized (SCL: GPIO%d, SDA: GPIO%d)",
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "I2C bus0 initialized (SCL: GPIO%d, SDA: GPIO%d)",
                     POWER_I2C_SCL_IO, POWER_I2C_SDA_IO);
+
+#ifdef SUPPORT_HARDWARE_V2
+    /* V2.0: Initialize second I2C bus for IP5561 */
+    i2c_master_bus_config_t ip5561_bus_config = {
+        .i2c_port = IP5561_I2C_PORT_NUM,
+        .sda_io_num = IP5561_I2C_SDA_IO,
+        .scl_io_num = IP5561_I2C_SCL_IO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+
+    ret = i2c_new_master_bus(&ip5561_bus_config, &g_i2c_bus_handle_ip5561);
+    if (ret != ESP_OK) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to initialize IP5561 I2C bus: %s", esp_err_to_name(ret));
+    } else {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "I2C bus1 initialized for IP5561 (SCL: GPIO%d, SDA: GPIO%d)",
+                        IP5561_I2C_SCL_IO, IP5561_I2C_SDA_IO);
+    }
+#endif
 
     /* Step 3: Initialize IP5561 (independent, non-blocking) */
     ret = power_manage_init_ip5561();
@@ -960,10 +1202,47 @@ esp_err_t power_manage_init(void)
  * @brief Shared sensor monitor task (DA228EC + MMC5603)
  *
  * Reads sensors, caches data, sends BLE notification if report enabled.
+ * Sensor data is read every 500ms; debug log printed every 30s.
  */
+
+/* Debug calculation toggles (for hardware comparison testing) */
+#define SENSOR_DEBUG_LOG_INTERVAL_MS   30000   /* Debug log interval (30s) */
+#define SENSOR_DEBUG_TILT_ANGLE        1       /* 1=calculate and log tilt angle */
+#define SENSOR_DEBUG_COMPASS_HEADING   1       /* 1=calculate and log compass heading */
+
+#if SENSOR_DEBUG_TILT_ANGLE
+/* Calculate tilt angle (仰角/pitch) from accelerometer data.
+ * Returns signed angle in degrees:
+ *   0° = flat, positive = tilted up, negative = tilted down
+ * Range: -90° ~ +90°
+ * ax/ay/az in mg. */
+static float sensor_calc_tilt(int16_t ax, int16_t ay, int16_t az)
+{
+    float x = ax, y = ay, z = az;
+    /* Pitch around X axis: atan2(ay, sqrt(ax² + az²))
+     * Uses Y axis as tilt direction (front edge up/down) */
+    return atan2f(y, sqrtf(x * x + z * z)) * 180.0f / 3.14159265f;
+}
+#endif
+
+#if SENSOR_DEBUG_COMPASS_HEADING
+/* Calculate compass heading from magnetometer data.
+ * Returns heading in degrees (0=North, 90=East, 180=South, 270=West).
+ * mx/my/mz in mG. */
+static int16_t sensor_calc_heading(int32_t mx, int32_t my, int32_t mz)
+{
+    (void)mz;  /* 2D compass for simplicity */
+    float heading = atan2f((float)my, (float)mx) * 180.0f / 3.14159265f;
+    if (heading < 0) heading += 360.0f;
+    return (int16_t)heading;
+}
+#endif
+
 static void sensor_monitor_task(void *pvParameters)
 {
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Sensor monitor task started");
+
+    uint32_t log_counter = 0;  /* Counts 500ms ticks; log every 60 ticks (30s) */
 
     while (1) {
         uint8_t flags = 0;
@@ -998,13 +1277,39 @@ static void sensor_monitor_task(void *pvParameters)
 
         g_sensor_cache.flags = flags;
 
-        /* Debug log */
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG",
-            g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
-            g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
+        /* Debug log (every 30s, not every 500ms) */
+        if (++log_counter >= (SENSOR_DEBUG_LOG_INTERVAL_MS / 500)) {
+            log_counter = 0;
 
-        /* Send BLE notification if report enabled */
+#if SENSOR_DEBUG_TILT_ANGLE && SENSOR_DEBUG_COMPASS_HEADING
+            float tilt = sensor_calc_tilt(g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az);
+            int16_t heading = sensor_calc_heading(g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | tilt=%.1f° heading=%d°",
+                g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
+                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz,
+                tilt, heading);
+#elif SENSOR_DEBUG_TILT_ANGLE
+            float tilt = sensor_calc_tilt(g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | tilt=%.1f°",
+                g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
+                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz, tilt);
+#elif SENSOR_DEBUG_COMPASS_HEADING
+            int16_t heading = sensor_calc_heading(g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | heading=%d°",
+                g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
+                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz, heading);
+#else
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG",
+                g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
+                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
+#endif
+        }
+
+        /* Send BLE notification if report enabled (every cycle, not throttled) */
         if (g_sensor_cache.report_enabled && flags) {
             gatt_system_server_send_sensor_data();
         }

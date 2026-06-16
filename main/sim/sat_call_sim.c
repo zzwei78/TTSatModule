@@ -976,25 +976,11 @@ static void sim_generate_ringtone(int16_t *buf, size_t samples)
 
 static void sim_generate_voice(int16_t *buf, size_t samples)
 {
-    float sample_rate = 8000.0f;
-    uint32_t pos = g_sim.sample_pos;
-
-    for (size_t i = 0; i < samples; i++) {
-        float t = (float)pos / sample_rate;
-
-        /* Simple test tone: 600Hz with slight amplitude variation */
-        float amp = 0.4f + 0.1f * sinf(2.0f * (float)M_PI * 2.0f * t); /* Slow tremolo */
-        float val = amp * sinf(2.0f * (float)M_PI * SIM_VOICE_FREQ * t);
-
-        /* Add some noise for realism */
-        int32_t noise = (int32_t)esp_random() - 0x40000000; /* -1.0 to 1.0 range approx */
-        val += (float)noise / 2147483648.0f * 0.05f; /* 5% noise */
-
-        int16_t sample = (int16_t)(val * 16000.0f);
-        buf[i] = sample;
-        pos++;
-    }
-    g_sim.sample_pos = pos;
+    /* No PCM data available — generate silence for ACTIVE state.
+     * The 600Hz test tone was a debug placeholder that should not
+     * play during normal simulated calls.  Real audio comes from
+     * the PCM flash partition or from the TT module. */
+    memset(buf, 0, samples * sizeof(int16_t));
 }
 
 /* ============================================================

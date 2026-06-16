@@ -227,6 +227,9 @@ static uint16_t calculate_crc16(const uint8_t *data, size_t len)
  */
 static esp_err_t get_battery_info(system_battery_info_t *info)
 {
+    static system_battery_info_t s_last_good;
+    static bool s_have_last_good = false;
+
     if (info == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -249,7 +252,11 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
     /* Step 2: Validate core data */
     if (voltage < 2500 || voltage > 4500) {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
-            "Battery voltage out of range: %umV", voltage);
+            "Battery voltage out of range: %umV, using last good data", voltage);
+        if (s_have_last_good) {
+            memcpy(info, &s_last_good, sizeof(system_battery_info_t));
+            return ESP_OK;
+        }
         return ESP_FAIL;
     }
     if (current < -5000 || current > 5000) {
@@ -313,6 +320,10 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
     } else {
         info->soc_percent = (uint16_t)((uint32_t)(v_comp - V_EMPTY_MV) * 100 / (V_FULL_MV - V_EMPTY_MV));
     }
+
+    /* Cache as last good reading */
+    memcpy(&s_last_good, info, sizeof(system_battery_info_t));
+    s_have_last_good = true;
 
     return ESP_OK;
 }

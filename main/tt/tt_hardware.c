@@ -13,6 +13,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "syslog.h"
+#ifdef SUPPORT_HARDWARE_V2
+#include "system/power_manage.h"
+#endif
 
 /* Tag for logging */
 static const char *TAG = "TT_HARDWARE";
@@ -56,9 +59,17 @@ esp_err_t tt_hw_init(void)
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = (1ULL << TT_MODULE_RESET) | (1ULL << TT_UART_BOOT) | 
-                           (1ULL << AP_WAKEUP_BB_PIN) | (1ULL << GPIO_TTPWR_EN) | 
+#ifdef SUPPORT_HARDWARE_V2
+    /* V2: GPIO1 managed by boost manager, add GPIO38 ldo_en instead */
+    io_conf.pin_bit_mask = (1ULL << TT_MODULE_RESET) | (1ULL << TT_UART_BOOT) |
+                           (1ULL << AP_WAKEUP_BB_PIN) |
+                           (1ULL << TT_IOTL_GPIO) | (1ULL << TT_UART1_RTS_PIN) |
+                           (1ULL << GPIO_TT_LDO_EN);
+#else
+    io_conf.pin_bit_mask = (1ULL << TT_MODULE_RESET) | (1ULL << TT_UART_BOOT) |
+                           (1ULL << AP_WAKEUP_BB_PIN) | (1ULL << GPIO_TTPWR_EN) |
                            (1ULL << TT_IOTL_GPIO) | (1ULL << TT_UART1_RTS_PIN);
+#endif
     io_conf.pull_down_en = 0;
     io_conf.pull_up_en = 0;
     ret = gpio_config(&io_conf);
@@ -85,12 +96,16 @@ esp_err_t tt_hw_init(void)
     gpio_set_pull_mode(AP_WAKEUP_BB_PIN, GPIO_FLOATING);
 
     gpio_set_level(TT_IOTL_GPIO, 1);  /* HIGH = disabled (UART level shifter off) */
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-#ifndef TT_PWR_PIN_INVERSE   
-    gpio_set_level(GPIO_TTPWR_EN, 0);
-#else 
-    gpio_set_level(GPIO_TTPWR_EN, 1);
-#endif // TT_PWR_PIN_INVERSE
+#ifdef SUPPORT_HARDWARE_V2
+    /* V2: GPIO1 controlled by boost manager, init LDO off */
+    gpio_set_level(GPIO_TT_LDO_EN, 0);  /* LDO off initially */
+#else
+    gpio_set_level(GPIO_TTPWR_EN, TT_PWR_OFF_LEVEL);  /* Power off initially */
+#endif
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
 
     gpio_set_level(TT_UART1_RTS_PIN, 0);
 
@@ -162,12 +177,18 @@ esp_err_t tt_hw_power_on(void)
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Powering on Tiantong Module");
-    //gpio_set_level(GPIO_TTPWR_EN, 1);
-#ifndef TT_PWR_PIN_INVERSE
-    gpio_set_level(GPIO_TTPWR_EN, 1);
+    gpio_set_level(TT_IOTL_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+#ifdef SUPPORT_HARDWARE_V2
+    /* V2: Request boost power, then enable LDO */
+    power_manage_boost_request(BOOST_CONSUMER_TT_MODULE);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level(GPIO_TT_LDO_EN, 1);  /* Enable LDO → TT module gets power */
 #else
-    gpio_set_level(GPIO_TTPWR_EN, 0);
-#endif // TT_PWR_PIN_INVERSE
+    gpio_set_level(GPIO_TTPWR_EN, TT_PWR_ON_LEVEL);
+#endif
+    vTaskDelay(pdMS_TO_TICKS(200));
     gpio_set_level(TT_IOTL_GPIO, 0);  /* LOW = enable UART level shifter */
 
     return ESP_OK;
@@ -186,13 +207,18 @@ esp_err_t tt_hw_power_off(void)
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Powering off Tiantong Module");
-    //gpio_set_level(GPIO_TTPWR_EN, 0);
-#ifndef TT_PWR_PIN_INVERSE
-    gpio_set_level(GPIO_TTPWR_EN, 0);
-#else
-    gpio_set_level(GPIO_TTPWR_EN, 1);
-#endif // TT_PWR_PIN_INVERSE
     gpio_set_level(TT_IOTL_GPIO, 1);  /* HIGH = disable UART level shifter */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+#ifdef SUPPORT_HARDWARE_V2
+    /* V2: Disable LDO first, then release boost (boost may stay on if MCU needs it) */
+    gpio_set_level(GPIO_TT_LDO_EN, 0);  /* Disable LDO → TT module loses power */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    power_manage_boost_release(BOOST_CONSUMER_TT_MODULE);
+#else
+    gpio_set_level(GPIO_TTPWR_EN, TT_PWR_OFF_LEVEL);
+#endif
+    vTaskDelay(pdMS_TO_TICKS(2000));
 
     return ESP_OK;
 }
@@ -213,12 +239,18 @@ esp_err_t tt_hw_reset(void)
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Performing hardware reset");
 
+    gpio_set_level(TT_IOTL_GPIO, 1);  /* HIGH = disable UART level shifter */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     /* Toggle reset pin */
     gpio_set_level(TT_MODULE_RESET, 0);
     vTaskDelay(100 / portTICK_PERIOD_MS);
     gpio_set_level(TT_MODULE_RESET, 1);
     vTaskDelay(100 / portTICK_PERIOD_MS);
     gpio_set_level(TT_MODULE_RESET, 0);
+
+    gpio_set_level(TT_IOTL_GPIO, 0);  /* HIGH = disable UART level shifter */
+    vTaskDelay(pdMS_TO_TICKS(200));    
 
     return ESP_OK;
 }
@@ -284,6 +316,9 @@ esp_err_t tt_hw_enter_normal_mode(void)
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Entering normal mode");
+    
+    gpio_set_level(TT_IOTL_GPIO, 1);  /* HIGH = disable UART level shifter */
+    vTaskDelay(pdMS_TO_TICKS(200));  
 
     gpio_set_level(TT_UART_BOOT, 0);
     vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -292,6 +327,9 @@ esp_err_t tt_hw_enter_normal_mode(void)
     gpio_set_level(TT_MODULE_RESET, 1);
     vTaskDelay(100 / portTICK_PERIOD_MS);
     gpio_set_level(TT_MODULE_RESET, 0);
+
+    vTaskDelay(pdMS_TO_TICKS(200));  
+    gpio_set_level(TT_IOTL_GPIO, 0);  /* HIGH = disable UART level shifter */
 
     return ESP_OK;
 }

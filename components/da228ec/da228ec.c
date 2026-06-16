@@ -21,14 +21,14 @@ typedef struct {
 /* I2C read register */
 static esp_err_t da228ec_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, size_t len, uint8_t *data)
 {
-    return i2c_master_transmit_receive(dev, &reg, 1, data, len, -1);
+    return i2c_master_transmit_receive(dev, &reg, 1, data, len, pdMS_TO_TICKS(200));
 }
 
 /* I2C write register */
 static esp_err_t da228ec_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };
-    return i2c_master_transmit(dev, buf, sizeof(buf), -1);
+    return i2c_master_transmit(dev, buf, sizeof(buf), pdMS_TO_TICKS(100));
 }
 
 da228ec_handle_t da228ec_create(const da228ec_config_t *config)

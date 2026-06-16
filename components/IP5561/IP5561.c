@@ -59,7 +59,7 @@ static esp_err_t ip5561_i2c_read_ctrl(ip5561_handle_t handle, uint8_t reg, uint8
     ip5561_wakeup_if_needed(handle);  /* Wakeup before I2C communication */
 
     ip5561_data_t *ip_data = (ip5561_data_t *)handle;
-    return i2c_master_transmit_receive(ip_data->i2c_ctrl_handle, &reg, 1, data, 1, -1);
+    return i2c_master_transmit_receive(ip_data->i2c_ctrl_handle, &reg, 1, data, 1, pdMS_TO_TICKS(100));
 }
 
 /**
@@ -73,7 +73,7 @@ static esp_err_t ip5561_i2c_write_ctrl(ip5561_handle_t handle, uint8_t reg, uint
 
     ip5561_data_t *ip_data = (ip5561_data_t *)handle;
     uint8_t buf[2] = {reg, data};
-    return i2c_master_transmit(ip_data->i2c_ctrl_handle, buf, sizeof(buf), -1);
+    return i2c_master_transmit(ip_data->i2c_ctrl_handle, buf, sizeof(buf), pdMS_TO_TICKS(100));
 }
 
 /**
@@ -87,7 +87,7 @@ static esp_err_t ip5561_i2c_read_stat(ip5561_handle_t handle, uint8_t reg, uint8
     ip5561_wakeup_if_needed(handle);  /* Wakeup before I2C communication */
 
     ip5561_data_t *ip_data = (ip5561_data_t *)handle;
-    return i2c_master_transmit_receive(ip_data->i2c_stat_handle, &reg, 1, data, 1, -1);
+    return i2c_master_transmit_receive(ip_data->i2c_stat_handle, &reg, 1, data, 1, pdMS_TO_TICKS(100));
 }
 
 /**
@@ -101,7 +101,7 @@ static esp_err_t ip5561_i2c_write_stat(ip5561_handle_t handle, uint8_t reg, uint
 
     ip5561_data_t *ip_data = (ip5561_data_t *)handle;
     uint8_t buf[2] = {reg, data};
-    return i2c_master_transmit(ip_data->i2c_stat_handle, buf, sizeof(buf), -1);
+    return i2c_master_transmit(ip_data->i2c_stat_handle, buf, sizeof(buf), pdMS_TO_TICKS(100));
 }
 
 /* ========== I2C Communication Functions ========== */
@@ -118,7 +118,7 @@ static esp_err_t ip5561_i2c_read_ctrl_bytes(ip5561_handle_t handle, uint8_t reg,
     ip5561_wakeup_if_needed(handle);  /* Wakeup before I2C communication */
 
     ip5561_data_t *ip_data = (ip5561_data_t *)handle;
-    return i2c_master_transmit_receive(ip_data->i2c_ctrl_handle, &reg, 1, data, len, -1);
+    return i2c_master_transmit_receive(ip_data->i2c_ctrl_handle, &reg, 1, data, len, pdMS_TO_TICKS(200));
 }
 
 /**
@@ -137,7 +137,7 @@ static esp_err_t ip5561_i2c_write_ctrl_bytes(ip5561_handle_t handle, uint8_t reg
     buf[0] = reg;
     memcpy(&buf[1], data, len);
 
-    return i2c_master_transmit(ip_data->i2c_ctrl_handle, buf, sizeof(buf), -1);
+    return i2c_master_transmit(ip_data->i2c_ctrl_handle, buf, sizeof(buf), pdMS_TO_TICKS(100));
 }
 
 /**
@@ -152,7 +152,7 @@ __attribute__((unused)) static esp_err_t ip5561_i2c_read_stat_bytes(ip5561_handl
     ip5561_wakeup_if_needed(handle);  /* Wakeup before I2C communication */
 
     ip5561_data_t *ip_data = (ip5561_data_t *)handle;
-    return i2c_master_transmit_receive(ip_data->i2c_stat_handle, &reg, 1, data, len, -1);
+    return i2c_master_transmit_receive(ip_data->i2c_stat_handle, &reg, 1, data, len, pdMS_TO_TICKS(200));
 }
 
 /**
@@ -171,7 +171,7 @@ static esp_err_t ip5561_i2c_write_stat_bytes(ip5561_handle_t handle, uint8_t reg
     buf[0] = reg;
     memcpy(&buf[1], data, len);
 
-    return i2c_master_transmit(ip_data->i2c_stat_handle, buf, sizeof(buf), -1);
+    return i2c_master_transmit(ip_data->i2c_stat_handle, buf, sizeof(buf), pdMS_TO_TICKS(100));
 }
 
 /* ========== Public API Implementation ========== */
@@ -810,6 +810,113 @@ esp_err_t ip5561_disable_ntc_temperature_protection(ip5561_handle_t handle)
     return ret;
 }
 
+/* ========== VBUS Output / VOUT Disable / NTC Disable ========== */
+
+esp_err_t ip5561_configure_vbus_output(ip5561_handle_t handle, bool enable)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+
+    esp_err_t ret;
+    uint8_t reg;
+
+    /* 1. VBUS_CTL0 (0x18): Enable VBUS MOS + QC + DCP output paths */
+    ret = ip5561_i2c_read_ctrl(handle, IP55XX_VBUS_CTL0, &reg);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to read VBUS_CTL0");
+    if (enable) {
+        reg |= (1 << 0) | (1 << 2) | (1 << 3);  /* En_Vbus_Mos | En_Vbus_Qc | En_Vbus_Dcp */
+    } else {
+        reg &= ~((1 << 0) | (1 << 2) | (1 << 3));
+    }
+    ret = ip5561_i2c_write_ctrl(handle, IP55XX_VBUS_CTL0, reg);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to write VBUS_CTL0");
+    ESP_LOGI(TAG, "VBUS_CTL0 (0x18): 0x%02X - VBUS output %s", reg, enable ? "ENABLED" : "disabled");
+
+    /* 2. VBUS_CTL1 (0x1B): Disable light-load shutdown, set max timeout */
+    ret = ip5561_i2c_read_ctrl(handle, IP55XX_VBUS_CTL1, &reg);
+    if (ret == ESP_OK) {
+        if (enable) {
+            reg &= ~(1 << 0);     /* Clear En_Vbus_Chgilow (disable light load shutdown) */
+            reg |= (0x3 << 2);    /* Set_Vbus_Ilow_Time = 11 (16s max timeout) */
+        } else {
+            reg |= (1 << 0);      /* Enable light load shutdown when disabled */
+        }
+        ip5561_i2c_write_ctrl(handle, IP55XX_VBUS_CTL1, reg);
+        ESP_LOGI(TAG, "VBUS_CTL1 (0x1B): 0x%02X", reg);
+    }
+
+    /* 3. SRC_QC_EN (0x85): Enable output fast charge protocols */
+    if (enable) {
+        reg = 0x3F;  /* DCP + QC2.0 + QC3.0 + AFC + FCP + SCP */
+    } else {
+        reg = 0x00;
+    }
+    ret = ip5561_i2c_write_ctrl(handle, IP55XX_QC_CTRL2, reg);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to write SRC_QC_EN");
+    ESP_LOGI(TAG, "SRC_QC_EN (0x85): 0x%02X - output protocols %s",
+             reg, enable ? "ENABLED (DCP+QC+AFC+FCP+SCP)" : "disabled");
+
+    /* 4. Ensure Boost is enabled in SYS_CTL0 */
+    if (enable) {
+        ret = ip5561_i2c_read_ctrl(handle, IP55XX_SYS_CTL0, &reg);
+        if (ret == ESP_OK) {
+            reg |= IP55XX_SYS_CTL0_EN_BOOST;
+            ip5561_i2c_write_ctrl(handle, IP55XX_SYS_CTL0, reg);
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ip5561_disable_vout(ip5561_handle_t handle)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+
+    esp_err_t ret;
+    uint8_t reg;
+
+    /* VOUT_CTL0 (0x10): Disable all VOUT paths (MOS + DCP + QC + detect) */
+    ret = ip5561_i2c_read_ctrl(handle, IP55XX_VOUT_CTL0, &reg);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to read VOUT_CTL0");
+    reg &= ~((1 << 0) | (1 << 1) | (1 << 2) | (1 << 3));  /* Clear all enable bits */
+    ret = ip5561_i2c_write_ctrl(handle, IP55XX_VOUT_CTL0, reg);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to write VOUT_CTL0");
+    ESP_LOGI(TAG, "VOUT_CTL0 (0x10): 0x%02X - VOUT disabled (unused port)", reg);
+
+    /* VOUT_CTL1 (0x13): Disable light load for VOUT */
+    ret = ip5561_i2c_read_ctrl(handle, IP55XX_VOUT_CTL1, &reg);
+    if (ret == ESP_OK) {
+        reg &= ~(1 << 0);  /* En_Vout_Chgilow = 0 */
+        reg &= ~(1 << 1);  /* En_Vout_Vhgilow = 0 */
+        ip5561_i2c_write_ctrl(handle, IP55XX_VOUT_CTL1, reg);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ip5561_disable_ntc(ip5561_handle_t handle)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+
+    esp_err_t ret;
+    uint8_t reg;
+
+    /* NTC_CTL1 (0xFD): Clear all protection bits + disable NTC1 hardware auto mode */
+    ret = ip5561_i2c_read_ctrl(handle, IP55XX_NTC_ENABLE, &reg);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to read NTC_ENABLE");
+    reg = 0x00;  /* Disable all: En_ntc1=0, all temp protection=0 */
+    ret = ip5561_i2c_write_ctrl(handle, IP55XX_NTC_ENABLE, reg);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to write NTC_ENABLE");
+    ESP_LOGI(TAG, "NTC_ENABLE (0xFD): 0x%02X - NTC protection DISABLED (not connected)", reg);
+
+    /* VBUS_IMOSLOW (0x4B): Set to 0x00 to prevent light-load auto-close of VBUS MOS */
+    ret = ip5561_i2c_write_ctrl(handle, IP55XX_VBUS_IMOSLOW, 0x00);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "VBUS_IMOSLOW (0x4B): 0x00 - light-load MOS shutdown DISABLED");
+    }
+
+    return ESP_OK;
+}
+
 /* ========== Charging Voltage Control ========== */
 
 esp_err_t ip5561_set_charge_voltage(ip5561_handle_t handle, uint16_t voltage_mv)
@@ -870,6 +977,65 @@ esp_err_t ip5561_set_9v_charge_current(ip5561_handle_t handle, uint16_t current_
     ESP_RETURN_ON_ERROR(ret, TAG, "Failed to write CHG_CTL5");
 
     ESP_LOGI(TAG, "9V charge current limit set to %d mA (reg=0x%02X)", current_ma, current_reg_val);
+    return ESP_OK;
+}
+
+esp_err_t ip5561_set_5v_charge_current(ip5561_handle_t handle, uint16_t current_ma)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+
+    /* CHG_CTL4 (0x29) at 0xE8 I2C address
+     * bits 6:0: Chg_Iset_Vbus5v = current_ma / 25mA
+     * bit 7: Chg_Iset_Ppath_EN (use same current for path-through) */
+    uint8_t current_reg_val = (uint8_t)(current_ma / 25);
+
+    if (current_reg_val < 10) current_reg_val = 10;    /* 250mA minimum */
+    if (current_reg_val > 127) current_reg_val = 127;  /* ~3175mA maximum */
+
+    esp_err_t ret = ip5561_i2c_write_ctrl(handle, IP55XX_CHG_CTL4, current_reg_val);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to write CHG_CTL4");
+
+    ESP_LOGI(TAG, "5V charge current limit set to %d mA (reg=0x%02X)", current_ma, current_reg_val);
+    return ESP_OK;
+}
+
+esp_err_t ip5561_configure_vbus_input(ip5561_handle_t handle, bool enable)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+
+    esp_err_t ret;
+    uint8_t reg;
+
+    /* 1. SINK_QC_EN (0x81): Input fast charge protocol enable */
+    reg = enable ? 0x07 : 0x00;  /* bit0=QC, bit1=FCP, bit2=AFC */
+    ret = ip5561_i2c_write_ctrl(handle, IP55XX_QC_CTRL0, reg);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to write SINK_QC_EN");
+    ESP_LOGI(TAG, "SINK_QC_EN (0x81): 0x%02X - input QC/FCP/AFC %s",
+             reg, enable ? "ENABLED" : "disabled");
+
+    /* 2. SYS_CTL3 (0x25): bit3 = En_Vbus_Sinkqc (VBUS input QC enable) */
+    ret = ip5561_i2c_read_ctrl(handle, IP55XX_SYS_CTL3, &reg);
+    if (ret == ESP_OK) {
+        if (enable) {
+            reg |= (1 << 3);
+        } else {
+            reg &= ~(1 << 3);
+        }
+        ip5561_i2c_write_ctrl(handle, IP55XX_SYS_CTL3, reg);
+        ESP_LOGI(TAG, "SYS_CTL3 (0x25): 0x%02X - VBUS sink QC %s",
+                 reg, enable ? "ENABLED" : "disabled");
+    }
+
+    /* 3. TYPEC PD SINK: ensure PD input enabled (TYPEC_CTL1 0xD4 bit0) */
+    ret = ip5561_i2c_read_ctrl(handle, IP55XX_PD_CTRL, &reg);
+    if (ret == ESP_OK) {
+        if (enable) {
+            reg |= (1 << 0);   /* EN_PD_SRC = 1 (also enables PD sink in DRP mode) */
+        }
+        ip5561_i2c_write_ctrl(handle, IP55XX_PD_CTRL, reg);
+        ESP_LOGI(TAG, "PD_CTRL (0xD4): 0x%02X - PD %s", reg, enable ? "ENABLED" : "disabled");
+    }
+
     return ESP_OK;
 }
 
