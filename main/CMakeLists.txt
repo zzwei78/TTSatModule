@@ -45,6 +45,7 @@ set(SYSTEM_SRCS
     "system/syslog.c"
     "system/ble_monitor.c"
     "system/sleep_manager.c"
+    "system/led_manager.c"
 )
 
 # Config source files

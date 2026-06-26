@@ -18,6 +18,7 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include "ble/ble_gatt_server.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -27,6 +28,7 @@
 #include "tt/tt_module.h"
 #include "tt/tt_hardware.h"
 #include "system/power_manage.h"
+#include "system/led_manager.h"
 #include "system/ble_monitor.h"
 #include "system/sleep_manager.h"
 #include "config/user_params.h"
@@ -131,13 +133,17 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting application...");
 
+    /* Initialize LEDs FIRST — release deep sleep hold, configure all LEDs */
+    led_manager_init();
+    led_start_heartbeat(LED_3);  /* Blue LED heartbeat */
+
     /* Initialize NVS — used to store PHY calibration data */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(ret); 
 
     /* Initialize sleep manager (detects deep sleep wakeup cause) */
     sleep_manager_init();
@@ -217,7 +223,7 @@ void app_main(void)
                  esp_err_to_name(ret));
     } else {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Power management initialized");
-    }
+    }     
 
     /* Step 2: Initialize TT Module (phone call has highest priority, no voltage check) */
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[2/4] Initializing TT module...");

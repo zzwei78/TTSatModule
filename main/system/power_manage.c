@@ -5,6 +5,7 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -12,11 +13,14 @@
 #include "esp_intr_alloc.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_bt.h"
+#include "esp_rom_gpio.h"
 #include "IP5561.h"
 #include "system/power_manage.h"
 #include "syslog.h"
 #include "tt/tt_module.h"
+#include "tt/tt_hardware.h"
 #include "ble/gatt_system_server.h"
 #include "ble/spp_at_server.h"
 #include "config/user_params.h"
@@ -42,6 +46,14 @@ static ip5561_handle_t g_ip5561_handle = NULL;
 /* Fuel gauge device handle (auto-detected BQ27220 or CW2217E) */
 static fuel_gauge_handle_t g_fuel_gauge_handle = NULL;
 
+/* Return fuel gauge chip name for logging */
+static const char *fuel_gauge_name(void)
+{
+    if (g_fuel_gauge_handle == NULL) return "N/A";
+    return (fuel_gauge_get_type(g_fuel_gauge_handle) == FUEL_GAUGE_BQ27220)
+           ? "BQ27220" : "CW2217E";
+}
+
 /* DA228EC device handle (3-axis accelerometer, primary) */
 static da228ec_handle_t g_da228ec_handle = NULL;
 
@@ -60,23 +72,38 @@ static struct {
 } g_sensor_cache = {0};
 
 /* Monitor task handles */
-static TaskHandle_t g_ip5561_task_handle = NULL;
+static TaskHandle_t g_ip5561_manage_task = NULL;
 static TaskHandle_t g_fuel_gauge_task_handle = NULL;
 
 /* Monitor task running flags */
-static bool g_ip5561_task_running = false;
+static bool g_ip5561_manage_running = false;
 static bool g_fuel_gauge_task_running = false;
 
 /* Cached average current (calculated from CoulombCounter delta, updated every 60s) */
 static int16_t g_avg_current_ma = 0;
 
+/* ========== Battery Event Report State ========== */
+#define BATT_TEMP_HIGH_THRESHOLD    55      /* °C: high temperature alert */
+#define BATT_TEMP_HIGH_RECOVERY     52      /* °C: hysteresis recovery */
+#define BATT_TEMP_LOW_THRESHOLD     (-10)   /* °C: low temperature alert */
+#define BATT_TEMP_LOW_RECOVERY      (-7)    /* °C: hysteresis recovery */
+#define BATT_CHARGE_CURRENT_MA      200     /* mA: threshold to distinguish charging */
+
+static bool g_batt_report_enabled = false;
+static uint8_t g_batt_report_flags = 0;
+static uint8_t g_batt_soc_threshold = BATTERY_REPORT_DEFAULT_SOC_THRESHOLD;
+
+/* State tracking for event detection */
+static bool g_batt_event_inited = false;    /* First-read initialization */
+static uint8_t g_batt_last_soc = 0;
+static bool g_batt_last_charging = false;
+static bool g_batt_temp_high_active = false;
+static bool g_batt_temp_low_active = false;
+
 /* IP5561 configuration fingerprint for reset detection */
 typedef struct {
     uint8_t sys_ctl0;
-    uint8_t sys_ctl1;
-    uint8_t qc_ctrl0;
-    uint8_t pd_ctrl;
-    uint8_t chg_tmo_ctl1;
+    uint8_t sys_ctl4;
     bool initialized;
 } ip5561_config_fingerprint_t;
 
@@ -108,18 +135,14 @@ static void boost_update_gpio(void);
 #define IP5561_I2C_SDA_IO       GPIO_NUM_14
 #define IP5561_I2C_PORT_NUM     I2C_NUM_1
 
-/* V2.0: Boost IC GPIO definitions */
-#define BOOST_PWR_EN_GPIO       GPIO_NUM_1      /* Active LOW: LOW=boost on */
-#define BOOST_PWR_MODE_GPIO     GPIO_NUM_36     /* HIGH=normal, LOW=low-power */
-
 /* V2.0: Low-battery boost thresholds (hysteresis) */
 #define LOW_BAT_BOOST_OFF_MV    3300            /* Falling: TT off, MCU requests boost */
 #define LOW_BAT_BOOST_ON_MV     3400            /* Rising: TT can restart, MCU releases boost */
 #endif
 
 /* IP5561 wakeup GPIO definition */
-#define IP5561_WAKEUP_GPIO      GPIO_NUM_8      /* GPIO8 for IP5561 wakeup */
-#define IP5561_WAKEUP_DELAY_MS  10              /* 10ms delay per state */
+#define IP5561_WAKEUP_GPIO      GPIO_NUM_8      /* GPIO8 for IP5561 wakeup (KEY) */
+#define IP5561_INT_GPIO         GPIO_NUM_5      /* GPIO5: IP5561 INT (I2C mode ready) */
 
 /* ========== IP5561 Wakeup Functions ========== */
 
@@ -142,21 +165,104 @@ static void ip5561_wakeup_gpio_init(void)
 }
 
 /**
- * @brief IP5561 wakeup sequence: LOW -> HIGH -> LOW
+ * @brief IP5561 long wakeup: hold KEY high for 2 seconds.
  *
- * Each state maintains for 10ms to ensure reliable wakeup
+ * Required to wake from deep shutdown mode (e.g. after light-load
+ * shutdown or prolonged power-off). Call once during init before
+ * any I2C communication.
  */
-static void ip5561_wakeup_sequence(void)
+void power_manage_ip5561_long_wakeup(void)
 {
     gpio_set_level(IP5561_WAKEUP_GPIO, 0);
-    vTaskDelay(pdMS_TO_TICKS(IP5561_WAKEUP_DELAY_MS));
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     gpio_set_level(IP5561_WAKEUP_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(IP5561_WAKEUP_DELAY_MS));
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 long wakeup (2s key press)...");
+    vTaskDelay(pdMS_TO_TICKS(2500));
 
     gpio_set_level(IP5561_WAKEUP_GPIO, 0);
-    vTaskDelay(pdMS_TO_TICKS(IP5561_WAKEUP_DELAY_MS / 2));  /* 5ms stabilization */
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
+
+/* ========== IP5561 INT GPIO (GPIO5, common for V1/V2) ========== */
+
+/**
+ * @brief Configure INT (GPIO5) as input
+ *
+ * INT is driven HIGH by IP5561 when I2C mode is ready.
+ */
+static void ip5561_int_gpio_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << IP5561_INT_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    /* Disable RTC pull-down left over from deep sleep (if woken from deep sleep).
+     * During deep sleep, sleep_manager enables RTC pull-down on GPIO5 for clean
+     * LOW level; clear it here so IP5561's INT signal is read unmodified. */
+    rtc_gpio_pulldown_dis(IP5561_INT_GPIO);
+}
+
+/**
+ * @brief Wait for INT pin to stay HIGH continuously for >=100ms
+ *
+ * Per datasheet: after IP5561 raises INT, MCU must wait at least 100ms
+ * of continuous HIGH before starting I2C communication.
+ *
+ * @param timeout_ms Maximum time to wait
+ * @return true if INT confirmed HIGH for 100ms, false on timeout
+ */
+static bool ip5561_wait_int_ready(uint32_t timeout_ms)
+{
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t high_since_tick = 0;
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    TickType_t hold_ticks = pdMS_TO_TICKS(100);  /* 100ms continuous HIGH required */
+
+    while ((xTaskGetTickCount() - start_tick) < timeout_ticks) {
+        if (gpio_get_level(IP5561_INT_GPIO) == 1) {
+            if (high_since_tick == 0) {
+                high_since_tick = xTaskGetTickCount();
+            } else if ((xTaskGetTickCount() - high_since_tick) >= hold_ticks) {
+                return true;  /* INT sustained HIGH for >=100ms */
+            }
+        } else {
+            high_since_tick = 0;  /* INT dropped — restart timer */
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));  /* ≥1 tick: yields to IDLE (avoids watchdog) */
+    }
+    return false;  /* Timeout */
+}
+
+/* ========== IP5561 I2C Handshake (V2 only, dedicated I2C1 bus) ========== */
+#ifdef SUPPORT_HARDWARE_V2
+
+/**
+ * @brief Set I2C1 SDA/SCL to input + internal pullup (high-Z but pulled to 3.3V)
+ *
+ * IP5561 multiplexes LED1=SDA and LED2=SCL. When IP5561 wakes from shutdown,
+ * it checks whether LED1/LED2 are pulled HIGH. If so, it enters I2C mode and
+ * raises INT. This must be called BEFORE the wakeup key press so the pins are
+ * ready when IP5561 checks them.
+ */
+static void ip5561_i2c_pins_high_z(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << IP5561_I2C_SCL_IO) | (1ULL << IP5561_I2C_SDA_IO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+}
+
+#endif /* SUPPORT_HARDWARE_V2 */
 
 /* ========== Boost Power Manager (V2.0 only) ========== */
 #ifdef SUPPORT_HARDWARE_V2
@@ -239,6 +345,22 @@ void power_manage_boost_deep_sleep_prepare(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[BOOST] Deep sleep: boost OFF, GPIOs held");
 }
 
+void power_manage_ip5561_deep_sleep_prepare(void)
+{
+    /* Reset I2C1 pins (GPIO6/GPIO14) to high-Z so they don't drive during deep sleep.
+     * On wakeup, app_main() re-runs and sets them high-Z before IP5561 handshake. */
+    gpio_set_direction(IP5561_I2C_SCL_IO, GPIO_MODE_DISABLE);
+    gpio_set_direction(IP5561_I2C_SDA_IO, GPIO_MODE_DISABLE);
+
+    /* Hold KEY (GPIO8) LOW during deep sleep */
+    gpio_set_level(IP5561_WAKEUP_GPIO, 0);
+    gpio_hold_en(IP5561_WAKEUP_GPIO);
+
+    /* INT (GPIO5) is input — no action needed, left in default high-Z */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[IP5561] Deep sleep: I2C pins high-Z, KEY held LOW");
+}
+
 #endif /* SUPPORT_HARDWARE_V2 */
 
 /* ========== Interrupt-Safe Battery Data Access ========== */
@@ -313,9 +435,6 @@ static int16_t safe_get_battery_current(void)
     return fuel_gauge_get_current(g_fuel_gauge_handle);
 }
 
-/* Enable/disable detailed diagnostics in monitor task */
-#define POWER_MANAGE_ENABLE_DIAGNOSTICS    1    /* 1=enable, 0=disable */
-
 /* Default BQ27220 CEDV parameters */
 static const __attribute__((unused)) parameter_cedv_t default_bq27220_cedv = {
     .full_charge_cap = 650,
@@ -358,218 +477,6 @@ static const __attribute__((unused)) gauging_config_t default_bq27220_config = {
     .IGNORE_SD = 1,
     .SME0 = 0,
 };
-
-/**
- * @brief IP5561 monitor task
- *
- * Periodically reads IP5561 register status to verify communication
- * on both I2C addresses (0xE8 and 0xEA)
- */
-static void __attribute__((unused)) sensor_monitor_task(void *pvParameters);
-static esp_err_t power_manage_apply_ip5561_config(void);  /* Forward decl for monitor reset recovery */
-static void __attribute__((unused)) ip5561_monitor_task(void *pvParameters)
-{
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task started");
-
-    uint8_t prev_sys_ctl0 = 0xFF;  // Previous value for change detection
-    uint8_t prev_mos_status = 0xFF;
-    int error_count_ctrl = 0;
-    int error_count_stat = 0;
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[IP5561 Monitor] Starting continuous monitoring (10s interval)");
-
-    while (g_ip5561_task_running) {
-        /* ========== Critical State Monitoring ========== */
-
-        uint8_t sys_ctl0 = 0, sys_ctl1 = 0, mos_status = 0;
-        esp_err_t ret_ctrl;
-
-        /* Read SYS_CTL0 - Detect Boost state changes */
-        ret_ctrl = ip5561_get_sys_ctl0(g_ip5561_handle, &sys_ctl0);
-        if (ret_ctrl == ESP_OK) {
-            // Detect boost state changes
-            if ((sys_ctl0 & 0x02) != (prev_sys_ctl0 & 0x02)) {
-                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                         "[IP5561] ⚠️ BOOST STATE CHANGED: 0x%02X -> 0x%02X (Boost now %s)",
-                         prev_sys_ctl0, sys_ctl0,
-                         (sys_ctl0 & 0x02) ? "ENABLED" : "DISABLED");
-            }
-            prev_sys_ctl0 = sys_ctl0;
-            error_count_ctrl = 0;
-        } else {
-            error_count_ctrl++;
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                     "[IP5561] Failed to read SYS_CTL0, error count: %d", error_count_ctrl);
-        }
-
-        /* Read SYS_CTL1 - Light load detection check & correction */
-        ret_ctrl = ip5561_get_sys_ctl1(g_ip5561_handle, &sys_ctl1);
-        if (ret_ctrl == ESP_OK) {
-            /* Force disable light load detection if enabled */
-            if ((sys_ctl1 & 0x04) || (sys_ctl1 & 0x08)) {
-                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                         "[IP5561] ⚠️ Light load detected! Forcing disable...");
-                sys_ctl1 &= ~(0x04 | 0x08 | 0x30);
-                ip5561_set_sys_ctl1(g_ip5561_handle, sys_ctl1);
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                         "[IP5561] SYS_CTL1 corrected to: 0x%02X", sys_ctl1);
-            }
-
-            /* ========== Config Fingerprint Check ========== */
-            /* Detect if IP5561 reset or configuration was lost */
-            if (g_ip5561_fingerprint.initialized) {
-                bool config_changed = false;
-                uint8_t current_sys_ctl0 = 0, current_qc = 0, current_pd = 0, current_tmo = 0;
-
-                ip5561_get_sys_ctl0(g_ip5561_handle, &current_sys_ctl0);
-                ip5561_read_reg(g_ip5561_handle, 0x81, &current_qc, false);   /* QC_CTRL0 */
-                ip5561_read_reg(g_ip5561_handle, 0xD4, &current_pd, false);   /* PD_CTRL */
-                ip5561_read_reg(g_ip5561_handle, 0x21, &current_tmo, false);   /* CHG_TMO_CTL1 */
-
-                /* Compare with saved fingerprint */
-                if (current_sys_ctl0 != g_ip5561_fingerprint.sys_ctl0) {
-                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                             "[IP5561] ⚠️ CONFIG CHANGE! SYS_CTL0: 0x%02X -> 0x%02X (possible reset!)",
-                             g_ip5561_fingerprint.sys_ctl0, current_sys_ctl0);
-                    config_changed = true;
-                }
-                if (current_qc != g_ip5561_fingerprint.qc_ctrl0) {
-                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                             "[IP5561] ⚠️ CONFIG CHANGE! QC_CTRL0: 0x%02X -> 0x%02X",
-                             g_ip5561_fingerprint.qc_ctrl0, current_qc);
-                    config_changed = true;
-                }
-                if (current_pd != g_ip5561_fingerprint.pd_ctrl) {
-                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                             "[IP5561] ⚠️ CONFIG CHANGE! PD_CTRL: 0x%02X -> 0x%02X",
-                             g_ip5561_fingerprint.pd_ctrl, current_pd);
-                    config_changed = true;
-                }
-                if (current_tmo != g_ip5561_fingerprint.chg_tmo_ctl1) {
-                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                             "[IP5561] ⚠️ CONFIG CHANGE! CHG_TMO_CTL1: 0x%02X -> 0x%02X",
-                             g_ip5561_fingerprint.chg_tmo_ctl1, current_tmo);
-                    config_changed = true;
-                }
-
-                if (config_changed) {
-                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                             "[IP5561] 🔴 IP5561 RESET detected! Re-applying configuration...");
-
-                    /* Read reset cause indicators before recovery */
-                    uint8_t sys_state0 = 0, sys_state1 = 0;
-                    ip5561_read_reg(g_ip5561_handle, 0xC4, &sys_state0, true);
-                    ip5561_read_reg(g_ip5561_handle, 0xC5, &sys_state1, true);
-                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                             "[IP5561] Reset cause: SYS_STATE0=0x%02X [VBUSOV:%d VBUSOK:%d] SYS_STATE1=0x%02X [VBATLOW:%d VSYS_OV:%d]",
-                             sys_state0, (sys_state0 >> 5) & 1, (sys_state0 >> 4) & 1,
-                             sys_state1, (sys_state1 >> 2) & 1, (sys_state1 >> 1) & 1);
-
-                    /* Full re-initialization of all IP5561 registers */
-                    power_manage_apply_ip5561_config();
-                    SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                             "[IP5561] ✅ Configuration re-applied after reset");
-                }
-            }
-        }
-
-        /* Read MOSFET status - Detect state changes */
-        ret_ctrl = ip5561_read_reg(g_ip5561_handle, 0x87, &mos_status, false);
-        if (ret_ctrl == ESP_OK) {
-            if ((mos_status & 0x01) != (prev_mos_status & 0x01)) {
-                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                         "[IP5561] ⚠️ MOSFET STATE CHANGED: 0x%02X -> 0x%02X (MOS now %s)",
-                         prev_mos_status, mos_status,
-                         (mos_status & 0x01) ? "ON" : "OFF");
-            }
-            prev_mos_status = mos_status;
-        }
-
-        /* ========== Error Summary ========== */
-        if (error_count_ctrl >= 3 || error_count_stat >= 3) {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                     "[IP5561] ⚠️ I2C ERROR! Ctrl: %d, Stat: %d",
-                     error_count_ctrl, error_count_stat);
-        }
-
-        /* ========== Visual Separator ========== */
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "------------------------------------------------");
-
-        /* ========== VBUS Output Diagnostics ========== */
-        {
-            uint8_t mos_state = 0, ocp_state = 0, sys_state3 = 0;
-
-            /* MOS_STATE (0xEB @ 0xEA): bit6=VBUS MOS, bit4=VOUT MOS */
-            ip5561_read_reg(g_ip5561_handle, 0xEB, &mos_state, true);
-
-            /* OCP_STATE (0xFC @ 0xEA): bit2=boost_uv, bit0=boost_scdt */
-            ip5561_read_reg(g_ip5561_handle, 0xFC, &ocp_state, true);
-
-            /* SYS_STATE3 (0xD0 @ 0xEA): bit4=Boost_en, bits2:0=sys_state */
-            ip5561_read_reg(g_ip5561_handle, 0xD0, &sys_state3, true);
-
-            /* SYS_STATE0 (0xC4 @ 0xEA): bit5=VBUSOV, bit4=VBUSOK */
-            uint8_t sys_state0 = 0;
-            ip5561_read_reg(g_ip5561_handle, 0xC4, &sys_state0, true);
-
-            /* VBUS output current (0x5A-0x5B @ 0xEA) */
-            uint8_t vbus_il = 0, vbus_ih = 0;
-            ip5561_read_reg(g_ip5561_handle, 0x5A, &vbus_il, true);
-            ip5561_read_reg(g_ip5561_handle, 0x5B, &vbus_ih, true);
-            uint16_t vbus_iadc = ((uint16_t)vbus_ih << 8) | vbus_il;
-            int16_t vbus_out_ma = (int16_t)(vbus_iadc * 0.671387f);
-
-            /* VBUS voltage (0x62-0x63 @ 0xEA) */
-            uint8_t vbus_vl = 0, vbus_vh = 0;
-            ip5561_read_reg(g_ip5561_handle, 0x62, &vbus_vl, true);
-            ip5561_read_reg(g_ip5561_handle, 0x63, &vbus_vh, true);
-            uint16_t vbus_vadc = ((uint16_t)vbus_vh << 8) | vbus_vl;
-            uint16_t vbus_out_mv = (uint16_t)(vbus_vadc * 1.611328f);
-
-            bool vbus_mos_on = (mos_state & (1 << 6)) != 0;
-            bool boost_en = (sys_state3 & (1 << 4)) != 0;
-            uint8_t sys_state = sys_state3 & 0x07;
-
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                "[IP5561] VBUS: MOS=%s Boost=%s Sys=%d V=%umV I=%dmA | MOS_REG=0x%02X OCP=0x%02X STATE0=0x%02X[VBUSOV:%d VBUSOK:%d]",
-                vbus_mos_on ? "ON" : "OFF",
-                boost_en ? "EN" : "DIS",
-                sys_state,
-                vbus_out_mv, vbus_out_ma,
-                mos_state, ocp_state,
-                sys_state0, (sys_state0 >> 5) & 1, (sys_state0 >> 4) & 1);
-
-            /* ========== OCP Auto-Clear ========== */
-            /* bit5 (0x20): reserved, ignore */
-            /* bit2 (0x04): boost UV (overcurrent) */
-            /* bit0 (0x01): boost short circuit */
-            if (ocp_state & 0x05) {
-                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                    "[IP5561] ⚠️ OCP triggered! (uv=%d, scdt=%d) Clearing...",
-                    (ocp_state >> 2) & 1, ocp_state & 1);
-                ip5561_write_reg(g_ip5561_handle, 0xFC, ocp_state | 0x05, true);
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-
-            /* ========== VBUS MOS Auto-Recovery ========== */
-            /* If boost is enabled but VBUS MOS went off, try to re-enable VBUS output */
-            if (boost_en && !vbus_mos_on) {
-                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                    "[IP5561] ⚠️ Boost enabled but VBUS MOS OFF! Attempting recovery...");
-                ip5561_configure_vbus_output(g_ip5561_handle, true);
-            }
-        }
-
-        /* Read every 10 seconds (1s granularity for quick stop response) */
-        for (int i = 0; i < 10 && g_ip5561_task_running; i++) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task stopped");
-    g_ip5561_task_handle = NULL;
-    vTaskDelete(NULL);
-}
 
 /**
  * @brief BQ27220 monitor task
@@ -664,7 +571,7 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
     /* ========== Step 1: Read BQ27220 data (primary source) ========== */
     voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
     if (voltage == 0) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "BQ27220: Failed to read voltage");
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[%s]: Failed to read voltage", fuel_gauge_name());
         return ESP_FAIL;
     }
 
@@ -690,7 +597,7 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
     }
 
     SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-        "BQ27220: V=%umV, I=%dmA, DSG=%d → Charging=%d",
+        "[%s]: V=%umV, I=%dmA, DSG=%d → Charging=%d", fuel_gauge_name(),
         voltage, current, batt_status.DSG, fg_charging);
 
     /* ========== Step 2: Read IP5561 charging status (secondary source) ========== */
@@ -701,7 +608,7 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
         SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
             "IP5561: Charging=%d", ip5561_charging);
     } else {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Handle NULL, using BQ27220 only");
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Handle NULL, using %s only", fuel_gauge_name());
     }
 
     /* ========== Step 3: Determine charging state with cross-validation ========== */
@@ -745,7 +652,8 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
             /* Status mismatch - trust current most */
             *is_charging = current_charging;
             SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                "State MISMATCH! BQ27220_charging=%d (DSG=%d), I=%dmA, IP5561=%d → Using CURRENT (Charging=%d)",
+                "State MISMATCH! %s_charging=%d (DSG=%d), I=%dmA, IP5561=%d → Using CURRENT (Charging=%d)",
+                fuel_gauge_name(),
                 fg_charging, batt_status.DSG, current, ip5561_charging, current_charging);
         }
     } else {
@@ -777,22 +685,120 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
     return ESP_OK;
 }
 
+/* ========== Battery Event Detection ========== */
+
+static void battery_event_check(void)
+{
+    if (!g_batt_report_enabled || g_fuel_gauge_handle == NULL) {
+        return;
+    }
+
+    uint16_t voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
+    int16_t current = fuel_gauge_get_current(g_fuel_gauge_handle);
+    uint16_t soc = fuel_gauge_get_state_of_charge(g_fuel_gauge_handle);
+    uint16_t temp_0_1k = fuel_gauge_get_temperature(g_fuel_gauge_handle);
+
+    /* Convert temperature: 0.1°K → °C */
+    int temp_c = (int)temp_0_1k / 10 - 273;
+
+    /* Initialize baseline on first call */
+    if (!g_batt_event_inited) {
+        g_batt_last_soc = soc;
+        g_batt_last_charging = (current < -BATT_CHARGE_CURRENT_MA);
+        g_batt_event_inited = true;
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[BATT_EVENT] Initialized: soc=%u%%, charging=%d, temp=%d°C",
+            soc, g_batt_last_charging, temp_c);
+        return;
+    }
+
+    /* --- SOC change detection --- */
+    if ((g_batt_report_flags & BATTERY_REPORT_FLAG_SOC) &&
+        (uint8_t)abs((int)soc - (int)g_batt_last_soc) >= g_batt_soc_threshold) {
+        gatt_system_server_send_battery_event(BATTERY_EVENT_SOC_CHANGE,
+                                              soc, voltage, temp_0_1k);
+        g_batt_last_soc = soc;
+    }
+
+    /* --- Charging status detection --- */
+    if (g_batt_report_flags & BATTERY_REPORT_FLAG_CHARGE) {
+        bool charging_now = (current < -BATT_CHARGE_CURRENT_MA);
+
+        if (charging_now != g_batt_last_charging) {
+            if (charging_now) {
+                /* Started charging */
+                gatt_system_server_send_battery_event(BATTERY_EVENT_CHARGE_START,
+                                                      soc, voltage, temp_0_1k);
+            } else {
+                /* Stopped charging — check if full */
+                if (g_batt_last_charging && soc >= 99) {
+                    gatt_system_server_send_battery_event(BATTERY_EVENT_CHARGE_FULL,
+                                                          soc, voltage, temp_0_1k);
+                } else {
+                    gatt_system_server_send_battery_event(BATTERY_EVENT_CHARGE_STOP,
+                                                          soc, voltage, temp_0_1k);
+                }
+            }
+            g_batt_last_charging = charging_now;
+        }
+    }
+
+    /* --- Temperature high alert (with hysteresis) --- */
+    if (g_batt_report_flags & BATTERY_REPORT_FLAG_TEMP) {
+        if (temp_c >= BATT_TEMP_HIGH_THRESHOLD && !g_batt_temp_high_active) {
+            gatt_system_server_send_battery_event(BATTERY_EVENT_TEMP_HIGH,
+                                                  soc, voltage, temp_0_1k);
+            g_batt_temp_high_active = true;
+        } else if (temp_c <= BATT_TEMP_HIGH_RECOVERY) {
+            g_batt_temp_high_active = false;
+        }
+
+        if (temp_c <= BATT_TEMP_LOW_THRESHOLD && !g_batt_temp_low_active) {
+            gatt_system_server_send_battery_event(BATTERY_EVENT_TEMP_LOW,
+                                                  soc, voltage, temp_0_1k);
+            g_batt_temp_low_active = true;
+        } else if (temp_c >= BATT_TEMP_LOW_RECOVERY) {
+            g_batt_temp_low_active = false;
+        }
+    }
+}
+
+void power_manage_set_battery_report(uint8_t flags, uint8_t soc_threshold)
+{
+    g_batt_report_flags = flags;
+    g_batt_soc_threshold = (soc_threshold > 0) ? soc_threshold : 1;
+    g_batt_event_inited = false;  /* Re-init baseline on enable */
+    g_batt_report_enabled = (flags != 0);
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+        "[BATT_EVENT] Report %s (flags=0x%02X, soc_thr=%u%%)",
+        g_batt_report_enabled ? "ENABLED" : "DISABLED",
+        g_batt_report_flags, g_batt_soc_threshold);
+}
+
+void power_manage_disable_battery_report(void)
+{
+    g_batt_report_enabled = false;
+    g_batt_report_flags = 0;
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[BATT_EVENT] Report DISABLED");
+}
+
 static void __attribute__((unused)) fuel_gauge_monitor_task(void *pvParameters)
 {
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge monitor task started (60s period)");
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[%s] monitor task started (60s period)", fuel_gauge_name());
 
     int error_count = 0;
     uint16_t prev_coulomb_count = 0;
     bool first_read = true;
 
     while (g_fuel_gauge_task_running) {
-        /* ========== Read all BQ27220 data ========== */
+        /* ========== Read battery data ========== */
         uint16_t voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
         if (voltage == 0) {
             error_count++;
             if (error_count > 3) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                    "BQ27220 read failed %d times", error_count);
+                    "[%s] read failed %d times", fuel_gauge_name(), error_count);
             }
             for (int i = 0; i < 60 && g_fuel_gauge_task_running; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
@@ -830,7 +836,8 @@ static void __attribute__((unused)) fuel_gauge_monitor_task(void *pvParameters)
 
         /* ========== Print battery status ========== */
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "[BATT] V=%umV, I_now=%dmA, I_avg=%dmA, SOC=%u%%, P_avg=%dmW, Coulomb=%u",
+            "[%s] V=%umV, I_now=%dmA, I_avg=%dmA, SOC=%u%%, P_avg=%dmW, Coulomb=%u",
+            fuel_gauge_name(),
             voltage, instant_current, avg_current_ma, soc, avg_power, coulomb_count);
 
         /* ========== Low Battery TT Module Auto-Shutdown Check ========== */
@@ -881,12 +888,16 @@ static void __attribute__((unused)) fuel_gauge_monitor_task(void *pvParameters)
         /* Print BLE TX power */
         {
             int8_t ble_pwr = esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT);
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[BATT] BLE TX power: %d dBm", ble_pwr);
+            SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[BATT] BLE TX power: %d dBm", ble_pwr);
         }
 
-        /* Wait 60 seconds before next check (1s granularity for quick stop response) */
+        /* Wait 60 seconds before next check (1s granularity for quick stop response).
+         * Battery event detection runs every 10 seconds within this window. */
         for (int i = 0; i < 60 && g_fuel_gauge_task_running; i++) {
             vTaskDelay(pdMS_TO_TICKS(1000));
+            if (g_batt_report_enabled && (i % 10 == 9)) {
+                battery_event_check();
+            }
         }
     }
 
@@ -924,10 +935,31 @@ static esp_err_t power_manage_apply_ip5561_config(void)
     /* Light load detection: disabled (prevent auto-shutdown of outputs) */
     ip5561_configure_light_load(g_ip5561_handle, false, false, 0);
 
+    /* SYS_CTL4 (0x31): Enable long-press 2S key wakeup + keep default key-off mode */
+    {
+        uint8_t sys_ctl4 = 0;
+        ip5561_read_reg(g_ip5561_handle, 0x31, &sys_ctl4, false);
+        sys_ctl4 |= (1 << 2);               /* En_Long_Wk = 1 (long press 2s wakeup) */
+        /* Keep Set_Key bits [1:0] at default (10 = two short presses to power off) */
+        ip5561_write_reg(g_ip5561_handle, 0x31, sys_ctl4, false);
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "SYS_CTL4: 0x%02X (En_Long_Wk=1)", sys_ctl4);
+    }
+
+    /* SYS_CTL5 (0x33): Enable low-current always-on mode.
+     * En_Lowcur=1 keeps chip alive in low-power mode even after VBUS removal,
+     * preventing unwanted shutdown. */
+    {
+        uint8_t sys_ctl5 = 0;
+        ip5561_read_reg(g_ip5561_handle, 0x33, &sys_ctl5, false);
+        sys_ctl5 |= (1 << 5);               /* En_Lowcur = 1 (enable always-on mode) */
+        ip5561_write_reg(g_ip5561_handle, 0x33, sys_ctl5, false);
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "SYS_CTL5: 0x%02X (En_Lowcur=1)", sys_ctl5);
+    }
+
     /* Charge voltage and current */
     ip5561_set_charge_voltage(g_ip5561_handle, 4350);
     ip5561_set_5v_charge_current(g_ip5561_handle, 3500);
-    ip5561_set_9v_charge_current(g_ip5561_handle, 1500);
+    ip5561_set_9v_charge_current(g_ip5561_handle, 2500);
     ip5561_set_9v_uv_threshold(g_ip5561_handle, 7500);
 
     /* Input fast charge: enable QC/FCP/AFC/PD */
@@ -944,21 +976,14 @@ static esp_err_t power_manage_apply_ip5561_config(void)
 
     ip5561_disable_boost_protections(g_ip5561_handle, false);
 
-    /* Save configuration fingerprint (re-read AFTER all config applied) */
-    uint8_t sys_ctl0 = 0, sys_ctl1 = 0;
-    uint8_t qc_ctrl0 = 0, pd_ctrl = 0, chg_tmo = 0;
-    ip5561_get_sys_ctl0(g_ip5561_handle, &sys_ctl0);
-    ip5561_get_sys_ctl1(g_ip5561_handle, &sys_ctl1);
-    ip5561_read_reg(g_ip5561_handle, 0x81, &qc_ctrl0, false);
-    ip5561_read_reg(g_ip5561_handle, 0xD4, &pd_ctrl, false);
-    ip5561_read_reg(g_ip5561_handle, 0x21, &chg_tmo, false);
-
-    g_ip5561_fingerprint.sys_ctl0 = sys_ctl0;
-    g_ip5561_fingerprint.sys_ctl1 = sys_ctl1;
-    g_ip5561_fingerprint.qc_ctrl0 = qc_ctrl0;
-    g_ip5561_fingerprint.pd_ctrl = pd_ctrl;
-    g_ip5561_fingerprint.chg_tmo_ctl1 = chg_tmo;
+    /* Save configuration fingerprint (only stable registers) */
+    ip5561_get_sys_ctl0(g_ip5561_handle, &g_ip5561_fingerprint.sys_ctl0);
+    ip5561_read_reg(g_ip5561_handle, 0x31, &g_ip5561_fingerprint.sys_ctl4, false);
     g_ip5561_fingerprint.initialized = true;
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+        "IP5561 fingerprint saved: CTL0=0x%02X CTL4=0x%02X",
+        g_ip5561_fingerprint.sys_ctl0, g_ip5561_fingerprint.sys_ctl4);
 
     return ESP_OK;
 }
@@ -970,12 +995,7 @@ static esp_err_t power_manage_apply_ip5561_config(void)
  */
 static esp_err_t power_manage_init_ip5561(void)
 {
-    esp_err_t ret;
-
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "=== Initializing IP5561 (Charging Manager) ===");
-
-    /* Wakeup IP5561 before creating device */
-    ip5561_wakeup_sequence();
 
     /* Create IP5561 device */
     ip5561_config_t ip5561_cfg = {
@@ -993,25 +1013,224 @@ static esp_err_t power_manage_init_ip5561(void)
         return ESP_FAIL;
     }
 
-    /* Register wakeup callback (auto-wakeup before each I2C communication) */
-    ip5561_set_wakeup_callback(g_ip5561_handle, ip5561_wakeup_sequence);
+    /* Check if IP5561 had internal reset by comparing stable registers.
+     * Uses CTL0 + CTL4 (not QC_CTRL0 — it's a trigger that auto-clears). */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+        "IP5561: fingerprint %s (CTL0=0x%02X CTL4=0x%02X)",
+        g_ip5561_fingerprint.initialized ? "EXISTS" : "NONE",
+        g_ip5561_fingerprint.sys_ctl0, g_ip5561_fingerprint.sys_ctl4);
 
-    /* Test IP5561 communication */
-    uint8_t sys_ctl0 = 0;
-    ret = ip5561_get_sys_ctl0(g_ip5561_handle, &sys_ctl0);
-    if (ret != ESP_OK) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Communication test failed");
-        ip5561_delete(g_ip5561_handle);
-        g_ip5561_handle = NULL;
-        return ESP_FAIL;
+    if (g_ip5561_fingerprint.initialized) {
+        uint8_t cur_ctl0 = 0;
+        uint8_t cur_ctl4 = 0;
+        ip5561_get_sys_ctl0(g_ip5561_handle, &cur_ctl0);
+        ip5561_read_reg(g_ip5561_handle, 0x31, &cur_ctl4, false);
+
+        if (cur_ctl0 == g_ip5561_fingerprint.sys_ctl0 &&
+            cur_ctl4 == g_ip5561_fingerprint.sys_ctl4) {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                "IP5561: No reset detected, config intact (CTL0=0x%02X CTL4=0x%02X)",
+                cur_ctl0, cur_ctl4);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: ✓ Initialization complete");
+            return ESP_OK;
+        }
+
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "IP5561: Reset detected! CTL0: 0x%02X->0x%02X, CTL4: 0x%02X->0x%02X, re-applying config",
+            g_ip5561_fingerprint.sys_ctl0, cur_ctl0,
+            g_ip5561_fingerprint.sys_ctl4, cur_ctl4);
     }
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: Communication OK, SYS_CTL0: 0x%02X", sys_ctl0);
 
-    /* Apply full register configuration */
+    /* Apply full register configuration (first init or after reset) */
     power_manage_apply_ip5561_config();
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561: ✓ Initialization complete");
     return ESP_OK;
+}
+
+/* ========== IP5561 Public Control API ========== */
+
+void power_manage_ip5561_double_click_shutdown(void)
+{
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[IP5561] Double-click shutdown (KEY pulse x2)");
+
+    /* Simulate physical double-click: two short KEY pulses */
+    gpio_set_level(IP5561_WAKEUP_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_set_level(IP5561_WAKEUP_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    gpio_set_level(IP5561_WAKEUP_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_set_level(IP5561_WAKEUP_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+esp_err_t power_manage_ip5561_set_vbus_output(bool enable)
+{
+    if (g_ip5561_handle == NULL) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = ip5561_configure_vbus_output(g_ip5561_handle, enable);
+    if (ret == ESP_OK) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "VBUS output %s", enable ? "enabled" : "disabled");
+    } else {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to %s VBUS output: %s",
+                        enable ? "enable" : "disable", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+/* ========== IP5561 Manage Task ========== */
+
+/* Forward declarations: tasks defined later in this file */
+static void sensor_monitor_task(void *pvParameters);
+
+/**
+ * @brief IP5561 unified manage task
+ *
+ * Replaces ip5561_monitor_task + ip5561_retry_task.
+ *
+ * Period:
+ *   - If not initialized: 2 minutes (retry init)
+ *   - If initialized:     1 minute  (health check)
+ *
+ * Each cycle:
+ *   1. If handle == NULL → try init, wait 2 min
+ *   2. If handle != NULL → probe SYS_CTL0:
+ *      - Comm OK → check OCP, NTC, config fingerprint (reset detection)
+ *      - Comm fail → long wakeup → re-probe → if still fail, handle = NULL
+ */
+static void ip5561_manage_task(void *pvParameters)
+{
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[IP5561 Manage] Task started");
+
+    /* Initial delay to let system stabilize after boot */
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    
+    while (g_ip5561_manage_running) {
+        uint32_t next_delay_ms;
+
+        if (g_ip5561_handle == NULL) {
+            /* === Case 1: Not initialized — short KEY then attempt init === */
+            int int_level = gpio_get_level(IP5561_INT_GPIO);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                            "[IP5561 Manage] Not initialized (INT=%d), trying init...",
+                            int_level);
+        
+            /* Short KEY pulse only during init retry, NOT during health check */
+            gpio_set_level(IP5561_WAKEUP_GPIO, 1);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            gpio_set_level(IP5561_WAKEUP_GPIO, 0);
+            vTaskDelay(pdMS_TO_TICKS(50));
+
+            esp_err_t ret = power_manage_init_ip5561();
+            if (ret == ESP_OK) {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                                "[IP5561 Manage] Init success!");
+            } else {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                                "[IP5561 Manage] Init failed (INT=%d), will retry in 2 min",
+                                int_level);
+            }
+            next_delay_ms = 120000;  /* 2 min between init attempts */
+        } else {
+            /* === Case 2: Initialized — health check (no KEY pulse!) === */
+            uint8_t sys_ctl0 = 0;
+            esp_err_t ret = ip5561_get_sys_ctl0(g_ip5561_handle, &sys_ctl0);
+
+            if (ret == ESP_OK) {
+                /* --- Charging status (0xE9 @ 0xEA) --- */
+                uint8_t chg_state2 = 0;
+                ip5561_read_reg(g_ip5561_handle, 0xE9, &chg_state2, true);
+                /* 0xE9: bit0=VBUS_IN_OK, bit1=CHG_DONE, bit3=CHG_ACTIV,
+                 *       bits6:4 = charge state (0=Idle,1=PreChg,2=CC,3=CV,5=Full) */
+                bool vbus_in   = (chg_state2 & 0x01) != 0;
+                bool chg_done  = (chg_state2 & 0x02) != 0;
+                bool chg_activ = (chg_state2 & 0x08) != 0;
+                uint8_t chg_phase = (chg_state2 >> 4) & 0x07;
+
+                int16_t ibat = ip5561_get_battery_current(g_ip5561_handle);
+                uint16_t vbat_adc = ip5561_get_battery_voltage(g_ip5561_handle);
+                uint16_t vbat_mv = (uint16_t)(vbat_adc * 0.26855f);
+
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[IP5561 Manage] CTL0=0x%02X | CHG: vbus=%d activ=%d done=%d phase=%d | Vbat=%umV Ibat=%dmA",
+                    sys_ctl0, vbus_in, chg_activ, chg_done, chg_phase, vbat_mv, ibat);
+
+                /* --- OCP check (0xFC @ 0xEA) --- */
+                uint8_t ocp_state = 0;
+                if (ip5561_read_reg(g_ip5561_handle, 0xFC, &ocp_state, true) == ESP_OK) {
+                    if (ocp_state & 0x05) {  /* bit2=boost_uv, bit0=boost_scdt */
+                        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                                        "[IP5561 Manage] OCP triggered (0x%02X), clearing...",
+                                        ocp_state);
+                        ip5561_write_reg(g_ip5561_handle, 0xFC, ocp_state | 0x05, true);
+                    }
+                }
+
+                /* --- NTC alert check (0xFB @ 0xEA) --- */
+                uint8_t ntc_state = 0;
+                if (ip5561_read_reg(g_ip5561_handle, 0xFB, &ntc_state, true) == ESP_OK) {
+                    if (ntc_state & 0xF0) {  /* any temperature flag */
+                        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                                        "[IP5561 Manage] NTC alert (0x%02X): Hot=%d MHot=%d MLow=%d Cold=%d",
+                                        ntc_state,
+                                        (ntc_state >> 7) & 1, (ntc_state >> 6) & 1,
+                                        (ntc_state >> 5) & 1, (ntc_state >> 4) & 1);
+                    }
+                }
+
+                /* --- Reset detection via config fingerprint --- */
+                if (g_ip5561_fingerprint.initialized) {
+                    uint8_t cur_sys_ctl4 = 0;
+                    ip5561_read_reg(g_ip5561_handle, 0x31, &cur_sys_ctl4, false);
+
+                    if (cur_sys_ctl4 != g_ip5561_fingerprint.sys_ctl4) {
+                        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                                        "[IP5561 Manage] Reset detected! SYS_CTL4: 0x%02X -> 0x%02X, re-applying config",
+                                        g_ip5561_fingerprint.sys_ctl4, cur_sys_ctl4);
+                        power_manage_apply_ip5561_config();
+                    }
+                }
+
+                next_delay_ms = 60000;  /* 1 min for normal health check */
+            } else {
+                /* === Communication lost === */
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[IP5561 Manage] Comm lost, fingerprint %s (CTL4=0x%02X), marking NULL",
+                    g_ip5561_fingerprint.initialized ? "EXISTS" : "NONE",
+                    g_ip5561_fingerprint.sys_ctl4);
+
+                /* NOTE: long wakeup (2s KEY) is disabled because it triggers
+                 * IP5561 shutdown when the chip is already running, causing
+                 * ESP32 power loss. Just mark handle as NULL and retry init
+                 * on next cycle (VBUS plug-in will unlock IP5561). */
+                ip5561_delete(g_ip5561_handle);
+                g_ip5561_handle = NULL;
+                /* Keep fingerprint — on reconnect we check if chip reset */
+                next_delay_ms = 120000;  /* 2 min before next init attempt */
+            }
+        }
+        
+        next_delay_ms = 5000;
+
+        /* Wait with 10s granularity for quick stop response */
+        uint32_t remaining = next_delay_ms;
+        while (remaining >= 10000 && g_ip5561_manage_running) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            remaining -= 10000;
+        }
+        if (remaining > 0 && g_ip5561_manage_running) {
+            vTaskDelay(pdMS_TO_TICKS(remaining));
+        }
+    }
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[IP5561 Manage] Task stopped");
+    g_ip5561_manage_task = NULL;
+    vTaskDelete(NULL);
 }
 
 /**
@@ -1040,7 +1259,7 @@ static esp_err_t power_manage_init_fuel_gauge(void)
     for (int i = 0; i < 3; i++) {
         voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
         if (voltage > 0) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Fuel gauge: ✓ Communication OK, Voltage: %u mV", voltage);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[%s]: ✓ Communication OK, Voltage: %u mV", fuel_gauge_name(), voltage);
             return ESP_OK;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -1070,14 +1289,46 @@ esp_err_t power_manage_init(void)
 
     /* Step 1: Initialize IP5561 wakeup GPIO */
     ip5561_wakeup_gpio_init();
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 wakeup GPIO initialized (GPIO%d, %dms pulse)",
-                    IP5561_WAKEUP_GPIO, IP5561_WAKEUP_DELAY_MS);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 wakeup GPIO initialized (GPIO%d)",
+                    IP5561_WAKEUP_GPIO);
+
+    /* Step 1a: Configure INT (GPIO5) as input — common for V1/V2 */
+    ip5561_int_gpio_init();
 
 #ifdef SUPPORT_HARDWARE_V2
     /* V2.0: Initialize boost IC GPIOs */
     boost_gpio_init();
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Boost IC GPIOs initialized (EN: GPIO%d, MODE: GPIO%d)",
                     BOOST_PWR_EN_GPIO, BOOST_PWR_MODE_GPIO);
+
+    /* Step 1b: Set I2C1 SDA/SCL (GPIO6/GPIO14) to high-Z + pullup.
+     * IP5561 checks LED1/LED2 levels on wakeup to decide I2C mode. */
+    ip5561_i2c_pins_high_z();
+
+    /* Step 1c: Long wakeup DISABLED.
+     * 2s KEY pulse triggers IP5561 shutdown when chip is already running,
+     * causing ESP32 power loss. Manage task will retry init without wakeup. */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 long wakeup disabled");
+#endif
+
+    /* Step 1d: Wait for INT (GPIO5) sustained HIGH >=100ms — common for V1/V2.
+     * This confirms IP5561 has entered I2C mode and is ready for communication. */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Waiting for IP5561 INT (GPIO%d)...", IP5561_INT_GPIO);
+    bool int_ready = ip5561_wait_int_ready(2000);  /* 2s timeout */
+    if (int_ready) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                        "IP5561 INT high for 100ms, I2C mode confirmed");
+    } else {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                        "IP5561 INT timeout, trying I2C anyway");
+    }
+
+#ifdef SUPPORT_HARDWARE_V2
+    /* Step 1e: Short KEY press (300ms) to activate IP5561 before I2C init */
+    gpio_set_level(IP5561_WAKEUP_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    gpio_set_level(IP5561_WAKEUP_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
 #endif
 
     /* Step 2: Initialize I2C bus (fuel gauge + sensors) */
@@ -1118,12 +1369,12 @@ esp_err_t power_manage_init(void)
     }
 #endif
 
-    /* Step 3: Initialize IP5561 (independent, non-blocking) */
+    /* Step 3: Initialize IP5561 (non-blocking, manage task will retry if failed) */
     ret = power_manage_init_ip5561();
     if (ret == ESP_OK) {
         ip5561_ok = true;
     } else {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 initialization failed - continuing without it");
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 init failed - manage task will retry");
     }
 
     /* Step 4: Initialize Fuel Gauge (auto-detect BQ27220/CW2217E, non-blocking) */
@@ -1411,25 +1662,27 @@ esp_err_t power_manage_task_start(void)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* Start IP5561 monitor task */
-    if (g_ip5561_handle != NULL && g_ip5561_task_handle == NULL) {
-        g_ip5561_task_running = true;
+#if 1
+    /* Start IP5561 manage task (always start — handles init retry + health check) */
+    if (g_ip5561_manage_task == NULL) {
+        g_ip5561_manage_running = true;
         BaseType_t ret = xTaskCreate(
-            ip5561_monitor_task,
-            "ip5561_monitor",
-            4096,
+            ip5561_manage_task,
+            "ip5561_mgr",
+            8192,
             NULL,
-            5,  /* Priority */
-            &g_ip5561_task_handle
+            2,  /* Priority: low (background management) */
+            &g_ip5561_manage_task
         );
 
         if (ret != pdPASS) {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to create IP5561 monitor task");
-            g_ip5561_task_running = false;
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to create IP5561 manage task");
+            g_ip5561_manage_running = false;
             return ESP_FAIL;
         }
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task started");
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 manage task started");
     }
+ #endif   
 
     /* Start fuel gauge monitor task */
     if (g_fuel_gauge_handle != NULL && g_fuel_gauge_task_handle == NULL) {
@@ -1457,20 +1710,20 @@ esp_err_t power_manage_task_start(void)
 
 esp_err_t power_manage_task_stop(void)
 {
-    /* Stop IP5561 monitor task */
-    if (g_ip5561_task_handle != NULL) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Stopping IP5561 monitor task...");
-        g_ip5561_task_running = false;
+    /* Stop IP5561 manage task */
+    if (g_ip5561_manage_task != NULL) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Stopping IP5561 manage task...");
+        g_ip5561_manage_running = false;
 
         int timeout = 20;  /* 2 second timeout */
-        while (g_ip5561_task_handle != NULL && timeout-- > 0) {
+        while (g_ip5561_manage_task != NULL && timeout-- > 0) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
 
-        if (g_ip5561_task_handle != NULL) {
-            SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task stop timeout");
+        if (g_ip5561_manage_task != NULL) {
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 manage task stop timeout");
         } else {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 monitor task stopped");
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 manage task stopped");
         }
     }
 
@@ -1521,7 +1774,7 @@ mmc5603_handle_t power_manage_get_mmc5603_handle(void)
 
 bool power_manage_task_is_running(void)
 {
-    return g_ip5561_task_running || g_fuel_gauge_task_running;
+    return g_ip5561_manage_running || g_fuel_gauge_task_running;
 }
 
 /* ========== Wireless Charger Control Functions ========== */
@@ -1583,7 +1836,8 @@ bool power_manage_is_wpc_charging(void)
         return false;
     }
 
-    return ip5561_is_wpc_charging(g_ip5561_handle);
+    /* WPC is disabled in config — skip I2C read to avoid unnecessary traffic */
+    return false;
 }
 
 /* ========== PowerBank API (IP5561) ========== */
@@ -1649,47 +1903,49 @@ esp_err_t power_manage_get_charging_status(uint8_t *status_flags)
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (g_ip5561_handle == NULL) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 not initialized");
+    if (g_fuel_gauge_handle == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    ip5561_chg_status_t chg_status;
-    esp_err_t ret = ip5561_get_charge_status(g_ip5561_handle, &chg_status);
-    if (ret != ESP_OK) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to get charge status");
-        return ret;
-    }
+    /* Read battery data from fuel gauge (no IP5561 dependency) */
+    int16_t current = fuel_gauge_get_current(g_fuel_gauge_handle);
+    uint16_t soc = fuel_gauge_get_state_of_charge(g_fuel_gauge_handle);
+    battery_status_t batt_status;
+    fuel_gauge_get_battery_status(g_fuel_gauge_handle, &batt_status);
 
-    /* Read SYS_CTL0 to get charger/boost enable status */
-    uint8_t sys_ctl0 = 0;
-    ip5561_get_sys_ctl0(g_ip5561_handle, &sys_ctl0);
-
-    /* Build status flags
-     * bit0: charger_enabled
-     * bit1: boost_enabled
-     * bit2: charging
-     * bit3: discharging
-     * bit4: charge_done
+    /* Build status flags (same bit layout as before)
+     * bit0: charger_enabled   — power flowing into battery
+     * bit1: boost_enabled     — power flowing out of battery
+     * bit2: charging          — active charging (current < -200mA)
+     * bit3: discharging       — active discharging (current > 200mA)
+     * bit4: charge_done       — full charged (FC flag or SOC>=99 + low current)
      */
     *status_flags = 0;
-    if (sys_ctl0 & 0x01) {
-        *status_flags |= 0x01;  /* bit0: charger_enabled */
-    }
-    if (sys_ctl0 & 0x02) {
-        *status_flags |= 0x02;  /* bit1: boost_enabled */
-    }
-    if (chg_status.charging) {
+
+    if (current < -200) {
+        /* Clearly charging */
+        *status_flags |= 0x01;  /* bit0: charger active */
         *status_flags |= 0x04;  /* bit2: charging */
+    } else if (current > 200) {
+        /* Clearly discharging */
+        *status_flags |= 0x02;  /* bit1: boost active */
+        *status_flags |= 0x08;  /* bit3: discharging */
+    } else if (!batt_status.DSG && current < -100) {
+        /* Trickle charge: negative current >100mA + not in discharge mode */
+        *status_flags |= 0x01;
+        *status_flags |= 0x04;
+    } else {
+        /* Idle zone (|I| < 100mA): sensor offset, neither charging nor discharging */
     }
-    if (chg_status.vbus_valid && (sys_ctl0 & 0x02)) {
-        *status_flags |= 0x08;  /* bit3: discharging (boost active with load) */
-    }
-    if (chg_status.chg_done) {
+
+    /* Charge done: FC flag from fuel gauge, or SOC>=99 with near-zero current */
+    if (batt_status.FC || (soc >= 99 && current > -100 && current < 100)) {
         *status_flags |= 0x10;  /* bit4: charge_done */
     }
 
-    SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Charging status: 0x%02X", *status_flags);
+    SYS_LOGD_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "Charging status: 0x%02X (I=%dmA, SOC=%u%%, DSG=%d, FC=%d)",
+                    *status_flags, current, soc, batt_status.DSG, batt_status.FC);
     return ESP_OK;
 }
 
@@ -1895,488 +2151,6 @@ esp_err_t power_manage_set_wireless_charging(bool enable)
     }
 
     return ret;
-}
-
-esp_err_t power_manage_ip5561_print_diagnostics(void)
-{
-    if (g_ip5561_handle == NULL) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "IP5561 not initialized");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t ret;
-    uint8_t reg_value;
-    uint16_t adc_value;
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "==================== IP5561 DIAGNOSTICS ====================");
-
-    /* ========== System Control Registers ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x00, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "SYS_CTL0 (0x00): 0x%02X [ChgEN:%d|BoostEN:%d|WPCEN:%d]",
-            reg_value,
-            (reg_value & 0x01) ? 1 : 0,
-            (reg_value & 0x02) ? 1 : 0,
-            (reg_value & 0x04) ? 1 : 0);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x03, &reg_value, true);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "SYS_CTL1 (0x03): 0x%02X [ILOW_CUR:%d|ILOW_PWR:%d|ILOW_TMO:%d]",
-            reg_value,
-            (reg_value & 0x04) ? 1 : 0,
-            (reg_value & 0x08) ? 1 : 0,
-            (reg_value & 0x30) >> 4);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0xE9, &reg_value, true);
-    if (ret == ESP_OK) {
-        /* Parse charge state (bits 6:4) */
-        uint8_t chg_state = (reg_value >> 4) & 0x07;
-        const char *chg_state_str;
-        switch (chg_state) {
-            case 0x0: chg_state_str = "Idle"; break;
-            case 0x1: chg_state_str = "Pre-charge"; break;
-            case 0x2: chg_state_str = "CC (Const Current)"; break;
-            case 0x3: chg_state_str = "CV (Const Voltage)"; break;
-            case 0x5: chg_state_str = "Charge Complete"; break;
-            default:  chg_state_str = "Unknown"; break;
-        }
-
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "CHG_STATE2 (0xE9): 0x%02X [VBUS:%d|ChgDone:%d|Chg:%d|State:%s(0x%X)]",
-            reg_value,
-            (reg_value & 0x01) ? 1 : 0,
-            (reg_value & 0x02) ? 1 : 0,
-            (reg_value & 0x08) ? 1 : 0,
-            chg_state_str,
-            chg_state);
-    }
-
-    /* ========== SYS_CTL3 (System Control 3) ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x25, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "SYS_CTL3 (0x25): 0x%02X", reg_value);
-    }
-
-    /* ========== Status Registers ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x03, &reg_value, true);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "BATLOW (0x03): 0x%02X [Battery Low Voltage Threshold]",
-            reg_value);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x19, &reg_value, true);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "GPIO_20UA_EN (0x19): 0x%02X [GPIO 20uA Enable]", reg_value);
-    }
-
-    /* ========== MOSFET Status ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x87, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "MOS_STATUS (0x87): 0x%02X [ChgFet:%d|DsgFet:%d]",
-            reg_value,
-            (reg_value & 0x01) ? 1 : 0,
-            (reg_value & 0x02) ? 1 : 0);
-    }
-
-    /* ========== NTC Protection (NTC_CTL1 Register) ==========
-     * Datasheet: I2C 0xE8, Register 0xFD
-     * Bit 7: En_chg_ml  - Charge mid-low temp (5°C) current reduction
-     * Bit 6: En_chg_mh  - Charge mid-high temp (41°C) current reduction
-     * Bit 5: En_boost_lt - Boost low temp (-20°C) protection [RESET=1]
-     * Bit 4: En_boost_ht - Boost high temp (60°C) protection [RESET=1]
-     * Bit 3: En_chg_lt   - Charge low temp (0°C) protection [RESET=1]
-     * Bit 2: En_chg_ht   - Charge high temp (45°C) protection [RESET=1]
-     * Bit 1: Reserved
-     * Bit 0: En_ntc1     - NTC1 enable
-     */
-    ret = ip5561_read_reg(g_ip5561_handle, 0xFD, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "NTC_CTL1 (0xFD): 0x%02X [ChgML:%d|ChgMH:%d|BoostLT:%d|BoostHT:%d|ChgLT:%d|ChgHT:%d|NTC1:%d]",
-            reg_value,
-            (reg_value & 0x80) ? 1 : 0,  /* bit 7 */
-            (reg_value & 0x40) ? 1 : 0,  /* bit 6 */
-            (reg_value & 0x20) ? 1 : 0,  /* bit 5 */
-            (reg_value & 0x10) ? 1 : 0,  /* bit 4 */
-            (reg_value & 0x08) ? 1 : 0,  /* bit 3 */
-            (reg_value & 0x04) ? 1 : 0,  /* bit 2 */
-            (reg_value & 0x01) ? 1 : 0); /* bit 0 */
-
-        /* TEST CODE: Try to clear NTC charge protection bits (2,3) every cycle */
-        static bool ntc_test_done = false;
-        if (!ntc_test_done && (reg_value & 0x0C)) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                ">>> TEST: Attempting to clear NTC charge protection bits...");
-
-            uint8_t ntc_original = reg_value;
-            uint8_t ntc_clear = reg_value & ~0x0C;  /* Clear bits 2 and 3 */
-
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                ">>> TEST: Original: 0x%02X, Writing: 0x%02X", ntc_original, ntc_clear);
-
-            /* Write the cleared value */
-            ret = ip5561_write_reg(g_ip5561_handle, 0xFD, ntc_clear, false);
-            if (ret == ESP_OK) {
-                /* Read back to verify */
-                vTaskDelay(pdMS_TO_TICKS(10));  /* Small delay */
-                ret = ip5561_read_reg(g_ip5561_handle, 0xFD, &reg_value, false);
-                if (ret == ESP_OK) {
-                    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                        ">>> TEST: Readback: 0x%02X [ChgHT:%d|ChgLT:%d|BoostHT:%d|BoostLT:%d] %s",
-                        reg_value,
-                        (reg_value & 0x04) ? 1 : 0,
-                        (reg_value & 0x08) ? 1 : 0,
-                        (reg_value & 0x10) ? 1 : 0,
-                        (reg_value & 0x20) ? 1 : 0,
-                        (reg_value == ntc_clear) ? "✓ SUCCESS" : "✗ FAILED");
-
-                    /* If bits 2 or 3 are still set, try writing 0x00 to force all protection off */
-                    if (reg_value & 0x0C) {
-                        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                            ">>> TEST: Bits still set! Trying to force write 0x21...");
-                        /* 0x21 = 0010 0001: Keep bit 0 (NTC enable) and bit 4 (Boost HT) */
-                        uint8_t ntc_force = 0x21;
-                        ip5561_write_reg(g_ip5561_handle, 0xFD, ntc_force, false);
-
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                        ip5561_read_reg(g_ip5561_handle, 0xFD, &reg_value, false);
-                        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                            ">>> TEST: After force: 0x%02X [ChgHT:%d|ChgLT:%d|BoostHT:%d|BoostLT:%d]",
-                            reg_value,
-                            (reg_value & 0x04) ? 1 : 0,
-                            (reg_value & 0x08) ? 1 : 0,
-                            (reg_value & 0x10) ? 1 : 0,
-                            (reg_value & 0x20) ? 1 : 0);
-                    }
-                }
-            }
-            ntc_test_done = true;  /* Only run once */
-        }
-    }
-
-    /* NTC Control Register - Current source configuration */
-    ret = ip5561_read_reg(g_ip5561_handle, 0xF6, &reg_value, false);
-    if (ret == ESP_OK) {
-        uint8_t current_src = (reg_value >> 4) & 0x03;
-        const char *current_str;
-        switch (current_src) {
-            case 0: current_str = "Auto"; break;
-            case 1: current_str = "Auto"; break;
-            case 2: current_str = "80uA"; break;
-            case 3: current_str = "20uA"; break;
-            default: current_str = "Unknown"; break;
-        }
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "NTC_CTRL (0xF6): 0x%02X [Current:%s|raw:0x%X]",
-            reg_value, current_str, current_src);
-    }
-
-    /* ========== WPC Status ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x14, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "VWPC_CTL0 (0x14): 0x%02X [WPC_EN:%d|WPC_V:%d|Chg:%d]",
-            reg_value,
-            (reg_value & 0x01) ? 1 : 0,
-            (reg_value & 0x02) ? 1 : 0,
-            (reg_value & 0x04) ? 1 : 0);
-    }
-
-    /* ========== VBUS/VOUT Control ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x18, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "VBUS_CTL0 (0x18): 0x%02X", reg_value);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x24, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "PPATH_CTL0 (0x24): 0x%02X [Power Path Control]", reg_value);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x10, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "VOUT_CTL0 (0x10): 0x%02X [OVP:%d|OCP:%d]",
-            reg_value,
-            (reg_value & 0x40) ? 1 : 0,
-            (reg_value & 0x80) ? 1 : 0);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x13, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "VOUT_CTL1 (0x13): 0x%02X", reg_value);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x1C, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "VOUT_CTL2 (0x1C): 0x%02X", reg_value);
-    }
-
-    /* ========== Fast Charge Protocols ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x81, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "QC_CTRL0 (0x81): 0x%02X [QC_EN:%d]",
-            reg_value,
-            (reg_value & 0x01) ? 1 : 0);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x84, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "QC_CTRL1 (0x84): 0x%02X", reg_value);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x85, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "QC_CTRL2 (0x85): 0x%02X", reg_value);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0xD4, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "PD_CTRL (0xD4): 0x%02X", reg_value);
-    }
-
-    /* ========== Charging Control ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x01, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "CHG_CTL0 (0x01): 0x%02X", reg_value);
-    }
-
-    /* Read CHG_VOLT_SET (0x3A) - Charging voltage setting */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x3A, &reg_value, false);
-    if (ret == ESP_OK) {
-        /* Parse voltage setting bits [3:2] */
-        uint8_t vset = (reg_value >> 2) & 0x03;
-        const char *vset_str;
-        uint16_t vset_mv;
-        switch (vset) {
-            case 0: vset_str = "4.2V"; vset_mv = 4200; break;
-            case 1: vset_str = "4.3V"; vset_mv = 4300; break;
-            case 2: vset_str = "4.35V"; vset_mv = 4350; break;
-            case 3: vset_str = "4.4V"; vset_mv = 4400; break;
-            default: vset_str = "Unknown"; vset_mv = 0; break;
-        }
-
-        /* Parse RCV (Recharge Voltage) bits [1:0] */
-        uint8_t rcv = reg_value & 0x03;
-        const char *rcv_str;
-        uint16_t rcv_mv;
-        switch (rcv) {
-            case 0: rcv_str = "0mV"; rcv_mv = 0; break;
-            case 1: rcv_str = "14mV"; rcv_mv = 14; break;
-            case 2: rcv_str = "28mV"; rcv_mv = 28; break;
-            case 3: rcv_str = "42mV"; rcv_mv = 42; break;
-            default: rcv_str = "Unknown"; rcv_mv = 0; break;
-        }
-
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "CHG_VOLT_SET (0x3A): 0x%02X [VSET:%s(%dmV) | RCV:%s(%dmV) | CV_Total:%dmV]",
-            reg_value, vset_str, vset_mv, rcv_str, rcv_mv, vset_mv + rcv_mv);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x0C, &reg_value, false);
-    if (ret == ESP_OK) {
-        /* Parse UV threshold from high 4 bits [7:4] */
-        uint8_t uv_threshold = (reg_value >> 4) & 0x0F;
-        uint16_t uv_mv = 6000 + (uv_threshold * 500);  // Convert to mV
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "CHG_CTL1 (0x0C): 0x%02X [9V UV Loop: %d mV | raw: 0x%X]",
-            reg_value, uv_mv, uv_threshold);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0x0D, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "CHG_CTL2 (0x0D): 0x%02X [5V Input UV Loop]", reg_value);
-    }
-
-    /* ========== Charge Timeout ========== */
-    ret = ip5561_read_reg(g_ip5561_handle, 0x21, &reg_value, false);
-    if (ret == ESP_OK) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "CHG_TMO_CTL1 (0x21): 0x%02X [Tmo_EN:%d]",
-            reg_value,
-            (reg_value & 0x80) ? 1 : 0);
-    }
-
-    /* ========== ADC Readings ========== */
-    // Note: IP5561 ADC values need scaling factors according to datasheet:
-    // - VBAT_ADC: raw * 0.26855 mV
-    // - VBUS_ADC/VOUT_ADC: raw * 1.611328 mV
-    // - IBUS_ADC: raw * 0.671387 mA
-
-    adc_value = ip5561_get_vbus_voltage(g_ip5561_handle);
-    uint32_t vbus_mv = (uint32_t)(adc_value * 1.611328);  // VBUS scaling
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-        "VBUS_ADC: %u mV (raw: %u)", vbus_mv, adc_value);
-
-    int16_t ibus_current = ip5561_get_ibus_current(g_ip5561_handle);
-    int16_t ibus_ma = (int16_t)(ibus_current * 0.671387);  // IBUS scaling
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-        "IBUS_ADC: %d mA (raw: %d)", ibus_ma, ibus_current);
-
-    adc_value = ip5561_get_vout_voltage(g_ip5561_handle);
-    uint32_t vout_mv = (uint32_t)(adc_value * 1.611328);  // VOUT scaling
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-        "VOUT_ADC: %u mV (raw: %u)", vout_mv, adc_value);
-
-    adc_value = ip5561_get_battery_voltage(g_ip5561_handle);
-    uint32_t vbat_mv = (uint32_t)(adc_value * 0.26855);  // VBAT scaling
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-        "VBAT_ADC: %u mV (raw: %u)", vbat_mv, adc_value);
-
-    /* Read IBAT (battery charging current) - KEY INDICATOR! */
-    if (g_ip5561_handle != NULL) {
-        int16_t ibat_current = ip5561_get_battery_current(g_ip5561_handle);
-        /*
-         * IBAT ADC scaling: IP5561 provides signed 16-bit ADC value
-         * LSB = 1.0 mA per IP5561 datasheet
-         * Positive value = charging, Negative value = discharging
-         * Conversion already applied in ip5561_get_battery_current()
-         */
-        int16_t ibat_ma = ibat_current;
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "IBAT_ADC: %d mA (raw: %d)",
-            ibat_ma, ibat_current);
-    }
-
-    /* Read NTC thermistor temperature */
-    int16_t ntc_temp_c = 0;
-    uint16_t ntc_adc = 0;
-    ret = ip5561_get_ntc_temperature(g_ip5561_handle, &ntc_temp_c, &ntc_adc);
-    if (ret == ESP_OK) {
-        uint32_t ntc_mv = (uint32_t)(ntc_adc * 0.26855);  // NTC scaling
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "NTC1: %d°C (ADC: %u, %u mV)", ntc_temp_c, ntc_adc, ntc_mv);
-    } else {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Failed to read NTC temperature");
-    }
-
-    /* ========== Fast Charge Protocol Status Registers ========== */
-    uint8_t fcp_status = 0, status_src0 = 0, status_src1 = 0;
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0xA1, &fcp_status, true);
-    if (ret == ESP_OK) {
-        /* FCP_STATUS: bit 7:6 = FCP voltage selection */
-        uint8_t fcp_vsel = (fcp_status >> 6) & 0x03;
-        const char *vsel_str;
-        switch (fcp_vsel) {
-            case 0: vsel_str = "5V"; break;
-            case 1: vsel_str = "9V"; break;
-            case 2: vsel_str = "12V"; break;
-            default: vsel_str = "Unknown"; break;
-        }
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "FCP_STATUS (0xA1): 0x%02X [FCP_VSEL:%s]", fcp_status, vsel_str);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0xA4, &status_src0, true);
-    if (ret == ESP_OK) {
-        /* STATUS_SRC0: bit 3:0 = VOUT fast charge protocol */
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "STATUS_SRC0 (0xA4): 0x%02X [VOUT_FCP_State:0x%X]",
-            status_src0, status_src0 & 0x0F);
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0xA5, &status_src1, true);
-    if (ret == ESP_OK) {
-        /* STATUS_SRC1: VBUS/VOUT protocol status */
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "STATUS_SRC1 (0xA5): 0x%02X", status_src1);
-    }
-
-    /* ========== NTC1 and OCP State Registers ========== */
-    uint8_t ntc1_state = 0, ocp_state = 0;
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0xFB, &ntc1_state, true);
-    if (ret == ESP_OK) {
-        /* NTC1_STATE: NTC temperature flags and output MOS current status
-         * Bit 7: Ntc1_ht    - NTC1 high temperature flag
-         * Bit 6: Ntc1_mht   - NTC1 mid-high temperature flag
-         * Bit 5: Ntc1_mlt   - NTC1 mid-low temperature flag
-         * Bit 4: Ntc1_lt    - NTC1 low temperature flag
-         * Bit 3: Mos_vbus_ilow  - VBUS output light load
-         * Bit 2: Mos_vwpc_ilow  - VWPC output light load
-         * Bit 1: Mos_vout_ilow  - VOUT output light load
-         * Bit 0: Reserved
-         */
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "NTC1_STATE (0xFB): 0x%02X [Hot:%d|MHot:%d|MLow:%d|Cold:%d]",
-            ntc1_state,
-            (ntc1_state & 0x80) ? 1 : 0,  /* bit 7: Ntc1_ht */
-            (ntc1_state & 0x40) ? 1 : 0,  /* bit 6: Ntc1_mht */
-            (ntc1_state & 0x20) ? 1 : 0,  /* bit 5: Ntc1_mlt */
-            (ntc1_state & 0x10) ? 1 : 0);  /* bit 4: Ntc1_lt */
-    }
-
-    ret = ip5561_read_reg(g_ip5561_handle, 0xFC, &ocp_state, true);
-    if (ret == ESP_OK) {
-        /* OCP_STATE: System overcurrent status
-         * Bit 7:3: Reserved
-         * Bit 2: Boost_uv  - Boost overcurrent flag
-         * Bit 1: Reserved
-         * Bit 0: Boost_scdt - Boost short circuit flag
-         */
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "OCP_STATE (0xFC): 0x%02X [Boost_OCP:%d|Boost_Short:%d]",
-            ocp_state,
-            (ocp_state & 0x04) ? 1 : 0,   /* bit 2: Boost overcurrent */
-            (ocp_state & 0x01) ? 1 : 0);   /* bit 0: Boost short circuit */
-    }
-
-    /* ========== Charging Status Summary ========== */
-    ip5561_chg_status_t chg_status;
-    if (ip5561_get_charge_status(g_ip5561_handle, &chg_status) == ESP_OK) {
-        /* Parse detailed charge state from chg_status register */
-        uint8_t chg_state = (chg_status.chg_status >> 4) & 0x07;
-        const char *chg_state_detail;
-        switch (chg_state) {
-            case 0x0: chg_state_detail = "IDLE"; break;
-            case 0x1: chg_state_detail = "PRE-CHARGE"; break;
-            case 0x2: chg_state_detail = "CC (恒流)"; break;
-            case 0x3: chg_state_detail = "CV (恒压)"; break;
-            case 0x5: chg_state_detail = "FULL (充满)"; break;
-            default:  chg_state_detail = "UNKNOWN"; break;
-        }
-
-        /* Read SYS_CTL0 to get ChgEN and BoostEN status */
-        uint8_t sys_ctl0 = 0;
-        ip5561_get_sys_ctl0(g_ip5561_handle, &sys_ctl0);
-
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "========== CHARGING STATUS ==========");
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "  Charging: %s | Done: %s | VBUS: %s",
-            chg_status.charging ? "YES" : "NO",
-            chg_status.chg_done ? "YES" : "NO",
-            chg_status.vbus_valid ? "Valid" : "Invalid");
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "  Phase: %s (raw: 0x%X)", chg_state_detail, chg_state);
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "  ChgEN: %s | BoostEN: %s",
-            (sys_ctl0 & 0x01) ? "ON" : "OFF",
-            (sys_ctl0 & 0x02) ? "ON" : "OFF");
-    }
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "============================================================");
-
-    return ESP_OK;
 }
 
 /* ========== Battery SOC Calibration API ========== */

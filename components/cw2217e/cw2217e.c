@@ -69,20 +69,26 @@ static const char *TAG = "CW2217E";
 /* Sense resistor: 10 mOhm, scaled by 1000 */
 #define USER_RSENSE              (10 * 1000)
 
+#define CW_DESIGN_CAPACITY_MAH   4700   /* 华昊锂能 4700mAh */
+
 #define delay_ms(x) vTaskDelay(pdMS_TO_TICKS(x))
 
-/* ========== Battery Profile (from CW221X reference) ========== */
+/* ========== Battery Profile ==========
+ * Battery: 华昊锂能 4700mAh
+ * Profile: profile3_KWEI10X, R_sense=10mΩ
+ * Source: Cellwise lab test 2026-06-24
+ * File: 科纬智能_TTPBank_华昊锂能4700mAh_profile3_KWEI10X_10mohm_20260624.txt */
 static const uint8_t cw_battery_profile[CW_SIZE_OF_PROFILE] = {
-    0x37, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xB1, 0xCB, 0xC7, 0xC4, 0xB9, 0xB4, 0xAB, 0x70,
-    0x49, 0xFF, 0xEA, 0xCD, 0xB6, 0x8D, 0x7D, 0x68,
-    0x5E, 0x5B, 0x56, 0x73, 0x96, 0xD1, 0x83, 0xEC,
-    0xC8, 0xAD, 0x9F, 0xAF, 0xBF, 0xB9, 0xAD, 0xAD,
-    0xBD, 0xCA, 0xD7, 0xC4, 0xAE, 0x97, 0x87, 0x7D,
-    0x77, 0x84, 0x95, 0xA7, 0xBF, 0xC1, 0x8D, 0x3B,
-    0x00, 0x00, 0x57, 0x10, 0x00, 0xB0, 0x7E, 0x04,
-    0x00, 0x00, 0x64, 0x17, 0xD3, 0x89, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x93,
+    0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xB6, 0xBF, 0xBD, 0xC8, 0xA5, 0xA2, 0xD3, 0xB4,
+    0x9F, 0xF2, 0xD5, 0xB1, 0x97, 0x80, 0x62, 0x52,
+    0x49, 0x45, 0x40, 0x84, 0x54, 0xDC, 0x84, 0xFF,
+    0xFF, 0xFF, 0xCF, 0xB9, 0xC2, 0xD8, 0xD9, 0xD2,
+    0xD1, 0xD9, 0xE1, 0xD0, 0xB4, 0x8D, 0x8B, 0x88,
+    0x8B, 0x98, 0xAF, 0xC5, 0xCD, 0xBB, 0xF7, 0x81,
+    0x20, 0x00, 0xAB, 0x10, 0x00, 0xB0, 0x82, 0x00,
+    0x00, 0x00, 0x64, 0x08, 0xD3, 0x90, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
 };
 
 /* ========== Internal Data Structure ========== */
@@ -175,30 +181,20 @@ static int cw2217e_enter_sleep(cw2217e_data_t *data)
         return 0;
     }
 
-    /* If already in ACTIVE mode, we can directly enter SLEEP */
-    if (cur_mode == CW_CONFIG_MODE_ACTIVE) {
-        ESP_LOGI(TAG, "In ACTIVE mode, entering SLEEP directly");
-        if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_SLEEP) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to write SLEEP mode");
-            return -1;
-        }
-        delay_ms(10);
-        return 0;
-    }
-
-    /* Unknown mode: use RESTART -> SLEEP sequence */
-    ESP_LOGI(TAG, "Unknown mode, doing RESTART -> SLEEP");
+    /* Per Cellwise reference: always RESTART → SLEEP for clean state transition.
+     * This resets the chip's internal state machine before entering sleep,
+     * ensuring a clean environment for profile writing. */
     if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_RESTART) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write RESTART command");
         return -1;
     }
-    delay_ms(50);  /* Increased from 20ms to allow full restart */
+    delay_ms(20);  /* Reference: >= 20ms */
 
     if (cw_i2c_write_byte(data->i2c_dev, CW_REG_MODE_CONFIG, CW_CONFIG_MODE_SLEEP) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to write SLEEP mode after RESTART");
+        ESP_LOGE(TAG, "Failed to write SLEEP mode");
         return -1;
     }
-    delay_ms(10);
+    delay_ms(10);  /* Reference: >= 10ms */
 
     return 0;
 }
@@ -232,6 +228,7 @@ static int cw2217e_write_profile(cw2217e_data_t *data)
     for (int i = 0; i < CW_SIZE_OF_PROFILE; i++) {
         if (cw_i2c_write_byte(data->i2c_dev, CW_REG_BAT_PROFILE + i, cw_battery_profile[i]) != ESP_OK)
             return -1;
+        delay_ms(1);  /* CW2217E needs settling time between writes in SLEEP mode */
     }
     return 0;
 }
@@ -665,19 +662,19 @@ uint16_t cw2217e_get_temperature(cw2217e_handle_t handle)
 
 uint16_t cw2217e_get_full_charge_capacity(cw2217e_handle_t handle)
 {
-    return 650;  /* Default design capacity */
+    return CW_DESIGN_CAPACITY_MAH;
 }
 
 uint16_t cw2217e_get_design_capacity(cw2217e_handle_t handle)
 {
-    return 650;
+    return CW_DESIGN_CAPACITY_MAH;
 }
 
 uint16_t cw2217e_get_remaining_capacity(cw2217e_handle_t handle)
 {
     ESP_RETURN_ON_FALSE(handle, 0, TAG, "Invalid handle");
     uint16_t soc = cw2217e_get_state_of_charge(handle);
-    return (uint16_t)((uint32_t)soc * 650 / 100);
+    return (uint16_t)((uint32_t)soc * CW_DESIGN_CAPACITY_MAH / 100);
 }
 
 uint16_t cw2217e_get_state_of_charge(cw2217e_handle_t handle)
@@ -736,6 +733,15 @@ esp_err_t cw2217e_wakeup(cw2217e_handle_t handle)
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     cw2217e_data_t *data = (cw2217e_data_t *)handle;
     return (cw2217e_enter_active(data) == 0) ? ESP_OK : ESP_FAIL;
+}
+
+uint8_t cw2217e_get_mode_config(cw2217e_handle_t handle)
+{
+    ESP_RETURN_ON_FALSE(handle, 0xFF, TAG, "Invalid handle");
+    cw2217e_data_t *data = (cw2217e_data_t *)handle;
+    uint8_t val = 0xFF;
+    cw_i2c_read_byte(data->i2c_dev, CW_REG_MODE_CONFIG, &val);
+    return val;
 }
 
 esp_err_t cw2217e_write_temperature(cw2217e_handle_t handle, int temperature)

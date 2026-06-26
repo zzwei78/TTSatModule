@@ -18,6 +18,7 @@
 #include "audio/voice_packet_handler.h"
 #include "system/syslog.h"
 #include "esp_bt.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tt/tt_module.h"
@@ -830,6 +831,138 @@ int gatt_svr_init(void)
     return 0;
 }
 
+// ============================================================
+// BLE Device Name (NVS-backed)
+// ============================================================
+
+#define BLE_CONFIG_NVS_NAMESPACE    "ble_config"
+#define BLE_CONFIG_NVS_KEY_DEV_NAME "dev_name"
+
+/* Active device name buffer. Always null-terminated so it can be passed to
+ * ble_svc_gap_device_name_set() and friends. Length excludes the terminator. */
+static char s_ble_device_name[BLE_DEVICE_NAME_MAX_LEN + 1] = BLE_DEVICE_NAME_DEFAULT;
+static uint8_t s_ble_device_name_len = (sizeof(BLE_DEVICE_NAME_DEFAULT) - 1);
+
+void ble_device_name_init(void)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(BLE_CONFIG_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (ret == ESP_OK) {
+        size_t required = sizeof(s_ble_device_name);
+        char buf[sizeof(s_ble_device_name)];
+        ret = nvs_get_blob(handle, BLE_CONFIG_NVS_KEY_DEV_NAME, buf, &required);
+        nvs_close(handle);
+        if (ret == ESP_OK && required > 0 && required <= BLE_DEVICE_NAME_MAX_LEN) {
+            memcpy(s_ble_device_name, buf, required);
+            s_ble_device_name[required] = '\0';
+            s_ble_device_name_len = (uint8_t)required;
+        } else {
+            /* No custom name stored or invalid: use default. */
+            strlcpy(s_ble_device_name, BLE_DEVICE_NAME_DEFAULT, sizeof(s_ble_device_name));
+            s_ble_device_name_len = (uint8_t)(sizeof(BLE_DEVICE_NAME_DEFAULT) - 1);
+        }
+    } else {
+        /* Namespace not found or read error: keep default. */
+        strlcpy(s_ble_device_name, BLE_DEVICE_NAME_DEFAULT, sizeof(s_ble_device_name));
+        s_ble_device_name_len = (uint8_t)(sizeof(BLE_DEVICE_NAME_DEFAULT) - 1);
+    }
+
+    int rc = ble_svc_gap_device_name_set(s_ble_device_name);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "Failed to set device name '%s' (rc=%d)\n", s_ble_device_name, rc);
+    } else {
+        MODLOG_DFLT(INFO, "BLE device name initialized: '%s' (%u bytes)\n",
+                    s_ble_device_name, s_ble_device_name_len);
+    }
+}
+
+esp_err_t ble_device_name_set(const char *name, uint8_t len)
+{
+    if (len > BLE_DEVICE_NAME_MAX_LEN) {
+        MODLOG_DFLT(ERROR, "Device name too long: %u > %u\n", len, BLE_DEVICE_NAME_MAX_LEN);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* len > 0 requires a valid buffer. (len == 0 restores default.) */
+    if (len > 0 && name == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Validate: reject embedded NUL bytes in the supplied name (UTF-8 may
+     * legitimately contain bytes >= 0x80, so we only reject 0x00 in the
+     * interior of the buffer). */
+    for (uint8_t i = 0; i < len; i++) {
+        if (name[i] == '\0') {
+            MODLOG_DFLT(ERROR, "Device name contains embedded NUL at index %u\n", i);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    /* Empty name restores default and erases NVS entry. */
+    if (len == 0 || name == NULL) {
+        strlcpy(s_ble_device_name, BLE_DEVICE_NAME_DEFAULT, sizeof(s_ble_device_name));
+        s_ble_device_name_len = (uint8_t)(sizeof(BLE_DEVICE_NAME_DEFAULT) - 1);
+
+        nvs_handle_t handle;
+        esp_err_t ret = nvs_open(BLE_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &handle);
+        if (ret == ESP_OK) {
+            nvs_erase_key(handle, BLE_CONFIG_NVS_KEY_DEV_NAME);
+            nvs_commit(handle);
+            nvs_close(handle);
+        }
+        /* Fall through: still apply the name even if NVS erase failed. */
+    } else {
+        /* Persist to NVS first; if NVS write fails, report the error but
+         * still update the in-memory + GAP name so the user sees the change
+         * this session (it just won't survive reboot). */
+        nvs_handle_t handle;
+        esp_err_t ret = nvs_open(BLE_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &handle);
+        if (ret != ESP_OK) {
+            MODLOG_DFLT(ERROR, "Failed to open NVS for device name: %s\n", esp_err_to_name(ret));
+            return ret;
+        }
+        ret = nvs_set_blob(handle, BLE_CONFIG_NVS_KEY_DEV_NAME, name, len);
+        if (ret == ESP_OK) {
+            ret = nvs_commit(handle);
+        }
+        nvs_close(handle);
+        if (ret != ESP_OK) {
+            MODLOG_DFLT(ERROR, "Failed to persist device name: %s\n", esp_err_to_name(ret));
+            return ret;
+        }
+
+        memcpy(s_ble_device_name, name, len);
+        s_ble_device_name[len] = '\0';
+        s_ble_device_name_len = len;
+    }
+
+    /* Update GAP device name. */
+    int rc = ble_svc_gap_device_name_set(s_ble_device_name);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "ble_svc_gap_device_name_set failed (rc=%d)\n", rc);
+        return ESP_FAIL;
+    }
+
+    /* Restart advertising so the new name appears in scan responses.
+     * ble_gap_adv_stop() returns non-zero if not currently advertising, which
+     * is harmless. ble_spp_server_advertise() is a no-op if a connection is
+     * active and slots are full. */
+    int stop_rc = ble_gap_adv_stop();
+    if (stop_rc != 0 && stop_rc != BLE_HS_EALREADY && stop_rc != BLE_HS_ENOENT) {
+        MODLOG_DFLT(INFO, "adv_stop rc=%d before name change\n", stop_rc);
+    }
+    ble_spp_server_advertise();
+
+    MODLOG_DFLT(INFO, "BLE device name set: '%s' (%u bytes)\n",
+                s_ble_device_name, s_ble_device_name_len);
+    return ESP_OK;
+}
+
+const char *ble_device_name_get(void)
+{
+    return s_ble_device_name;
+}
+
 int ble_gatt_server_init(void)
 {
     esp_err_t ret;
@@ -882,12 +1015,8 @@ int ble_gatt_server_init(void)
         return rc;
     }
 
-    /* Set the default device name. */
-    rc = ble_svc_gap_device_name_set("TTCat");
-    if (rc != 0) {
-        MODLOG_DFLT(ERROR, "Failed to set device name %d \n", rc);
-        return rc;
-    }
+    /* Set the device name (from NVS if a custom name was stored, else default). */
+    ble_device_name_init();
 
     /*
      * NimBLE Store Configuration:

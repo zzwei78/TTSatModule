@@ -50,9 +50,16 @@ esp_err_t tt_hw_init(void)
     esp_rom_gpio_pad_select_gpio(TT_UART_BOOT);
     esp_rom_gpio_pad_select_gpio(TT_IOTL_GPIO);
 
-    /* Release GPIO holds from deep sleep (hold persists across wakeup reset on ESP32-S3) */
+    /* Release GPIO holds from deep sleep (hold persists across wakeup reset on ESP32-S3).
+     * Must release EVERY pin that was held with gpio_hold_en() before deep sleep. */
     gpio_hold_dis(GPIO_TTPWR_EN);
     gpio_hold_dis(AP_WAKEUP_BB_PIN);
+#ifdef SUPPORT_HARDWARE_V2
+    gpio_hold_dis(BOOST_PWR_MODE_GPIO);
+    gpio_hold_dis(GPIO_TT_LDO_EN);
+    gpio_hold_dis(GPIO_NUM_8);   /* IP5561 KEY (GPIO8) */
+    gpio_hold_dis(GPIO_LED3);    /* LED, just in case */
+#endif
     gpio_deep_sleep_hold_dis();
 
     /* Configure Output Pins */

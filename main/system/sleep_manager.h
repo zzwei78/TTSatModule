@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "config/hardware_version.h"
 
 /* ========== Sleep State Machine ========== */
 
@@ -28,6 +29,7 @@ typedef enum {
     SLEEP_WAKEUP_TIMER,          /* Periodic timer wakeup -> TEMP_AWAKE */
     SLEEP_WAKEUP_GPIO21,         /* BB_WAKEUP_AP_PIN -> full init */
     SLEEP_WAKEUP_PWRKEY,         /* GPIO9 pwrkey press -> full init */
+    SLEEP_WAKEUP_USB,            /* IP5561 INT (GPIO5) HIGH -> USB inserted -> full init */
     SLEEP_WAKEUP_OTHER
 } sleep_wakeup_cause_t;
 
@@ -35,9 +37,14 @@ typedef enum {
 
 #define SLEEP_LIGHT_IDLE_SEC        600     /* First entry: idle before light sleep */
 #define SLEEP_LIGHT_REENTER_SEC     2       /* Re-entry: quick re-sleep after wake */
-#define SLEEP_DEEP_IDLE_SEC         600     /* BLE disconnected: idle before deep sleep (10 min) */
+#ifdef SUPPORT_HARDWARE_V2
+#define SLEEP_DEEP_IDLE_SEC         120     /* V2.0: BLE disconnected, idle before deep sleep (2 min) */
+#define SLEEP_DEEP_TIMER_SEC        1800    /* V2.0: Deep sleep interval between timer wakeups (30 min) */
+#else
+#define SLEEP_DEEP_IDLE_SEC         300     /* V1.0: BLE disconnected, idle before deep sleep (5 min) */
+#define SLEEP_DEEP_TIMER_SEC        60      /* V1.0: Deep sleep interval between timer wakeups (1 min) */
+#endif
 #define SLEEP_TEMP_AWAKE_SEC        25      /* Timer wakeup: BLE advertise duration */
-#define SLEEP_DEEP_TIMER_SEC        60      /* Deep sleep interval between timer wakeups */
 #define SLEEP_LIGHT_TIMER_SEC       30      /* Light sleep timer interval (battery check) */
 
 /* ========== Public API ========== */

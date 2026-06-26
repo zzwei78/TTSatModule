@@ -105,6 +105,14 @@ static const uint8_t DEBUG_ALLOWED_COMMANDS[] = {
     // ===== BLE Test Commands =====
     0x7B, // Set BLE TX power temporarily with timeout
 
+    // ===== BLE Device Name Commands =====
+    0x7C,  // SET_DEVICE_NAME (persistent, low-risk, reversible)
+    0x7D,  // GET_DEVICE_NAME
+
+    // ===== Battery Event Report Commands =====
+    0x7E,  // ENABLE_BATTERY_REPORT
+    0x7F,  // DISABLE_BATTERY_REPORT
+
     // ===== Service Control Commands =====
     0x10,  // SERVICE_START
     0x11,  // SERVICE_STOP
@@ -117,6 +125,11 @@ static const uint8_t DEBUG_ALLOWED_COMMANDS[] = {
     // ===== TT Module Force Control =====
     0x72,  // TT_FORCE_ON
     0x73,  // TT_FORCE_OFF
+
+    // ===== Sensor Commands =====
+    0x74,  // GET_SENSOR_STATUS (raw data)
+    0x75,  // ENABLE_SENSOR_REPORT (param: 0=off, 1=on)
+    0x76,  // DISABLE_SENSOR_REPORT (legacy)
 
     // ===== Limited System Control Commands =====
     0x21,  // RESET_TO_FACTORY (requires additional verification)
@@ -807,18 +820,18 @@ static void print_system_command(const uint8_t *data, size_t len)
         break;
 
     case SYS_CMD_GET_SENSOR_STATUS:
-        cmd_name = "GET_SENSOR_STATUS";
-        snprintf(param_str, sizeof(param_str), "Query sensor presence");
+        cmd_name = "GET_SENSOR_DATA";
+        snprintf(param_str, sizeof(param_str), "Get raw sensor data (accel+mag)");
         break;
 
     case SYS_CMD_ENABLE_SENSOR_REPORT:
-        cmd_name = "ENABLE_SENSOR_REPORT";
-        snprintf(param_str, sizeof(param_str), "Enable periodic sensor data report");
+        cmd_name = "SET_SENSOR_REPORT";
+        snprintf(param_str, sizeof(param_str), "param[0]: 0=off 1=on");
         break;
 
     case SYS_CMD_DISABLE_SENSOR_REPORT:
         cmd_name = "DISABLE_SENSOR_REPORT";
-        snprintf(param_str, sizeof(param_str), "Disable sensor data report");
+        snprintf(param_str, sizeof(param_str), "Disable (legacy, use 0x75 with param=0)");
         break;
 
     case SYS_CMD_SIM_CTRL:
@@ -1695,6 +1708,40 @@ int gatt_system_server_send_sensor_data(void)
     return ble_gatts_notify_custom(conn_handle, system_control_val_handle, txom);
 }
 
+int gatt_system_server_send_battery_event(uint8_t event_type, uint8_t soc,
+                                           uint16_t voltage_mv, uint16_t temp_0_1k)
+{
+    if (event_type == BATTERY_EVENT_NONE) {
+        return ESP_OK;
+    }
+
+    uint16_t conn_handle = ble_conn_manager_get_primary_handle();
+    if (conn_handle == 0) {
+        return BLE_HS_ENOTCONN;
+    }
+
+    /* Build notification: [0x7E][event_type][soc][v_lo][v_hi][t_lo][t_hi] */
+    uint8_t buf[7];
+    buf[0] = SYS_CMD_ENABLE_BATTERY_REPORT;  /* Event notification identifier */
+    buf[1] = event_type;
+    buf[2] = soc;
+    buf[3] = (uint8_t)(voltage_mv & 0xFF);
+    buf[4] = (uint8_t)((voltage_mv >> 8) & 0xFF);
+    buf[5] = (uint8_t)(temp_0_1k & 0xFF);
+    buf[6] = (uint8_t)((temp_0_1k >> 8) & 0xFF);
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                    "Battery event: type=0x%02X soc=%u%% V=%umV T=%u(0.1K)",
+                    event_type, soc, voltage_mv, temp_0_1k);
+
+    struct os_mbuf *txom = ble_hs_mbuf_from_flat(buf, sizeof(buf));
+    if (!txom) {
+        return BLE_HS_ENOMEM;
+    }
+
+    return ble_gatts_notify_custom(conn_handle, system_control_val_handle, txom);
+}
+
 /**
  * @brief Send command response via BLE GATT notification
  *
@@ -2432,23 +2479,41 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
 
     case SYS_CMD_GET_SENSOR_STATUS:
         {
-            resp_data[0] = power_manage_get_sensor_flags();
-            resp_len = 1;
+            /* Return raw sensor data: [flags][ax_lo][ax_hi][ay_lo][ay_hi][az_lo][az_hi]
+             *                          [mx_lo][mx_hi][my_lo][my_hi][mz_lo][mz_hi] = 13 bytes */
+            uint8_t flags = 0;
+            int16_t ax = 0, ay = 0, az = 0;
+            int32_t mx = 0, my = 0, mz = 0;
+            power_manage_get_sensor_data(&flags, &ax, &ay, &az, &mx, &my, &mz);
+            resp_data[0] = flags;
+            memcpy(&resp_data[1], &ax, 2);
+            memcpy(&resp_data[3], &ay, 2);
+            memcpy(&resp_data[5], &az, 2);
+            int16_t mx16 = (int16_t)mx, my16 = (int16_t)my, mz16 = (int16_t)mz;
+            memcpy(&resp_data[7], &mx16, 2);
+            memcpy(&resp_data[9], &my16, 2);
+            memcpy(&resp_data[11], &mz16, 2);
+            resp_len = 13;
         }
         break;
 
     case SYS_CMD_ENABLE_SENSOR_REPORT:
         {
-            power_manage_set_sensor_report(true);
-            resp_data[0] = SYS_RESP_OK;
+            /* param[0]: 0=disable, 1=enable (default enable if no param) */
+            bool enable = (param_len == 0) ? true : (cmd_params[0] != 0);
+            power_manage_set_sensor_report(enable);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                "Sensor report %s", enable ? "ENABLED" : "DISABLED");
+            resp_data[0] = power_manage_is_sensor_report_enabled() ? 1 : 0;
             resp_len = 1;
         }
         break;
 
     case SYS_CMD_DISABLE_SENSOR_REPORT:
         {
+            /* Backward compat: explicit disable */
             power_manage_set_sensor_report(false);
-            resp_data[0] = SYS_RESP_OK;
+            resp_data[0] = 0;
             resp_len = 1;
         }
         break;
@@ -2544,8 +2609,73 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
         }
         break;
 
+    case SYS_CMD_SET_DEVICE_NAME:
+        {
+            /* Request params: UTF-8 name bytes.
+             *   param_len = 0      -> restore default "TTCat"
+             *   param_len = 1..29  -> set custom name
+             *   param_len > 29     -> SYS_RESP_INVALID_PARAM
+             * Response: [name_len][name_bytes...] (current name after apply) */
+            esp_err_t r = ble_device_name_set((const char *)cmd_params, param_len);
+            if (r == ESP_OK) {
+                const char *cur = ble_device_name_get();
+                size_t nlen = strlen(cur);
+                if (nlen > BLE_DEVICE_NAME_MAX_LEN) {
+                    nlen = BLE_DEVICE_NAME_MAX_LEN;
+                }
+                resp_data[0] = (uint8_t)nlen;
+                memcpy(resp_data + 1, cur, nlen);
+                resp_len = 1 + nlen;
+            } else if (r == ESP_ERR_INVALID_ARG) {
+                resp_code = SYS_RESP_INVALID_PARAM;
+            } else {
+                resp_code = SYS_RESP_ERROR;
+            }
+        }
+        break;
+
+    case SYS_CMD_GET_DEVICE_NAME:
+        {
+            /* Response: [name_len][name_bytes...] */
+            const char *cur = ble_device_name_get();
+            size_t nlen = strlen(cur);
+            if (nlen > BLE_DEVICE_NAME_MAX_LEN) {
+                nlen = BLE_DEVICE_NAME_MAX_LEN;
+            }
+            resp_data[0] = (uint8_t)nlen;
+            memcpy(resp_data + 1, cur, nlen);
+            resp_len = 1 + nlen;
+        }
+        break;
+
+    case SYS_CMD_ENABLE_BATTERY_REPORT:
+        {
+            /* params[0] = flags (event subscription bitmask, 0xFF=all)
+             * params[1] = SOC change threshold % (optional, default 1)
+             * Response: [flags][soc_threshold] */
+            uint8_t flags = BATTERY_REPORT_FLAG_ALL;
+            uint8_t soc_thr = BATTERY_REPORT_DEFAULT_SOC_THRESHOLD;
+            if (param_len >= 1) flags = cmd_params[0];
+            if (param_len >= 2 && cmd_params[1] > 0) soc_thr = cmd_params[1];
+            if (soc_thr > 100) soc_thr = 100;
+
+            power_manage_set_battery_report(flags, soc_thr);
+
+            resp_data[0] = flags;
+            resp_data[1] = soc_thr;
+            resp_len = 2;
+        }
+        break;
+
+    case SYS_CMD_DISABLE_BATTERY_REPORT:
+        {
+            power_manage_disable_battery_report();
+            resp_data[0] = 0;
+            resp_len = 1;
+        }
+        break;
+
     default:
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "Unknown system command: 0x%02x", cmd_code);
         resp_code = SYS_RESP_INVALID_CMD;
         break;
     }

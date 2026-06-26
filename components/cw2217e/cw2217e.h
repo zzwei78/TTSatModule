@@ -88,6 +88,13 @@ esp_err_t cw2217e_sleep(cw2217e_handle_t handle);
 esp_err_t cw2217e_wakeup(cw2217e_handle_t handle);
 
 /**
+ * @brief Read MODE_CONFIG register (0x08)
+ * @return register value, or 0xFF on error
+ *         0x00 = ACTIVE, 0xF0 = SLEEP, 0x30 = RESTART
+ */
+uint8_t cw2217e_get_mode_config(cw2217e_handle_t handle);
+
+/**
  * @brief Write host temperature to CW2217E for compensation
  * @param temperature Temperature in Celsius (-40 ~ 87)
  */

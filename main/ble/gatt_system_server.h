@@ -83,6 +83,14 @@
 /* BLE Test Commands */
 #define SYS_CMD_BLE_TX_POWER_TEMP       0x7B  // Set BLE TX power temporarily with timeout
 
+/* BLE Device Name Commands */
+#define SYS_CMD_SET_DEVICE_NAME         0x7C  // Set BLE device name (UTF-8, max 29 bytes; empty=restore default)
+#define SYS_CMD_GET_DEVICE_NAME         0x7D  // Get current BLE device name
+
+/* Battery Event Report Commands */
+#define SYS_CMD_ENABLE_BATTERY_REPORT   0x7E  // Enable battery event notifications
+#define SYS_CMD_DISABLE_BATTERY_REPORT  0x7F  // Disable battery event notifications
+
 /* System Command/Response Packet Configuration */
 #define SYS_CMD_PACKET_MAX_PARAMS       96      // Maximum parameter bytes
 #define SYS_CMD_PACKET_MAX_SIZE         (1 + 1 + SYS_CMD_PACKET_MAX_PARAMS + 2)  // seq + cmd + params + crc16
@@ -235,5 +243,40 @@ int gatt_system_server_get_service_status(uint8_t service_id);
  * @return 0 on success, negative error code otherwise
  */
 int gatt_system_server_send_sensor_data(void);
+
+/* ========== Battery Event Report ========== */
+
+/* Battery event types (pushed to APP via 0xABFD notify) */
+#define BATTERY_EVENT_NONE              0x00
+#define BATTERY_EVENT_SOC_CHANGE        0x01  /* SOC changed by >= threshold */
+#define BATTERY_EVENT_CHARGE_START      0x02  /* Charging started */
+#define BATTERY_EVENT_CHARGE_STOP       0x03  /* Charging stopped (not full) */
+#define BATTERY_EVENT_CHARGE_FULL       0x04  /* Battery fully charged */
+#define BATTERY_EVENT_TEMP_HIGH         0x05  /* Temperature >= high threshold */
+#define BATTERY_EVENT_TEMP_LOW          0x06  /* Temperature <= low threshold */
+
+/* Event subscription bitmask (used in ENABLE_BATTERY_REPORT flags param) */
+#define BATTERY_REPORT_FLAG_SOC         0x01  /* Subscribe to SOC change events */
+#define BATTERY_REPORT_FLAG_CHARGE      0x02  /* Subscribe to charging state events */
+#define BATTERY_REPORT_FLAG_TEMP        0x04  /* Subscribe to temperature alerts */
+#define BATTERY_REPORT_FLAG_ALL         0xFF  /* Subscribe to all events */
+
+/* Default SOC change threshold if APP doesn't specify */
+#define BATTERY_REPORT_DEFAULT_SOC_THRESHOLD  1   /* 1% */
+
+/**
+ * @brief Push a battery event notification to the connected app
+ *
+ * Called from power_manage battery event detector. Builds a 7-byte notification:
+ *   [0x7E][event_type][soc][voltage_lo][voltage_hi][temp_lo][temp_hi]
+ *
+ * @param event_type  BATTERY_EVENT_* code
+ * @param soc         Current SOC (0-100)
+ * @param voltage_mv  Current battery voltage (mV)
+ * @param temp_0_1k   Current temperature (0.1°K)
+ * @return 0 on success, negative on error
+ */
+int gatt_system_server_send_battery_event(uint8_t event_type, uint8_t soc,
+                                           uint16_t voltage_mv, uint16_t temp_0_1k);
 
 #endif /* GATT_SYSTEM_SERVER_H */

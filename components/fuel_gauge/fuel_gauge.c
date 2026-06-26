@@ -157,7 +157,24 @@ uint16_t fuel_gauge_get_voltage(fuel_gauge_handle_t handle)
     if (!handle) return 0;
     fuel_gauge_device_t *fg = (fuel_gauge_device_t *)handle;
     if (fg->type == FUEL_GAUGE_BQ27220) return bq27220_get_voltage(fg->dev);
-    return cw2217e_get_voltage(fg->dev);
+
+    /* CW2217E: try read, if fails wakeup and retry (chip may have slept) */
+    uint16_t v = cw2217e_get_voltage(fg->dev);
+    if (v == 0) {
+        uint8_t mode_before = cw2217e_get_mode_config(fg->dev);
+        cw2217e_wakeup(fg->dev);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        v = cw2217e_get_voltage(fg->dev);
+        uint8_t mode_after = cw2217e_get_mode_config(fg->dev);
+        if (v > 0) {
+            ESP_LOGW(TAG, "CW2217E recovered: MODE_CONFIG 0x%02X->0x%02X, V=%umV",
+                     mode_before, mode_after, v);
+        } else {
+            ESP_LOGE(TAG, "CW2217E read failed: MODE_CONFIG before=0x%02X after=0x%02X",
+                     mode_before, mode_after);
+        }
+    }
+    return v;
 }
 
 int16_t fuel_gauge_get_current(fuel_gauge_handle_t handle)
@@ -165,7 +182,9 @@ int16_t fuel_gauge_get_current(fuel_gauge_handle_t handle)
     if (!handle) return 0;
     fuel_gauge_device_t *fg = (fuel_gauge_device_t *)handle;
     if (fg->type == FUEL_GAUGE_BQ27220) return bq27220_get_current(fg->dev);
-    return cw2217e_get_current(fg->dev);
+    /* CW2217E: negate to unify with BQ27220 convention
+     * (negative = charging, positive = discharging) */
+    return -cw2217e_get_current(fg->dev);
 }
 
 int16_t fuel_gauge_get_avgcurrent(fuel_gauge_handle_t handle)
@@ -173,7 +192,7 @@ int16_t fuel_gauge_get_avgcurrent(fuel_gauge_handle_t handle)
     if (!handle) return 0;
     fuel_gauge_device_t *fg = (fuel_gauge_device_t *)handle;
     if (fg->type == FUEL_GAUGE_BQ27220) return bq27220_get_avgcurrent(fg->dev);
-    return cw2217e_get_avgcurrent(fg->dev);
+    return -cw2217e_get_avgcurrent(fg->dev);
 }
 
 uint16_t fuel_gauge_get_temperature(fuel_gauge_handle_t handle)

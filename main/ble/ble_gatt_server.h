@@ -8,6 +8,7 @@
 #define BLE_GATT_SERVER_H
 
 #include "esp_log.h"
+#include "esp_err.h"
 #include "host/ble_hs.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -18,6 +19,10 @@
 
 // MTU size
 #define SPP_GATT_MTU_SIZE   512
+
+// Device name (stored in NVS, configurable via System service)
+#define BLE_DEVICE_NAME_DEFAULT    "TTCat"
+#define BLE_DEVICE_NAME_MAX_LEN    29
 
 // BLE connection parameters (unit: 1.25ms)
 #define BLE_CONN_INTERVAL_UNIT_MS    1.25f
@@ -96,5 +101,41 @@ int ble_gatts_send_safe_notify(uint16_t conn_handle, uint16_t attr_handle,
  */
 int ble_gatts_send_safe_notify_fragmented(uint16_t conn_handle, uint16_t attr_handle,
                                           const uint8_t *data, uint16_t len, uint16_t mtu);
+
+// ============================================================
+// BLE Device Name (NVS-backed, configurable via System service)
+// ============================================================
+
+/**
+ * @brief Initialize BLE device name from NVS at boot.
+ *
+ * Reads the custom name from NVS namespace "ble_config" (key "dev_name").
+ * Falls back to BLE_DEVICE_NAME_DEFAULT ("TTCat") if no custom name is stored.
+ * Applies the name to the GAP service via ble_svc_gap_device_name_set().
+ */
+void ble_device_name_init(void);
+
+/**
+ * @brief Set the BLE device name, persist to NVS, and refresh advertising.
+ *
+ * @param name Pointer to UTF-8 name bytes (need not be null-terminated).
+ *             Pass NULL or len=0 to restore the default name.
+ * @param len Length of name in bytes. Valid range: 0..BLE_DEVICE_NAME_MAX_LEN (29).
+ *            0 restores the default name and erases the NVS entry.
+ * @return ESP_OK on success,
+ *         ESP_ERR_INVALID_ARG if len is out of range,
+ *         ESP_FAIL / other NVS error on persistence failure.
+ */
+esp_err_t ble_device_name_set(const char *name, uint8_t len);
+
+/**
+ * @brief Get the current BLE device name (null-terminated).
+ *
+ * The returned pointer is valid until the next call to ble_device_name_set()
+ * or ble_device_name_init(). Caller must NOT free it.
+ *
+ * @return Pointer to the current device name string.
+ */
+const char *ble_device_name_get(void);
 
 #endif /* BLE_GATT_SERVER_H */

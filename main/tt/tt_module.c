@@ -294,11 +294,11 @@ static void handle_simst_detection(const char *found_simst,
             if (xTaskCreate(tt_mux_init_task, "tt_mux_init_task", 8192, NULL, 8, &g_mux_init_task_handle) != pdPASS) {
                 SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to create MUX initialization task");
             } else {
-                xSemaphoreGive(g_simst_sem);
+                if (g_simst_sem != NULL) xSemaphoreGive(g_simst_sem);
             }
         } else {
             SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "SIM ready! Notifying existing MUX init task...");
-            xSemaphoreGive(g_simst_sem);
+            if (g_simst_sem != NULL) xSemaphoreGive(g_simst_sem);
         }
     } else {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "SIM not ready, will wait for next ^SIMST: notification...");
@@ -444,7 +444,7 @@ static void tt_mux_init_task(void *pvParameters)
 
         int waited_sec = 0;
         while (waited_sec < SIMST_WAIT_TIMEOUT_SEC) {
-            if (xSemaphoreTake(g_simst_sem, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            if (g_simst_sem != NULL && xSemaphoreTake(g_simst_sem, pdMS_TO_TICKS(5000)) == pdTRUE) {
                 simst_detected = true;
                 break;
             }
@@ -2185,7 +2185,8 @@ esp_err_t tt_module_cleanup(void)
     g_data_callback_user_data = NULL;
 
     // Reset module state to UNINITIALIZED
-    if (xSemaphoreTake(g_tt_module.mode_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (g_tt_module.mode_mutex != NULL &&
+        xSemaphoreTake(g_tt_module.mode_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         set_tt_state(TT_STATE_USER_OFF);
         g_tt_module.uart_mode = TT_UART_MODE_AT;
         xSemaphoreGive(g_tt_module.mode_mutex);

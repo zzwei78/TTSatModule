@@ -30,6 +30,10 @@
 
 static const char *TAG = "SLEEP_MGR";
 
+/* GPIO5 = IP5561 INT pin. Driven HIGH by IP5561 when USB/VBUS activates it.
+ * Used as ext0 deep sleep wakeup source for USB insertion detection. */
+#define USB_WAKEUP_GPIO    GPIO_NUM_5
+
 /* ========== RTC Data (survives deep sleep) ========== */
 
 /**
@@ -213,21 +217,24 @@ static void rtc_data_reset(void)
  */
 static bool is_ble_connected(void)
 {
-    /* Fast path: check cached count */
+    /* Primary: callback-maintained cache (reliable — driven by GAP events) */
     if (g_ble_conn_count > 0) {
         return true;
     }
 
-    /* Slow path: query NimBLE stack directly */
+    /* Fallback: query NimBLE stack in case a connect callback was missed.
+     * Count ALL active connections so the cache syncs to the correct value. */
+    int found = 0;
     for (uint16_t h = 0; h < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; h++) {
         struct ble_gap_conn_desc desc;
         if (ble_gap_conn_find(h, &desc) == 0) {
-            /* Connection exists but cache not updated - sync it */
-            g_ble_conn_count++;
-            SYS_LOGW(TAG, "Sync: Found BLE conn (handle=%d), updated count to %d",
-                     h, g_ble_conn_count);
-            return true;
+            found++;
         }
+    }
+    if (found > 0) {
+        g_ble_conn_count = found;
+        SYS_LOGW(TAG, "BLE conn sync: cache 0 → %d (nimble ground truth)", found);
+        return true;
     }
 
     return false;
@@ -268,8 +275,8 @@ esp_err_t sleep_manager_init(void)
         rtc_data.deep_sleep_count++;
         rtc_data_update_crc();  /* Update CRC after modification */
     } else if (cause == ESP_SLEEP_WAKEUP_EXT0) {
-        /* Legacy ext0 (V1 or older firmware): GPIO21 wakeup */
-        g_wakeup_cause = SLEEP_WAKEUP_GPIO21;
+        /* ext0: IP5561 INT (GPIO5) went HIGH → USB inserted */
+        g_wakeup_cause = SLEEP_WAKEUP_USB;
         g_current_mode = SLEEP_MODE_ACTIVE;
         rtc_data.deep_sleep_count++;
         rtc_data_update_crc();
@@ -324,6 +331,9 @@ void sleep_manager_print_wakeup_info(void)
     } else if (g_wakeup_cause == SLEEP_WAKEUP_PWRKEY) {
         SYS_LOGI(TAG, "Deep sleep PWRKEY (GPIO9) wakeup (count=%u)",
                  (unsigned)rtc_data.deep_sleep_count);
+    } else if (g_wakeup_cause == SLEEP_WAKEUP_USB) {
+        SYS_LOGI(TAG, "Deep sleep USB wakeup via IP5561 INT GPIO%d (count=%u)",
+                 USB_WAKEUP_GPIO, (unsigned)rtc_data.deep_sleep_count);
     } else if (g_wakeup_cause == SLEEP_WAKEUP_NONE) {
         SYS_LOGI(TAG, "Normal boot (boot_count=%u)", (unsigned)rtc_data.boot_count);
     } else {
@@ -581,17 +591,26 @@ static void sleep_decision_task(void *pvParameters)
             }
         }
 
-        /* Check BLE connection directly via NimBLE */
+        /* Check BLE connection directly via NimBLE (for diagnostics only) */
         int ble_count = 0;
-        for (uint16_t h = 0; h < 2; h++) {
+        for (uint16_t h = 0; h < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; h++) {
             struct ble_gap_conn_desc d;
             if (ble_gap_conn_find(h, &d) == 0) {
                 ble_count++;
             }
         }
 
+        /* Warn on mismatch between NimBLE query and callback-maintained cache.
+         * Trust is_ble_connected() (which checks cache first) for the actual
+         * decision — the callback count is more reliable than ble_gap_conn_find
+         * which can miss handles outside the [0, MAX) range after reconnects. */
+        if (ble_count != g_ble_conn_count) {
+            SYS_LOGW(TAG, "BLE count mismatch: nimble=%d cache=%d — trusting cache",
+                     ble_count, g_ble_conn_count);
+        }
+
         /* === BLE connected or TT on → reset deep sleep counter, check light sleep === */
-        if (ble_count > 0 || g_tt_powered) {
+        if (is_ble_connected() || g_tt_powered) {
             g_deep_sleep_idle_sec = 0;
 
             /* Skip light sleep if TT is initializing */
@@ -638,8 +657,17 @@ static void sleep_decision_task(void *pvParameters)
         }
 
         if (g_deep_sleep_idle_sec >= SLEEP_DEEP_IDLE_SEC) {
-            SYS_LOGI(TAG, "Entering DEEP_SLEEP / shutdown (ble=%d, tt=%d, idle=%ds)",
-                     ble_count, g_tt_powered, g_deep_sleep_idle_sec);
+            /* Final safety check: never enter deep sleep with BLE connected.
+             * is_ble_connected() checks the callback-maintained cache first. */
+            if (is_ble_connected()) {
+                SYS_LOGW(TAG, "Deep sleep aborted: BLE still connected (cache=%d)",
+                         g_ble_conn_count);
+                g_deep_sleep_idle_sec = 0;
+                continue;
+            }
+
+            SYS_LOGI(TAG, "Entering DEEP_SLEEP / shutdown (ble_nimble=%d, ble_cache=%d, tt=%d, idle=%ds)",
+                     ble_count, g_ble_conn_count, g_tt_powered, g_deep_sleep_idle_sec);
 
             enter_deep_sleep_internal();
             /* Does not return */
@@ -689,15 +717,42 @@ static void configure_gpio_for_deep_sleep(void)
      * GPIO21 (BB_WAKEUP_AP) IS an RTC GPIO — use rtc_gpio functions for wakeup.
      */
 
-    /* TT module power: ensure OFF and hold state during deep sleep */
+    /* TT module power + boost state based on TT state AND battery voltage.
+     * Note: GPIO1 = GPIO_TTPWR_EN = BOOST_PWR_EN_GPIO (same pin, active LOW) */
 #ifdef SUPPORT_HARDWARE_V2
-    /* V2: GPIO1/GPIO36 managed by boost manager, prepare for deep sleep */
-    power_manage_boost_deep_sleep_prepare();
-    /* V2: GPIO38 LDO off and hold */
-    gpio_set_level(GPIO_TT_LDO_EN, 0);
+    bool bat_low = (rtc_data.last_battery_mv > 0 && rtc_data.last_battery_mv < 3400);
+
+    if (g_tt_powered) {
+        /* TT ON: boost ON + normal mode + LDO ON */
+        SYS_LOGI(TAG, "Deep sleep: TT ON (bat=%umV) — boost+LDO held ON",
+                 rtc_data.last_battery_mv);
+        gpio_set_level(BOOST_PWR_MODE_GPIO, 1);   /* Normal mode */
+        gpio_set_level(GPIO_TT_LDO_EN, 1);        /* LDO ON */
+        gpio_set_level(GPIO_TTPWR_EN, 0);         /* GPIO1 LOW = boost ON + TT power ON */
+    } else if (bat_low) {
+        /* TT OFF but battery LOW: boost ON normal mode to keep MCU alive,
+         * LDO OFF to cut TT module */
+        SYS_LOGI(TAG, "Deep sleep: TT OFF + low bat (%umV) — boost ON normal, LDO OFF",
+                 rtc_data.last_battery_mv);
+        gpio_set_level(BOOST_PWR_MODE_GPIO, 1);   /* Normal mode */
+        gpio_set_level(GPIO_TT_LDO_EN, 0);        /* LDO OFF */
+        gpio_set_level(GPIO_TTPWR_EN, 0);         /* GPIO1 LOW = boost ON */
+    } else {
+        /* TT OFF + battery OK: everything OFF */
+        SYS_LOGI(TAG, "Deep sleep: TT OFF (bat=%umV) — all power OFF",
+                 rtc_data.last_battery_mv);
+        gpio_set_level(GPIO_TT_LDO_EN, 0);        /* LDO OFF */
+        gpio_set_level(BOOST_PWR_MODE_GPIO, 0);   /* Low-power mode */
+        gpio_set_level(GPIO_TTPWR_EN, 1);         /* GPIO1 HIGH = boost OFF */
+    }
+    gpio_hold_en(BOOST_PWR_EN_GPIO);
+    gpio_hold_en(BOOST_PWR_MODE_GPIO);
+    gpio_hold_en(GPIO_TTPWR_EN);
     gpio_hold_en(GPIO_TT_LDO_EN);
+    /* IP5561 I2C pins high-Z + KEY held LOW */
+    power_manage_ip5561_deep_sleep_prepare();
 #else
-    gpio_set_level(GPIO_TTPWR_EN, 0);
+    gpio_set_level(GPIO_TTPWR_EN, TT_PWR_OFF_LEVEL);
     gpio_hold_en(GPIO_TTPWR_EN);
 #endif
 
@@ -715,6 +770,12 @@ static void configure_gpio_for_deep_sleep(void)
     rtc_gpio_pullup_en(GPIO_PWRKEY);
     rtc_gpio_pulldown_dis(GPIO_PWRKEY);
 #endif
+
+    /* GPIO5 (IP5561 INT): pull-down ensures defined LOW during deep sleep when
+     * IP5561 is not driving INT. When USB is inserted, IP5561 drives INT HIGH
+     * (strong push-pull), overriding the weak RTC pull-down → ext0 wakes MCU. */
+    rtc_gpio_pullup_dis(USB_WAKEUP_GPIO);
+    rtc_gpio_pulldown_en(USB_WAKEUP_GPIO);
 
     /* Hold GPIO states during deep sleep */
     gpio_deep_sleep_hold_en();
@@ -752,8 +813,11 @@ static void enter_deep_sleep_internal(void)
      * Deep sleep resets the chip, so graceful task cleanup is unnecessary.
      */
 
-    /* Ensure TT module is fully off */
-    if (tt_module_is_powered()) {
+    /* TT module: power off only if it was already off intent.
+     * If TT is ON, keep it powered — configure_gpio_for_deep_sleep() will
+     * hold boost+LDO+TTPWR in ON state for the duration of deep sleep. */
+    if (!g_tt_powered && tt_module_is_powered()) {
+        SYS_LOGI(TAG, "Deep sleep: TT was not intended ON, powering off");
         tt_module_user_power_off();
     }
 
@@ -778,6 +842,22 @@ static void enter_deep_sleep_internal(void)
         }
         if (ext1_pin_mask) {
             esp_sleep_enable_ext1_wakeup(ext1_pin_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+        }
+    }
+
+    /*
+     * ext0 wakeup: USB insertion detection via IP5561 INT (GPIO5).
+     * IP5561 drives GPIO5 HIGH when VBUS/USB activates it.
+     * Only enable when GPIO5 is currently LOW (no USB); if already HIGH,
+     * USB is already connected and enabling ext0 would fire immediately.
+     */
+    {
+        int int_level = gpio_get_level(USB_WAKEUP_GPIO);
+        if (int_level == 0) {
+            esp_sleep_enable_ext0_wakeup(USB_WAKEUP_GPIO, 1);  /* Wake on HIGH */
+            SYS_LOGI(TAG, "ext0 wakeup armed: GPIO%d (IP5561 INT) → USB insert", USB_WAKEUP_GPIO);
+        } else {
+            SYS_LOGI(TAG, "GPIO%d already HIGH (USB present), ext0 wakeup skipped", USB_WAKEUP_GPIO);
         }
     }
 

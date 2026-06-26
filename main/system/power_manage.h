@@ -191,6 +191,26 @@ void power_manage_get_sensor_data(uint8_t *flags,
 void power_manage_set_sensor_report(bool enable);
 bool power_manage_is_sensor_report_enabled(void);
 
+/* ========== Battery Event Report ========== */
+
+/**
+ * @brief Enable battery event notifications
+ *
+ * When enabled, the power monitor task checks every 10 seconds for:
+ * - SOC change >= threshold → push event
+ * - Charging start/stop/full → push event
+ * - Temperature high/low → push event (with hysteresis)
+ *
+ * @param flags        Event subscription bitmask (BATTERY_REPORT_FLAG_*)
+ * @param soc_threshold SOC change threshold in percent (1-100)
+ */
+void power_manage_set_battery_report(uint8_t flags, uint8_t soc_threshold);
+
+/**
+ * @brief Disable battery event notifications
+ */
+void power_manage_disable_battery_report(void);
+
 /* ========== PowerBank API (IP5561) ========== */
 
 /**
@@ -340,17 +360,29 @@ bool power_manage_is_wpc_present(void);
  */
 bool power_manage_is_wpc_charging(void);
 
+/* ========== IP5561 Control API ========== */
+
 /**
- * @brief Print IP5561 diagnostic information
+ * @brief IP5561 long press wakeup (2s KEY pulse)
  *
- * This function reads and prints all key IP5561 registers for debugging
- * charging issues. Uses syslog interface for structured logging.
- *
- * @return
- *     - ESP_OK if successful
- *     - ESP_ERR_INVALID_ARG if IP5561 not initialized
+ * Wakes IP5561 from deep shutdown. Required for battery-only operation.
  */
-esp_err_t power_manage_ip5561_print_diagnostics(void);
+void power_manage_ip5561_long_wakeup(void);
+
+/**
+ * @brief IP5561 double-click shutdown (simulate two short KEY presses)
+ *
+ * Triggers IP5561 power-off by simulating a physical double-click on KEY.
+ */
+void power_manage_ip5561_double_click_shutdown(void);
+
+/**
+ * @brief Enable/disable IP5561 VBUS boost output
+ *
+ * @param enable true to enable VBUS output, false to disable
+ * @return ESP_OK on success
+ */
+esp_err_t power_manage_ip5561_set_vbus_output(bool enable);
 
 /* ========== Battery SOC Calibration API ========== */
 
@@ -438,6 +470,14 @@ bool power_manage_boost_is_active(void);
  * @brief Prepare boost GPIOs for deep sleep (turn off + hold state)
  */
 void power_manage_boost_deep_sleep_prepare(void);
+
+/**
+ * @brief Prepare IP5561 GPIOs for deep sleep
+ *
+ * Resets I2C1 SDA/SCL (GPIO6/GPIO14) to high-Z and holds KEY (GPIO8) LOW.
+ * Called from sleep_manager before entering deep sleep.
+ */
+void power_manage_ip5561_deep_sleep_prepare(void);
 
 #endif /* SUPPORT_HARDWARE_V2 */
 

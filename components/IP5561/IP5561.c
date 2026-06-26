@@ -211,15 +211,40 @@ ip5561_handle_t ip5561_create(const ip5561_config_t *config)
     ret = i2c_master_bus_add_device(config->i2c_bus, &dev_stat_config, &handle->i2c_stat_handle);
     ESP_GOTO_ON_ERROR(ret, err, TAG, "Failed to add I2C status device (0xEA)");
 
-    // Verify device communication by reading SYS_CTL0 register (uses 0xE8)
-    uint8_t sys_ctl0 = 0;
-    ret = ip5561_i2c_read_ctrl((ip5561_handle_t)handle, IP55XX_SYS_CTL0, &sys_ctl0);
-    ESP_GOTO_ON_ERROR(ret, err, TAG, "Failed to communicate with device (0xE8)");
+    // Verify device communication: try 0xE8 (ctrl) first, then 0xEA (stat)
+    uint8_t reg_val = 0;
+    bool probe_ok = false;
+
+    // Try 0xE8 address: read SYS_CTL0 (reg 0x00)
+    ret = ip5561_i2c_read_ctrl((ip5561_handle_t)handle, IP55XX_SYS_CTL0, &reg_val);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Probe 0xE8 OK  SYS_CTL0: 0x%02X", reg_val);
+        probe_ok = true;
+    }
+    else {
+        ESP_LOGW(TAG, "Probe 0xE8 failed: %s", esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    // If 0xE8 failed, try 0xEA address: read reg 0x50
+    if (!probe_ok) {
+        ret = ip5561_i2c_read_stat((ip5561_handle_t)handle, 0x50, &reg_val);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Probe 0xEA OK , reg 0x50: 0x%02X", reg_val);
+            probe_ok = true;
+        }
+        else  {
+            ESP_LOGW(TAG, "Probe 0xEA failed: %s", esp_err_to_name(ret));
+        }
+    }
+
+    if (!probe_ok) {
+        ESP_LOGE(TAG, "Failed to communicate on both 0xE8 and 0xEA");
+        goto err;
+    }
 
     ESP_LOGI(TAG, "IP5561 initialized successfully");
-    ESP_LOGI(TAG, "  SYS_CTL0 (0xE8): 0x%02X", sys_ctl0);
     ESP_LOGI(TAG, "  Dual I2C addresses: 0xE8 (ctrl), 0xEA (stat)");
-
 
     return (ip5561_handle_t)handle;
 
