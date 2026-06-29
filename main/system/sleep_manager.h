@@ -35,7 +35,7 @@ typedef enum {
 
 /* ========== Configuration Constants ========== */
 
-#define SLEEP_LIGHT_IDLE_SEC        600     /* First entry: idle before light sleep */
+#define SLEEP_LIGHT_IDLE_SEC        60      /* First entry: idle before light sleep (60s) */
 #define SLEEP_LIGHT_REENTER_SEC     2       /* Re-entry: quick re-sleep after wake */
 #ifdef SUPPORT_HARDWARE_V2
 #define SLEEP_DEEP_IDLE_SEC         120     /* V2.0: BLE disconnected, idle before deep sleep (2 min) */
@@ -77,6 +77,14 @@ sleep_mode_t sleep_manager_get_mode(void);
  * Call from: BLE data received, AT commands, voice call events
  */
 void sleep_manager_notify_activity(const char *source);
+
+/**
+ * @brief Lightweight idle refresh (no logging, for high-frequency calls)
+ *
+ * Call from voice data path to keep device awake during calls
+ * without flooding logs. Just updates the timestamp.
+ */
+void sleep_manager_refresh_idle(void);
 
 /**
  * @brief Notify that a BLE client has connected

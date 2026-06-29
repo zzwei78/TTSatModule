@@ -23,6 +23,7 @@
 #include "system/syslog.h"
 #include "sim/sat_call_sim.h"
 #include "tt/tt_module.h"
+#include "system/sleep_manager.h"
 
 /* GATT Voice Loopback Test Mode */
 // #define CONFIG_VOICE_GATT_LOOPBACK  // Uncomment to enable GATT loopback test
@@ -99,6 +100,9 @@ static void spp_voice_output_callback(const uint8_t *data, size_t len, void *use
     if (data == NULL || len == 0) {
         return;
     }
+
+    /* Refresh idle timer — keeps device awake while voice data is flowing */
+    sleep_manager_refresh_idle();
 
     // Check if voice service is enabled
     if (!g_voice_server.enabled) {
@@ -286,6 +290,9 @@ static int spp_voice_service_handler(uint16_t conn_handle, uint16_t attr_handle,
     case BLE_GATT_ACCESS_OP_WRITE_CHR:
         {
             uint16_t data_len = ctxt->om->om_len;
+
+            /* Refresh idle timer on downlink voice data */
+            sleep_manager_refresh_idle();
 
             SYS_LOGD_MODULE(SYS_LOG_MODULE_VOICE_PACKET, TAG, "[DL] BLE -> decode queue: %d bytes", data_len);
 

@@ -9,6 +9,7 @@
  */
 
 #include <string.h>
+#include <stdio.h>
 #include "system/sleep_manager.h"
 #include "esp_sleep.h"
 #include "esp_log.h"
@@ -27,12 +28,24 @@
 #include "audio/audiosvc.h"
 #include "config/user_params.h"
 #include "system/ble_monitor.h"
+#include "ble/ble_gatt_server.h"
+#include "ble/spp_voice_server.h"
 
 static const char *TAG = "SLEEP_MGR";
 
 /* GPIO5 = IP5561 INT pin. Driven HIGH by IP5561 when USB/VBUS activates it.
  * Used as ext0 deep sleep wakeup source for USB insertion detection. */
 #define USB_WAKEUP_GPIO    GPIO_NUM_5
+
+/* ========== Auto收网 (No Network → Power Off TT) ========== */
+#define TT_NO_NET_CHECK_SEC        60    /* Query CREG every 60s */
+#define TT_NO_NET_TIMEOUT_SEC      600   /* 10 min → auto power off TT */
+
+/* ========== Pwrkey Monitor (V2 only) ========== */
+#define PWRKEY_POLL_MS             20    /* Poll interval */
+#define PWRKEY_DEBOUNCE_MS         50    /* Min press to register (debounce) */
+#define PWRKEY_SHORT_THRESHOLD_MS  2000  /* < 2s = short press */
+#define PWRKEY_LONG_THRESHOLD_MS   5000  /* ≥ 5s while held = force deep sleep */
 
 /* ========== RTC Data (survives deep sleep) ========== */
 
@@ -89,6 +102,8 @@ static volatile bool g_ble_advertising = false;
 /* Task */
 static TaskHandle_t g_sleep_task_handle = NULL;
 static volatile bool g_sleep_task_running = false;
+static TaskHandle_t g_pwrkey_task_handle = NULL;
+static volatile bool g_pwrkey_task_running = false;
 
 /* TEMP_AWAKE timer */
 static TimerHandle_t g_temp_awake_timer = NULL;
@@ -98,6 +113,11 @@ static int32_t g_deep_sleep_idle_sec = 0;
 
 /* Track if we just woke from light sleep (for quick re-entry) */
 static bool g_just_woke_from_light_sleep = false;
+
+/* Auto收网: TT no-network duration tracking */
+static uint32_t g_tt_no_net_sec = 0;      /* Seconds since last network registration */
+static int g_tt_net_check_cnt = 0;        /* Counter for periodic CREG check */
+static bool g_tt_was_registered = true;   /* Last known registration state (for change logging) */
 
 /* Deferred init flag to prevent double-init */
 static volatile bool g_deferred_init_done = false;
@@ -109,6 +129,7 @@ static void enter_deep_sleep_internal(void);
 static void configure_gpio_for_deep_sleep(void);
 static void temp_awake_timer_callback(TimerHandle_t xTimer);
 static void deferred_full_init_task(void *pvParameters);
+static void pwrkey_init_and_start(void);
 
 /**
  * @brief Calculate CRC-16-CCITT checksum
@@ -315,6 +336,9 @@ esp_err_t sleep_manager_init(void)
     g_tt_powered = tt_module_is_powered();
     g_ble_conn_count = 0;  /* Will be tracked by notify functions */
 
+    /* Start pwrkey monitor (V2 only, runs from boot) */
+    pwrkey_init_and_start();
+
     g_initialized = true;
     return ESP_OK;
 }
@@ -405,6 +429,12 @@ void sleep_manager_notify_activity(const char *source)
     SYS_LOGI(TAG, "Activity [%s] (prev=%ds ago)", source ? source : "?", elapsed);
 }
 
+void sleep_manager_refresh_idle(void)
+{
+    g_last_activity_time = esp_timer_get_time();
+    g_just_woke_from_light_sleep = false;
+}
+
 void sleep_manager_notify_ble_connected(void)
 {
     g_ble_conn_count++;
@@ -462,6 +492,9 @@ void sleep_manager_notify_tt_powered_on(void)
     g_tt_powered = true;
     g_last_activity_time = esp_timer_get_time();
     g_deep_sleep_idle_sec = 0;  /* Reset deep sleep counter */
+    g_tt_no_net_sec = 0;        /* Reset auto收网 counter */
+    g_tt_net_check_cnt = 0;
+    g_tt_was_registered = true;
     SYS_LOGI(TAG, "TT module powered ON");
 }
 
@@ -469,6 +502,8 @@ void sleep_manager_notify_tt_powered_off(void)
 {
     g_tt_powered = false;
     g_last_activity_time = esp_timer_get_time();
+    g_tt_no_net_sec = 0;        /* Reset auto收网 counter */
+    g_tt_net_check_cnt = 0;
     SYS_LOGI(TAG, "TT module powered OFF");
 }
 
@@ -613,8 +648,78 @@ static void sleep_decision_task(void *pvParameters)
         if (is_ble_connected() || g_tt_powered) {
             g_deep_sleep_idle_sec = 0;
 
+            /* --- Auto收网: periodically check TT network registration --- */
+            if (g_tt_powered && tt_module_get_state() == TT_STATE_WORKING) {
+                if (++g_tt_net_check_cnt >= TT_NO_NET_CHECK_SEC) {
+                    g_tt_net_check_cnt = 0;
+
+                    char creg_resp[128] = {0};
+                    tt_at_result_t at_ret = tt_module_send_at_cmd_wait(
+                        "AT+CREG?", creg_resp, sizeof(creg_resp), 3000);
+
+                    bool registered = false;
+                    if (at_ret == TT_AT_RESULT_OK) {
+                        /* Parse +CREG: <n>,<stat> — stat 1=home, 5=roaming = registered */
+                        char *p = strstr(creg_resp, "+CREG:");
+                        if (p) {
+                            int n_val = 0, stat = 0;
+                            if (sscanf(p, "+CREG: %d,%d", &n_val, &stat) == 2) {
+                                registered = (stat == 1 || stat == 5);
+                            }
+                        }
+                    }
+
+                    if (registered) {
+                        if (!g_tt_was_registered) {
+                            SYS_LOGI(TAG, "[Auto收网] Network registered, counter reset");
+                        }
+                        g_tt_no_net_sec = 0;
+                        g_tt_was_registered = true;
+                    } else {
+                        g_tt_no_net_sec += TT_NO_NET_CHECK_SEC;
+                        g_tt_was_registered = false;
+                        /* Progress log every 5 min */
+                        if (g_tt_no_net_sec % 300 == 0) {
+                            SYS_LOGW(TAG, "[Auto收网] No network for %u/%u sec",
+                                     g_tt_no_net_sec, TT_NO_NET_TIMEOUT_SEC);
+                        }
+                    }
+
+                    /* Timeout: auto power off TT */
+                    if (g_tt_no_net_sec >= TT_NO_NET_TIMEOUT_SEC) {
+                        /* Safety: don't auto-off if user force-on or call active */
+                        extern bool tt_module_is_force_on(void);
+                        if (tt_module_is_force_on()) {
+                            SYS_LOGW(TAG, "[Auto收网] Force-on active, skipping");
+                            g_tt_no_net_sec = 0;
+                            continue;
+                        }
+                        if (spp_voice_server_is_call_active()) {
+                            SYS_LOGW(TAG, "[Auto收网] Call active, skipping");
+                            g_tt_no_net_sec = 0;
+                            continue;
+                        }
+
+                        SYS_LOGW(TAG, "[Auto收网] No network %us, powering off TT",
+                                 g_tt_no_net_sec);
+                        /* Network timeout shutdown: same hardware power-off as
+                         * user_power_off but does NOT set NVS manual_off flag,
+                         * allowing TT to auto-restart on next TEMP_AWAKE. */
+                        tt_module_network_timeout_off();
+                        /* notify_tt_powered_off already called by tt_module */
+                        g_tt_no_net_sec = 0;
+                        continue;  /* Re-evaluate state next iteration */
+                    }
+                }
+            }
+
             /* Skip light sleep if TT is initializing */
             if (g_tt_powered && tt_module_get_state() == TT_STATE_INITIALIZING) {
+                continue;
+            }
+
+            /* Never enter light sleep during an active voice call */
+            if (spp_voice_server_is_call_active()) {
                 continue;
             }
 
@@ -688,6 +793,9 @@ static void enter_light_sleep(void)
     /* Tell BB "AP is sleeping" — BB will pull GPIO21 LOW if it needs us */
     gpio_set_level(AP_WAKEUP_BB_PIN, 1);
 
+    /* Switch to powersave connection params (500ms-1s) to save ~10x BLE power */
+    ble_gatt_server_request_powersave();
+
     /* Configure wakeup sources */
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     esp_sleep_enable_bt_wakeup();
@@ -702,6 +810,9 @@ static void enter_light_sleep(void)
     esp_light_sleep_start();
 
     /* === Code continues here after wakeup === */
+
+    /* Restore normal connection params (30-50ms) for responsive communication */
+    ble_gatt_server_request_normal();
 
     /* Tell BB "AP is awake" */
     gpio_set_level(AP_WAKEUP_BB_PIN, 0);
@@ -779,6 +890,120 @@ static void configure_gpio_for_deep_sleep(void)
 
     /* Hold GPIO states during deep sleep */
     gpio_deep_sleep_hold_en();
+}
+
+/* ========== Pwrkey Monitor Task (V2 only) ========== */
+
+/* ISR: notify task on falling edge (button press). Minimal — just wake the task. */
+static void IRAM_ATTR pwrkey_isr_handler(void *arg)
+{
+    (void)arg;
+    BaseType_t hpw = pdFALSE;
+    if (g_pwrkey_task_handle != NULL) {
+        vTaskNotifyGiveFromISR(g_pwrkey_task_handle, &hpw);
+    }
+    if (hpw) portYIELD_FROM_ISR();
+}
+
+static void pwrkey_monitor_task(void *pvParameters)
+{
+    SYS_LOGI(TAG, "Pwrkey monitor started (GPIO%d, interrupt-driven)", GPIO_PWRKEY);
+
+    while (g_pwrkey_task_running) {
+        /* Block until ISR signals a press (zero CPU when idle) */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (!g_pwrkey_task_running) break;
+
+        int64_t press_start_us = esp_timer_get_time();
+        bool very_long_triggered = false;
+
+        /* Poll only during press — check for release or 5s threshold */
+        while (g_pwrkey_task_running) {
+            vTaskDelay(pdMS_TO_TICKS(PWRKEY_POLL_MS));
+
+            bool pressed = !gpio_get_level(GPIO_PWRKEY);  /* Active LOW */
+            int64_t held_ms = (esp_timer_get_time() - press_start_us) / 1000;
+
+            if (!pressed) {
+                /* === Released === */
+                if (held_ms < PWRKEY_DEBOUNCE_MS) {
+                    /* Debounce — ignore */
+                } else if (held_ms >= PWRKEY_SHORT_THRESHOLD_MS) {
+                    /* Long press 2-5s: toggle TT power */
+                    if (tt_module_is_powered()) {
+                        SYS_LOGI(TAG, "Pwrkey long (%lldms) -> TT off", held_ms);
+                        tt_module_user_power_off();
+                    } else {
+                        SYS_LOGI(TAG, "Pwrkey long (%lldms) -> TT on", held_ms);
+                        tt_module_user_power_on();
+                    }
+                } else {
+                    /* Short press < 2s: activity refresh */
+                    SYS_LOGI(TAG, "Pwrkey short (%lldms) -> activity", held_ms);
+                    sleep_manager_notify_activity("pwrkey");
+                }
+                break;
+            }
+
+            /* Still holding — check very long (5s) */
+            if (!very_long_triggered && held_ms >= PWRKEY_LONG_THRESHOLD_MS) {
+                very_long_triggered = true;
+                SYS_LOGW(TAG, "Pwrkey held %lldms -> force deep sleep", held_ms);
+
+                if (tt_module_is_powered()) {
+                    SYS_LOGI(TAG, "Force sleep: powering off TT first");
+                    tt_module_user_power_off();
+                }
+                sleep_manager_enter_deep_sleep();
+                /* Does not return */
+            }
+        }
+    }
+
+    SYS_LOGI(TAG, "Pwrkey monitor stopped");
+    g_pwrkey_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void pwrkey_init_and_start(void)
+{
+#ifdef SUPPORT_HARDWARE_V2
+    /* Configure GPIO9 (pwrkey): input + pull-up + falling edge interrupt */
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << GPIO_PWRKEY),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    if (gpio_config(&io_conf) != ESP_OK) {
+        SYS_LOGE(TAG, "Failed to configure pwrkey GPIO");
+        return;
+    }
+
+    /* Install GPIO ISR service (ignore error if already installed by another driver) */
+    esp_err_t isr_ret = gpio_install_isr_service(0);
+    if (isr_ret != ESP_OK && isr_ret != ESP_ERR_INVALID_STATE) {
+        SYS_LOGE(TAG, "Failed to install ISR service: %s", esp_err_to_name(isr_ret));
+        return;
+    }
+
+    /* Attach ISR handler */
+    if (gpio_isr_handler_add(GPIO_PWRKEY, pwrkey_isr_handler, NULL) != ESP_OK) {
+        SYS_LOGE(TAG, "Failed to add pwrkey ISR handler");
+        return;
+    }
+
+    /* Create monitor task */
+    g_pwrkey_task_running = true;
+    BaseType_t ret = xTaskCreate(
+        pwrkey_monitor_task, "pwrkey_mon", 4096, NULL, 4, &g_pwrkey_task_handle);
+
+    if (ret != pdPASS) {
+        SYS_LOGE(TAG, "Failed to create pwrkey monitor task");
+        g_pwrkey_task_running = false;
+    }
+#endif
 }
 
 static void enter_deep_sleep_internal(void)

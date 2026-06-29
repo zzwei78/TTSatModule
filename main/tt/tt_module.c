@@ -85,6 +85,27 @@ static tt_at_result_t tt_module_send_at_cmd_local(const char *cmd, char *respons
 static tt_at_result_t tt_module_send_at_cmd_gatt_internal(const char *cmd, uint16_t conn_handle);
 static void set_tt_state(tt_state_t new_state);
 
+/* Power lifecycle lock: lazily-created mutex, never deleted.
+ * Serializes user_power_on / user_power_off / network_timeout_off /
+ * low_battery_shutdown to prevent concurrent power state changes. */
+static SemaphoreHandle_t g_power_mutex = NULL;
+
+static bool acquire_power_lock(uint32_t timeout_ms)
+{
+    if (g_power_mutex == NULL) {
+        g_power_mutex = xSemaphoreCreateMutex();
+        if (g_power_mutex == NULL) return false;
+    }
+    return xSemaphoreTake(g_power_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static void release_power_lock(void)
+{
+    if (g_power_mutex != NULL) {
+        xSemaphoreGive(g_power_mutex);
+    }
+}
+
 /* Global variables for UART AT Port */
 static bool g_simst_detected = false;
 static bool g_tt_module_ready = false;  // TT module ready (^SIMST: detected)
@@ -2520,30 +2541,39 @@ esp_err_t tt_module_user_power_on(void)
         return ret;
     }
 
-    // Step 3: Check if already powered
+    // Step 3: Acquire power lock (prevents concurrent power on/off)
+    if (!acquire_power_lock(5000)) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "user_power_on: power lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // Step 4: Check if already powered (inside lock for atomicity)
     if (g_tt_module_powered) {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "TT module already powered");
+        release_power_lock();
         return ESP_OK;
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module User Power On ===");
 
-    // Step 4: Initialize (create queues, semaphores, etc.) - same as full_startup
+    // Step 5: Initialize (create queues, semaphores, etc.) - same as full_startup
     ret = tt_module_init(10);
     if (ret != ESP_OK) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to init TT module: %s", esp_err_to_name(ret));
+        release_power_lock();
         return ESP_FAIL;
     }
 
-    // Step 5: Start communication (includes power on) - same as full_startup
+    // Step 6: Start communication (includes power on) - same as full_startup
     ret = tt_module_start();
     if (ret != ESP_OK) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to start TT module: %s", esp_err_to_name(ret));
         tt_module_deinit();
+        release_power_lock();
         return ESP_FAIL;
     }
 
-    // Step 6: Update power flag
+    // Step 7: Update power flag
     // State remains INITIALIZING (set by tt_module_start), will become WORKING after MUX init completes
     g_tt_module_powered = true;
 
@@ -2554,6 +2584,7 @@ esp_err_t tt_module_user_power_on(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module User Power On Complete (battery: %umV%s) ===",
         voltage_read_ok ? voltage_mv : 0, voltage_read_ok ? "" : " (unread)");
 
+    release_power_lock();
     return ESP_OK;
 }
 
@@ -2566,34 +2597,42 @@ esp_err_t tt_module_user_power_off(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Step 2: Check if already powered off
+    // Step 2: Acquire power lock
+    if (!acquire_power_lock(5000)) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "user_power_off: power lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // Step 3: Check if already powered off (inside lock)
     if (!g_tt_module_powered) {
         SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "TT module already powered off");
+        release_power_lock();
         return ESP_OK;
     }
 
-    // Step 3: Set NVS user manual off flag (before shutdown)
+    // Step 4: Set NVS user manual off flag (before shutdown)
     esp_err_t ret = user_params_set_tt_manual_off(true);
     if (ret != ESP_OK) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Failed to set user manual off flag: %s", esp_err_to_name(ret));
+        release_power_lock();
         return ret;
     }
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module User Power Off ===");
 
-    // Step 4: Stop communication (includes power off) - same as full_shutdown
+    // Step 5: Stop communication (includes power off) - same as full_shutdown
     tt_module_stop();
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "[1/3] Communication stopped");
 
-    // Step 5: Cleanup state - same as full_shutdown
+    // Step 6: Cleanup state - same as full_shutdown
     tt_module_cleanup();
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "[2/3] State cleaned");
 
-    // Step 6: Deinitialize - same as full_shutdown
+    // Step 7: Deinitialize - same as full_shutdown
     tt_module_deinit();
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "[3/3] Module deinitialized");
 
-    // Step 7: Clear power flag and ensure final state
+    // Step 8: Clear power flag and ensure final state
     g_tt_module_powered = false;
     set_tt_state(TT_STATE_USER_OFF);  // Ensure final state is USER_OFF
 
@@ -2603,6 +2642,44 @@ esp_err_t tt_module_user_power_off(void)
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module User Power Off Complete ===");
 
+    release_power_lock();
+    return ESP_OK;
+}
+
+esp_err_t tt_module_network_timeout_off(void)
+{
+    if (!acquire_power_lock(5000)) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "network_timeout_off: power lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (!g_tt_module_powered) {
+        release_power_lock();
+        return ESP_OK;
+    }
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== TT Module Network Timeout Off ===");
+
+    /* Same shutdown sequence as user_power_off, but NO NVS manual_off flag.
+     * This allows TT to auto-restart on next TEMP_AWAKE for network retry. */
+    tt_module_stop();
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "[1/3] Communication stopped");
+
+    tt_module_cleanup();
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "[2/3] State cleaned");
+
+    tt_module_deinit();
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "[3/3] Module deinitialized");
+
+    g_tt_module_powered = false;
+    set_tt_state(TT_STATE_USER_OFF);
+
+    extern void sleep_manager_notify_tt_powered_off(void);
+    sleep_manager_notify_tt_powered_off();
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "=== Network Timeout Off Complete ===");
+
+    release_power_lock();
     return ESP_OK;
 }
 
@@ -2619,8 +2696,14 @@ esp_err_t tt_module_low_battery_shutdown(void)
         return ESP_OK;
     }
 
-    // Only shut down if currently powered
+    if (!acquire_power_lock(5000)) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "low_battery_shutdown: power lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // Only shut down if currently powered (inside lock)
     if (!g_tt_module_powered) {
+        release_power_lock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2636,6 +2719,7 @@ esp_err_t tt_module_low_battery_shutdown(void)
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Low battery shutdown failed: %s", esp_err_to_name(ret));
     }
 
+    release_power_lock();
     return ret;
 }
 
@@ -2671,6 +2755,11 @@ esp_err_t tt_module_force_on(void)
     // LOW_BATTERY_OFF / USER_OFF / HARDWARE_FAULT → full restart
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: restarting from state %d", state);
 
+    if (!acquire_power_lock(3000)) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "force_on: power lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
     // Clean up current state first (if powered)
     if (g_tt_module_powered) {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: shutting down current instance...");
@@ -2696,6 +2785,7 @@ esp_err_t tt_module_force_on(void)
         g_tt_force_on = false;
     }
 
+    release_power_lock();
     return ret;
 }
 

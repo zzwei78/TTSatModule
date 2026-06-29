@@ -624,7 +624,9 @@ esp_err_t cw2217e_get_battery_status(cw2217e_handle_t handle, battery_status_t *
     memset(battery_status, 0, sizeof(battery_status_t));
 
     int16_t current = cw2217e_get_current(handle);
-    battery_status->DSG = (current > 0);     /* Discharging */
+    /* CW2217E native: positive = charging, negative = discharging.
+     * DSG flag: 1 = discharging, 0 = charging/idle. */
+    battery_status->DSG = (current < 0);      /* Discharging when current is negative */
     battery_status->BATTPRES = true;          /* Battery always present */
 
     return ESP_OK;

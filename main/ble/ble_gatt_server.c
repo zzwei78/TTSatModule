@@ -963,6 +963,55 @@ const char *ble_device_name_get(void)
     return s_ble_device_name;
 }
 
+// ============================================================
+// BLE Connection Interval Management
+// ============================================================
+
+int ble_gatt_server_request_powersave(void)
+{
+    uint16_t conn_handle = ble_conn_manager_get_primary_handle();
+    if (conn_handle == 0) {
+        return BLE_HS_ENOTCONN;
+    }
+
+    struct ble_gap_upd_params params = {
+        .itvl_min = BLE_POWERSAVE_CONN_ITVL_MIN,
+        .itvl_max = BLE_POWERSAVE_CONN_ITVL_MAX,
+        .latency = BLE_POWERSAVE_CONN_LATENCY,
+        .supervision_timeout = BLE_POWERSAVE_SUPER_TIMEOUT,
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+
+    int rc = ble_gap_update_params(conn_handle, &params);
+    MODLOG_DFLT(INFO, "Powersave params requested: itvl=%d-%d latency=%d rc=%d\n",
+                BLE_POWERSAVE_CONN_ITVL_MIN, BLE_POWERSAVE_CONN_ITVL_MAX,
+                BLE_POWERSAVE_CONN_LATENCY, rc);
+    return rc;
+}
+
+int ble_gatt_server_request_normal(void)
+{
+    uint16_t conn_handle = ble_conn_manager_get_primary_handle();
+    if (conn_handle == 0) {
+        return BLE_HS_ENOTCONN;
+    }
+
+    struct ble_gap_upd_params params = {
+        .itvl_min = BLE_DEFAULT_CONN_ITVL_MIN,
+        .itvl_max = BLE_DEFAULT_CONN_ITVL_MAX,
+        .latency = BLE_CONN_LATENCY_NONE,
+        .supervision_timeout = BLE_SUPERVISION_TIMEOUT_400,
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+
+    int rc = ble_gap_update_params(conn_handle, &params);
+    MODLOG_DFLT(INFO, "Normal params requested: itvl=%d-%d latency=0 rc=%d\n",
+                BLE_DEFAULT_CONN_ITVL_MIN, BLE_DEFAULT_CONN_ITVL_MAX, rc);
+    return rc;
+}
+
 int ble_gatt_server_init(void)
 {
     esp_err_t ret;

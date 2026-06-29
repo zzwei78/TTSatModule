@@ -33,6 +33,14 @@
 #define BLE_CONN_LATENCY_NONE        0
 #define BLE_SUPERVISION_TIMEOUT_400  400  // 4s in 10ms units
 
+/* Powersave mode: BLE connected but idle (Light Sleep)
+ * Effective wakeup every ~1.5-3s, saves ~10x power vs normal mode.
+ * iOS/Android compatible: maxItvl*(latency+1) <= supervision/2 */
+#define BLE_POWERSAVE_CONN_ITVL_MIN  400  // 500ms
+#define BLE_POWERSAVE_CONN_ITVL_MAX  800  // 1000ms
+#define BLE_POWERSAVE_CONN_LATENCY   2    // skip 2 intervals → effective 1.5-3s
+#define BLE_POWERSAVE_SUPER_TIMEOUT  600  // 6s
+
 // Timeouts (milliseconds)
 #define CONN_SUBS_MUTEX_TIMEOUT_MS   100
 #define SYS_CMD_MUTEX_TIMEOUT_MS     100
@@ -137,5 +145,30 @@ esp_err_t ble_device_name_set(const char *name, uint8_t len);
  * @return Pointer to the current device name string.
  */
 const char *ble_device_name_get(void);
+
+// ============================================================
+// BLE Connection Interval Management
+// ============================================================
+
+/**
+ * @brief Request powersave connection parameters (500ms-1s, latency 2)
+ *
+ * Call before entering Light Sleep to reduce BLE power ~10x.
+ * iOS/Android compatible. APP receives param update request and
+ * typically accepts automatically.
+ *
+ * @return 0 on success, non-zero on error (no connection or update rejected)
+ */
+int ble_gatt_server_request_powersave(void);
+
+/**
+ * @brief Request normal connection parameters (30-50ms, latency 0)
+ *
+ * Call after waking from Light Sleep or when activity resumes
+ * to restore responsive BLE latency.
+ *
+ * @return 0 on success, non-zero on error
+ */
+int ble_gatt_server_request_normal(void);
 
 #endif /* BLE_GATT_SERVER_H */

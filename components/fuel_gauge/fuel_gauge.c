@@ -22,6 +22,36 @@ static const char *TAG = "FUEL_GAUGE";
 #define CW2217E_I2C_ADDR    0x64
 #define PROBE_I2C_FREQ_HZ   100000
 
+/* BQ27220: not calibrated for this battery, use voltage-based estimation.
+ * CW2217E: calibrated by Cellwise profile, trust register values. */
+#define BQ_DESIGN_CAPACITY_MAH      4700   /* 华昊锂能 4700mAh */
+#define BATT_INTERNAL_R_MOHM        10     /* Battery internal resistance for OCV compensation */
+
+/* BQ27220 voltage → SOC% (piecewise linear, li-ion 4.35V charge target) */
+static uint8_t bq_voltage_to_soc(uint16_t voltage_mv, int16_t current_ma)
+{
+    /* Compensate terminal voltage for IR drop to estimate OCV.
+     * Unified API: current < 0 = charging, > 0 = discharging. */
+    int16_t ocv = (int16_t)voltage_mv;
+    if (current_ma < -100) {
+        ocv -= (int16_t)((-current_ma) * BATT_INTERNAL_R_MOHM / 1000);
+    } else if (current_ma > 100) {
+        ocv += (int16_t)(current_ma * BATT_INTERNAL_R_MOHM / 1000);
+    }
+    if (ocv < 0) ocv = 0;
+    if (ocv > 4500) ocv = 4500;
+
+    if (ocv >= 4250) return 100;
+    if (ocv >= 4200) return (uint8_t)(90 + (ocv - 4200) * 10 / 50);
+    if (ocv >= 4100) return (uint8_t)(75 + (ocv - 4100) * 15 / 100);
+    if (ocv >= 4000) return (uint8_t)(55 + (ocv - 4000) * 20 / 100);
+    if (ocv >= 3850) return (uint8_t)(30 + (ocv - 3850) * 25 / 150);
+    if (ocv >= 3700) return (uint8_t)(10 + (ocv - 3700) * 20 / 150);
+    if (ocv >= 3500) return (uint8_t)((ocv - 3500) * 10 / 200);
+    if (ocv >= 3300) return (uint8_t)((ocv - 3300) * 5 / 200);
+    return 0;
+}
+
 /* Internal device wrapper */
 typedef struct {
     fuel_gauge_type_t type;
@@ -207,7 +237,13 @@ uint16_t fuel_gauge_get_state_of_charge(fuel_gauge_handle_t handle)
 {
     if (!handle) return 0;
     fuel_gauge_device_t *fg = (fuel_gauge_device_t *)handle;
-    if (fg->type == FUEL_GAUGE_BQ27220) return bq27220_get_state_of_charge(fg->dev);
+    if (fg->type == FUEL_GAUGE_BQ27220) {
+        /* BQ27220 not calibrated — estimate SOC from voltage + IR compensation */
+        uint16_t v = bq27220_get_voltage(fg->dev);
+        int16_t i = bq27220_get_current(fg->dev);
+        return bq_voltage_to_soc(v, i);
+    }
+    /* CW2217E: calibrated by Cellwise profile, trust register */
     return cw2217e_get_state_of_charge(fg->dev);
 }
 
@@ -223,7 +259,7 @@ uint16_t fuel_gauge_get_full_charge_capacity(fuel_gauge_handle_t handle)
 {
     if (!handle) return 0;
     fuel_gauge_device_t *fg = (fuel_gauge_device_t *)handle;
-    if (fg->type == FUEL_GAUGE_BQ27220) return bq27220_get_full_charge_capacity(fg->dev);
+    if (fg->type == FUEL_GAUGE_BQ27220) return BQ_DESIGN_CAPACITY_MAH;
     return cw2217e_get_full_charge_capacity(fg->dev);
 }
 
@@ -231,7 +267,7 @@ uint16_t fuel_gauge_get_design_capacity(fuel_gauge_handle_t handle)
 {
     if (!handle) return 0;
     fuel_gauge_device_t *fg = (fuel_gauge_device_t *)handle;
-    if (fg->type == FUEL_GAUGE_BQ27220) return bq27220_get_design_capacity(fg->dev);
+    if (fg->type == FUEL_GAUGE_BQ27220) return BQ_DESIGN_CAPACITY_MAH;
     return cw2217e_get_design_capacity(fg->dev);
 }
 
@@ -239,7 +275,13 @@ uint16_t fuel_gauge_get_remaining_capacity(fuel_gauge_handle_t handle)
 {
     if (!handle) return 0;
     fuel_gauge_device_t *fg = (fuel_gauge_device_t *)handle;
-    if (fg->type == FUEL_GAUGE_BQ27220) return bq27220_get_remaining_capacity(fg->dev);
+    if (fg->type == FUEL_GAUGE_BQ27220) {
+        /* Voltage-based estimate × design capacity */
+        uint16_t v = bq27220_get_voltage(fg->dev);
+        int16_t i = bq27220_get_current(fg->dev);
+        uint8_t soc = bq_voltage_to_soc(v, i);
+        return (uint16_t)((uint32_t)soc * BQ_DESIGN_CAPACITY_MAH / 100);
+    }
     return cw2217e_get_remaining_capacity(fg->dev);
 }
 

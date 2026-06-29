@@ -382,6 +382,14 @@ esp_err_t tt_module_user_power_on(void);
 esp_err_t tt_module_user_power_off(void);
 
 /**
+ * @brief Power off TT due to network timeout (auto收网)
+ *
+ * Same hardware shutdown as user_power_off but does NOT set the NVS
+ * manual_off flag, allowing TT to auto-restart on next TEMP_AWAKE.
+ */
+esp_err_t tt_module_network_timeout_off(void);
+
+/**
  * @brief Check if user control is allowed
  *
  * @return true if user control is allowed, false otherwise

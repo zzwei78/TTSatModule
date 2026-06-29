@@ -701,6 +701,12 @@ static void battery_event_check(void)
     /* Convert temperature: 0.1°K → °C */
     int temp_c = (int)temp_0_1k / 10 - 273;
 
+    /* Debug: log every check (current is unified API: negative=charging) */
+    bool charging_now = (current < -BATT_CHARGE_CURRENT_MA);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+        "[BATT_EVENT] V=%umV I=%dmA SOC=%u%% T=%d°C charging=%d (flags=0x%02X)",
+        voltage, current, soc, temp_c, charging_now, g_batt_report_flags);
+
     /* Initialize baseline on first call */
     if (!g_batt_event_inited) {
         g_batt_last_soc = soc;
