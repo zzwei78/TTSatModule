@@ -7,6 +7,7 @@
 #include "ble_conn_manager.h"
 #include "esp_log.h"
 #include <string.h>
+#include "host/ble_hs.h"
 
 static const char *TAG = "BLE_CONN_MGR";
 
@@ -225,6 +226,26 @@ int ble_conn_manager_get_connection_count(void) {
 }
 
 bool ble_conn_manager_is_max_connections(void) {
+    if (g_connection_count < BLE_MAX_CONNECTIONS) {
+        return false;
+    }
+
+    /* At max — verify against NimBLE to detect stale entries.
+     * If a disconnect event was missed (supervision timeout race, etc.),
+     * the tracked count may be higher than actual. Clean up stale slots. */
+    for (int i = 0; i < BLE_MAX_CONNECTIONS; i++) {
+        if (g_connections[i].is_connected) {
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(g_connections[i].conn_handle, &desc) != 0) {
+                ESP_LOGW(TAG, "Stale conn handle=%d (slot %d), cleaning up",
+                         g_connections[i].conn_handle, i);
+                g_connections[i].is_connected = false;
+                g_connections[i].conn_handle = 0;
+                g_connection_count--;
+            }
+        }
+    }
+
     return g_connection_count >= BLE_MAX_CONNECTIONS;
 }
 

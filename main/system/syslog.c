@@ -16,6 +16,7 @@
 #include "syslog.h"
 #include "ble/gatt_log_server.h"
 #include "ble/ble_conn_manager.h"
+#include "esp_attr.h"
 
 static const char *TAG = "SYSLOG";
 
@@ -65,14 +66,7 @@ typedef struct {
     TaskHandle_t send_task_handle;
 } syslog_gatt_buffer_t;
 
-static syslog_gatt_buffer_t g_gatt_buf = {
-    .head = 0,
-    .tail = 0,
-    .count = 0,
-    .dropped_bytes = 0,
-    .mutex = NULL,
-    .send_task_handle = NULL
-};
+EXT_RAM_BSS_ATTR static syslog_gatt_buffer_t g_gatt_buf;
 
 // ============================================================
 // Forward Declarations

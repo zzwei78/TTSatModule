@@ -127,6 +127,7 @@ typedef struct {
     uint8_t sim_creg;
     uint16_t gatt_conn;
     esp_timer_handle_t urc_timer;
+    esp_timer_handle_t net_timer;   /* Periodic network status push (sim only) */
     TaskHandle_t voice_task;
     bool voice_active;
     uint32_t sample_pos;        /* Audio sample position (for continuous generation) */
@@ -199,6 +200,29 @@ static int g_seq_index = 0;
  * Public API
  * ============================================================ */
 
+#define SIM_NET_PUSH_INTERVAL_SEC   10  /* Push CREG/CSQ every 10s when sim enabled */
+
+/* Push network status as URC to the connected APP (simulation only) */
+static void sim_net_push(void)
+{
+    if (g_sim.gatt_conn == 0) return;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "\r\n+CREG: 0,%d\r\n", g_sim.sim_creg);
+    spp_at_server_send_response_async(g_sim.gatt_conn, (const uint8_t *)buf, strlen(buf));
+
+    snprintf(buf, sizeof(buf), "\r\n+CSQ: %d,0\r\n", g_sim.sim_csq);
+    spp_at_server_send_response_async(g_sim.gatt_conn, (const uint8_t *)buf, strlen(buf));
+}
+
+static void sim_net_timer_cb(void *arg)
+{
+    /* Periodic push — only if sim enabled and call is idle (don't spam during calls) */
+    if (g_sim.enabled && g_sim.state == SIM_CALL_IDLE) {
+        sim_net_push();
+    }
+}
+
 void sat_call_sim_init(void)
 {
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
@@ -210,6 +234,13 @@ void sat_call_sim_init(void)
         .name = "sim_urc",
         .arg = NULL,
     }, &g_sim.urc_timer);
+
+    /* Create network status push timer (not started) */
+    esp_timer_create(&(esp_timer_create_args_t){
+        .callback = sim_net_timer_cb,
+        .name = "sim_net",
+        .arg = NULL,
+    }, &g_sim.net_timer);
 }
 
 bool sat_call_sim_is_enabled(void)
@@ -231,7 +262,18 @@ int sat_call_sim_set_enabled(bool enable, sim_scenario_t scenario)
     if (enable) {
         /* Map PCM partition for voice playback */
         sim_pcm_init();
+        /* Start periodic network status push */
+        if (g_sim.net_timer) {
+            esp_timer_start_periodic(g_sim.net_timer, SIM_NET_PUSH_INTERVAL_SEC * 1000000ULL);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Net status push timer started (%ds)", SIM_NET_PUSH_INTERVAL_SEC);
+        }
+        /* Immediate push so APP sees status right away */
+        sim_net_push();
     } else {
+        /* Stop network push timer */
+        if (g_sim.net_timer) {
+            esp_timer_stop(g_sim.net_timer);
+        }
         /* Stop any active call */
         if (g_sim.state != SIM_CALL_IDLE) {
             sim_stop_voice_inject();
@@ -256,12 +298,22 @@ sim_scenario_t sat_call_sim_get_scenario(void)
     return g_sim.scenario;
 }
 
+void sat_call_sim_set_conn_handle(uint16_t conn_handle)
+{
+    g_sim.gatt_conn = conn_handle;
+}
+
 void sat_call_sim_set_network(uint8_t csq, uint8_t creg)
 {
     g_sim.sim_csq = csq;
     g_sim.sim_creg = creg;
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
         "Sim network set: CSQ=%d, CREG=%d", csq, creg);
+
+    /* Push updated values only when idle — don't interleave with call URCs */
+    if (g_sim.enabled && g_sim.state == SIM_CALL_IDLE) {
+        sim_net_push();
+    }
 }
 
 int sat_call_sim_trigger_incoming(uint32_t delay_ms)

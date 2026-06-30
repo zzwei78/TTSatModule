@@ -99,6 +99,8 @@ static uint8_t g_batt_last_soc = 0;
 static bool g_batt_last_charging = false;
 static bool g_batt_temp_high_active = false;
 static bool g_batt_temp_low_active = false;
+static uint16_t g_batt_periodic_cnt = 0;   /* Periodic heartbeat counter (×10s) */
+#define BATT_PERIODIC_INTERVAL    12       /* 12 × 10s = 120s = 2 minutes */
 
 /* IP5561 configuration fingerprint for reset detection */
 typedef struct {
@@ -392,6 +394,20 @@ static void update_battery_cache(void)
     g_battery_cache.last_update_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     g_battery_cache.initialized = true;
     taskEXIT_CRITICAL_FROM_ISR(interrupt_mask);
+}
+
+bool power_manage_is_charging(void)
+{
+    /* IP5561 is the charge IC — its CHG_STATE2 bit3 is the authoritative
+     * "charging in progress" flag. Use it when IP5561 is available. */
+    if (g_ip5561_handle != NULL) {
+        return ip5561_is_charging(g_ip5561_handle);
+    }
+    /* Fallback: fuel gauge current direction (unified API: negative = charging) */
+    if (g_fuel_gauge_handle != NULL) {
+        return fuel_gauge_get_current(g_fuel_gauge_handle) < -BATT_CHARGE_CURRENT_MA;
+    }
+    return false;
 }
 
 /**
@@ -701,8 +717,10 @@ static void battery_event_check(void)
     /* Convert temperature: 0.1°K → °C */
     int temp_c = (int)temp_0_1k / 10 - 273;
 
-    /* Debug: log every check (current is unified API: negative=charging) */
-    bool charging_now = (current < -BATT_CHARGE_CURRENT_MA);
+    /* Charging detection: IP5561 first (authoritative), fallback to fuel gauge current.
+     * IP5561 knows the actual charge state; fuel gauge current is an approximation. */
+    bool charging_now = power_manage_is_charging();
+
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
         "[BATT_EVENT] V=%umV I=%dmA SOC=%u%% T=%d°C charging=%d (flags=0x%02X)",
         voltage, current, soc, temp_c, charging_now, g_batt_report_flags);
@@ -710,7 +728,7 @@ static void battery_event_check(void)
     /* Initialize baseline on first call */
     if (!g_batt_event_inited) {
         g_batt_last_soc = soc;
-        g_batt_last_charging = (current < -BATT_CHARGE_CURRENT_MA);
+        g_batt_last_charging = charging_now;
         g_batt_event_inited = true;
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
             "[BATT_EVENT] Initialized: soc=%u%%, charging=%d, temp=%d°C",
@@ -722,27 +740,25 @@ static void battery_event_check(void)
     if ((g_batt_report_flags & BATTERY_REPORT_FLAG_SOC) &&
         (uint8_t)abs((int)soc - (int)g_batt_last_soc) >= g_batt_soc_threshold) {
         gatt_system_server_send_battery_event(BATTERY_EVENT_SOC_CHANGE,
-                                              soc, voltage, temp_0_1k);
+                                              soc, voltage, temp_0_1k, charging_now);
         g_batt_last_soc = soc;
     }
 
     /* --- Charging status detection --- */
     if (g_batt_report_flags & BATTERY_REPORT_FLAG_CHARGE) {
-        bool charging_now = (current < -BATT_CHARGE_CURRENT_MA);
-
         if (charging_now != g_batt_last_charging) {
             if (charging_now) {
                 /* Started charging */
                 gatt_system_server_send_battery_event(BATTERY_EVENT_CHARGE_START,
-                                                      soc, voltage, temp_0_1k);
+                                                      soc, voltage, temp_0_1k, 1);
             } else {
                 /* Stopped charging — check if full */
                 if (g_batt_last_charging && soc >= 99) {
                     gatt_system_server_send_battery_event(BATTERY_EVENT_CHARGE_FULL,
-                                                          soc, voltage, temp_0_1k);
+                                                          soc, voltage, temp_0_1k, 0);
                 } else {
                     gatt_system_server_send_battery_event(BATTERY_EVENT_CHARGE_STOP,
-                                                          soc, voltage, temp_0_1k);
+                                                          soc, voltage, temp_0_1k, 0);
                 }
             }
             g_batt_last_charging = charging_now;
@@ -753,7 +769,7 @@ static void battery_event_check(void)
     if (g_batt_report_flags & BATTERY_REPORT_FLAG_TEMP) {
         if (temp_c >= BATT_TEMP_HIGH_THRESHOLD && !g_batt_temp_high_active) {
             gatt_system_server_send_battery_event(BATTERY_EVENT_TEMP_HIGH,
-                                                  soc, voltage, temp_0_1k);
+                                                  soc, voltage, temp_0_1k, charging_now);
             g_batt_temp_high_active = true;
         } else if (temp_c <= BATT_TEMP_HIGH_RECOVERY) {
             g_batt_temp_high_active = false;
@@ -761,11 +777,19 @@ static void battery_event_check(void)
 
         if (temp_c <= BATT_TEMP_LOW_THRESHOLD && !g_batt_temp_low_active) {
             gatt_system_server_send_battery_event(BATTERY_EVENT_TEMP_LOW,
-                                                  soc, voltage, temp_0_1k);
+                                                  soc, voltage, temp_0_1k, charging_now);
             g_batt_temp_low_active = true;
         } else if (temp_c >= BATT_TEMP_LOW_RECOVERY) {
             g_batt_temp_low_active = false;
         }
+    }
+
+    /* --- Periodic heartbeat (every 2 min) --- */
+    /* Ensures APP receives current state even if change events were missed */
+    if (++g_batt_periodic_cnt >= BATT_PERIODIC_INTERVAL) {
+        g_batt_periodic_cnt = 0;
+        gatt_system_server_send_battery_event(BATTERY_EVENT_PERIODIC,
+                                              soc, voltage, temp_0_1k, charging_now);
     }
 }
 
@@ -774,6 +798,7 @@ void power_manage_set_battery_report(uint8_t flags, uint8_t soc_threshold)
     g_batt_report_flags = flags;
     g_batt_soc_threshold = (soc_threshold > 0) ? soc_threshold : 1;
     g_batt_event_inited = false;  /* Re-init baseline on enable */
+    g_batt_periodic_cnt = 0;     /* Reset periodic counter */
     g_batt_report_enabled = (flags != 0);
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,

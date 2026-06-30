@@ -243,8 +243,10 @@ static bool is_ble_connected(void)
         return true;
     }
 
-    /* Fallback: query NimBLE stack in case a connect callback was missed.
-     * Count ALL active connections so the cache syncs to the correct value. */
+    /* Fallback: query NimBLE in case a connect callback was missed.
+     * Only syncs UP (never down) because ble_gap_conn_find can false-negative
+     * on valid connections with handles outside [0, MAX) after reconnects.
+     * Stale entries (cache > actual) are handled by ble_conn_manager self-healing. */
     int found = 0;
     for (uint16_t h = 0; h < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; h++) {
         struct ble_gap_conn_desc desc;
@@ -254,7 +256,7 @@ static bool is_ble_connected(void)
     }
     if (found > 0) {
         g_ble_conn_count = found;
-        SYS_LOGW(TAG, "BLE conn sync: cache 0 → %d (nimble ground truth)", found);
+        SYS_LOGW(TAG, "BLE conn sync: cache 0 → %d (nimble fallback)", found);
         return true;
     }
 
@@ -635,13 +637,26 @@ static void sleep_decision_task(void *pvParameters)
             }
         }
 
-        /* Warn on mismatch between NimBLE query and callback-maintained cache.
-         * Trust is_ble_connected() (which checks cache first) for the actual
-         * decision — the callback count is more reliable than ble_gap_conn_find
-         * which can miss handles outside the [0, MAX) range after reconnects. */
+        /* Correct cache if NimBLE consistently shows fewer connections.
+         * Only correct DOWN when nimble > 0 (avoid false-negative clearing to 0).
+         * This fixes stale entries from missed disconnect callbacks. */
         if (ble_count != g_ble_conn_count) {
-            SYS_LOGW(TAG, "BLE count mismatch: nimble=%d cache=%d — trusting cache",
-                     ble_count, g_ble_conn_count);
+            if (ble_count > 0 && ble_count < g_ble_conn_count) {
+                /* Safe correction: nimble sees real connections, just fewer than cache */
+                static int s_correct_log_cnt = 0;
+                if (s_correct_log_cnt++ % 30 == 0) {  /* Log once per 30s */
+                    SYS_LOGW(TAG, "BLE cache corrected: %d → %d (nimble ground truth)",
+                             g_ble_conn_count, ble_count);
+                }
+                g_ble_conn_count = ble_count;
+            } else if (ble_count == 0 && g_ble_conn_count > 0) {
+                /* NimBLE says 0 but cache says >0 — don't correct (could be false negative).
+                 * Log sparingly. */
+                static int s_mismatch_log_cnt = 0;
+                if (s_mismatch_log_cnt++ % 60 == 0) {  /* Log once per 60s */
+                    SYS_LOGW(TAG, "BLE mismatch: nimble=0 cache=%d (not correcting)", g_ble_conn_count);
+                }
+            }
         }
 
         /* === BLE connected or TT on → reset deep sleep counter, check light sleep === */
@@ -793,9 +808,6 @@ static void enter_light_sleep(void)
     /* Tell BB "AP is sleeping" — BB will pull GPIO21 LOW if it needs us */
     gpio_set_level(AP_WAKEUP_BB_PIN, 1);
 
-    /* Switch to powersave connection params (500ms-1s) to save ~10x BLE power */
-    ble_gatt_server_request_powersave();
-
     /* Configure wakeup sources */
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     esp_sleep_enable_bt_wakeup();
@@ -806,15 +818,10 @@ static void enter_light_sleep(void)
 #endif
     esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_LIGHT_TIMER_SEC * 1000000ULL);
 
-    /* Enter light sleep - CPU pauses, RAM preserved, BLE stays connected */
+    /* Enter light sleep - CPU pauses between BLE connection events, RAM preserved */
     esp_light_sleep_start();
 
     /* === Code continues here after wakeup === */
-
-    /* Restore normal connection params (30-50ms) for responsive communication */
-    ble_gatt_server_request_normal();
-
-    /* Tell BB "AP is awake" */
     gpio_set_level(AP_WAKEUP_BB_PIN, 0);
 }
 
@@ -893,6 +900,7 @@ static void configure_gpio_for_deep_sleep(void)
 }
 
 /* ========== Pwrkey Monitor Task (V2 only) ========== */
+#ifdef SUPPORT_HARDWARE_V2
 
 /* ISR: notify task on falling edge (button press). Minimal — just wake the task. */
 static void IRAM_ATTR pwrkey_isr_handler(void *arg)
@@ -929,8 +937,13 @@ static void pwrkey_monitor_task(void *pvParameters)
                 if (held_ms < PWRKEY_DEBOUNCE_MS) {
                     /* Debounce — ignore */
                 } else if (held_ms >= PWRKEY_SHORT_THRESHOLD_MS) {
-                    /* Long press 2-5s: toggle TT power */
-                    if (tt_module_is_powered()) {
+                    /* Long press 2-5s: toggle TT power.
+                     * But NOT during an active call — accidental long press
+                     * would kill the call. Just refresh idle instead. */
+                    if (spp_voice_server_is_call_active()) {
+                        SYS_LOGW(TAG, "Pwrkey long (%lldms) ignored — call active", held_ms);
+                        sleep_manager_notify_activity("pwrkey");
+                    } else if (tt_module_is_powered()) {
                         SYS_LOGI(TAG, "Pwrkey long (%lldms) -> TT off", held_ms);
                         tt_module_user_power_off();
                     } else {
@@ -964,6 +977,8 @@ static void pwrkey_monitor_task(void *pvParameters)
     g_pwrkey_task_handle = NULL;
     vTaskDelete(NULL);
 }
+
+#endif /* SUPPORT_HARDWARE_V2 */
 
 static void pwrkey_init_and_start(void)
 {

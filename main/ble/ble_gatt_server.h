@@ -35,11 +35,12 @@
 
 /* Powersave mode: BLE connected but idle (Light Sleep)
  * Effective wakeup every ~1.5-3s, saves ~10x power vs normal mode.
- * iOS/Android compatible: maxItvl*(latency+1) <= supervision/2 */
+ * BT spec requires: supervision_timeout > itvl_max*(latency+1)*2
+ *   7000ms > 1000ms * 3 * 2 = 6000ms ✓ */
 #define BLE_POWERSAVE_CONN_ITVL_MIN  400  // 500ms
 #define BLE_POWERSAVE_CONN_ITVL_MAX  800  // 1000ms
 #define BLE_POWERSAVE_CONN_LATENCY   2    // skip 2 intervals → effective 1.5-3s
-#define BLE_POWERSAVE_SUPER_TIMEOUT  600  // 6s
+#define BLE_POWERSAVE_SUPER_TIMEOUT  700  // 7s (> 6s spec minimum)
 
 // Timeouts (milliseconds)
 #define CONN_SUBS_MUTEX_TIMEOUT_MS   100

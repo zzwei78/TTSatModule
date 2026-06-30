@@ -278,26 +278,14 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
         current = 0;
     }
 
-    /* Step 3: Determine charging state
-     * BQ27220: Negative current = charging, Positive current = discharging
-     */
-    bool is_charging = (current < -200) ? true :
-                      (current > 200) ? false :
-                      !bat_status.DSG;
+    /* Step 3: Charging state — IP5561 first (authoritative), fuel gauge fallback.
+     * Consistent with battery_event_check() in power_manage.c. */
+    bool is_charging = power_manage_is_charging();
 
-    /* Step 4: Apply IR compensation to voltage when charging */
-    uint16_t v_comp = voltage;
-    if (is_charging && current < 0) {
-        uint32_t ir_drop = ((uint32_t)(-current) * POWER_MANAGE_BATT_INTERNAL_R_MOHM) / 1000;
-        if (ir_drop > POWER_MANAGE_MAX_IR_COMP_MV) {
-            ir_drop = POWER_MANAGE_MAX_IR_COMP_MV;
-        }
-        v_comp = voltage - (uint16_t)ir_drop;
-    }
-    info->voltage_mv = v_comp;
+    /* Step 4: Raw voltage (no IR compensation — consistent with event push) */
+    info->voltage_mv = voltage;
 
-    /* Step 5: Set current (average from power_manage cache) and charging status */
-    //info->current_ma = power_manage_get_avg_current();
+    /* Step 5: Set current and charging status */
     info->current_ma = fuel_gauge_get_current(battery_handle);
     info->charging = is_charging ? 1 : 0;
     info->full_charged = bat_status.FC ? 1 : 0;
@@ -315,24 +303,15 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
     if (info->temperature_0_1k == 0 || info->temperature_0_1k > 4000) {
         info->temperature_0_1k = 2981;  /* Default ~25°C (298.1K * 10) */
     }
-    if (info->full_charge_capacity_mah == 0 || info->full_charge_capacity_mah > 2000) {
-        info->full_charge_capacity_mah = 650;  /* Default design capacity */
+    if (info->full_charge_capacity_mah == 0) {
+        info->full_charge_capacity_mah = 4700;  /* Design capacity fallback */
     }
     if (info->remaining_capacity_mah > info->full_charge_capacity_mah) {
         info->remaining_capacity_mah = info->full_charge_capacity_mah;
     }
 
-    /* Step 8: Calculate SOC from compensated voltage */
-    const uint16_t V_EMPTY_MV = 3000;
-    const uint16_t V_FULL_MV = 4350;
-
-    if (v_comp <= V_EMPTY_MV) {
-        info->soc_percent = 0;
-    } else if (v_comp >= V_FULL_MV) {
-        info->soc_percent = 100;
-    } else {
-        info->soc_percent = (uint16_t)((uint32_t)(v_comp - V_EMPTY_MV) * 100 / (V_FULL_MV - V_EMPTY_MV));
-    }
+    /* Step 8: SOC from fuel_gauge unified interface (same as BATT_EVENT path) */
+    info->soc_percent = fuel_gauge_get_state_of_charge(battery_handle);
 
     /* Cache as last good reading */
     memcpy(&s_last_good, info, sizeof(system_battery_info_t));
@@ -358,16 +337,17 @@ static esp_err_t get_charge_status(system_charge_status_t *status)
         return ESP_ERR_INVALID_STATE;
     }
 
-    int16_t current = fuel_gauge_get_current(battery_handle);
-    status->is_charging = (current > 0) ? 1 : 0;
+    battery_status_t bat_status;
+    memset(&bat_status, 0, sizeof(bat_status));
+    fuel_gauge_get_battery_status(battery_handle, &bat_status);
+
+    /* Charging: IP5561 first (authoritative), fuel gauge fallback.
+     * Consistent with battery_event_check() and get_battery_info(). */
+    status->is_charging = power_manage_is_charging() ? 1 : 0;
     status->charge_voltage_mv = fuel_gauge_get_charge_voltage(battery_handle);
     status->charge_current_ma = fuel_gauge_get_charge_current(battery_handle);
     status->time_to_full_min = fuel_gauge_get_time_to_full(battery_handle);
-
-    battery_status_t bat_status;
-    if (fuel_gauge_get_battery_status(battery_handle, &bat_status) == ESP_OK) {
-        status->is_full = bat_status.FC ? 1 : 0;
-    }
+    status->is_full = bat_status.FC ? 1 : 0;
 
     return ESP_OK;
 }
@@ -863,6 +843,25 @@ static void print_system_command(const uint8_t *data, size_t len)
                                ((uint32_t)(len > 5 ? data[5] : 0) << 24);
             snprintf(param_str, sizeof(param_str), "Set TX power %d dBm, timeout %lu s", power, timeout);
         }
+        break;
+
+    case SYS_CMD_SET_DEVICE_NAME:
+        cmd_name = "SET_DEVICE_NAME";
+        break;
+
+    case SYS_CMD_GET_DEVICE_NAME:
+        cmd_name = "GET_DEVICE_NAME";
+        break;
+
+    case SYS_CMD_ENABLE_BATTERY_REPORT:
+        cmd_name = "ENABLE_BATTERY_REPORT";
+        if (len >= 2) {
+            snprintf(param_str, sizeof(param_str), "flags=0x%02X, soc_thr=%u%%", data[1], (len >= 3 ? data[2] : 1));
+        }
+        break;
+
+    case SYS_CMD_DISABLE_BATTERY_REPORT:
+        cmd_name = "DISABLE_BATTERY_REPORT";
         break;
 
     default:
@@ -1709,7 +1708,8 @@ int gatt_system_server_send_sensor_data(void)
 }
 
 int gatt_system_server_send_battery_event(uint8_t event_type, uint8_t soc,
-                                           uint16_t voltage_mv, uint16_t temp_0_1k)
+                                           uint16_t voltage_mv, uint16_t temp_0_1k,
+                                           uint8_t charging)
 {
     if (event_type == BATTERY_EVENT_NONE) {
         return ESP_OK;
@@ -1720,8 +1720,8 @@ int gatt_system_server_send_battery_event(uint8_t event_type, uint8_t soc,
         return BLE_HS_ENOTCONN;
     }
 
-    /* Build notification: [0x7E][event_type][soc][v_lo][v_hi][t_lo][t_hi] */
-    uint8_t buf[7];
+    /* Build notification: [0x7E][event_type][soc][v_lo][v_hi][t_lo][t_hi][charging] */
+    uint8_t buf[8];
     buf[0] = SYS_CMD_ENABLE_BATTERY_REPORT;  /* Event notification identifier */
     buf[1] = event_type;
     buf[2] = soc;
@@ -1729,10 +1729,11 @@ int gatt_system_server_send_battery_event(uint8_t event_type, uint8_t soc,
     buf[4] = (uint8_t)((voltage_mv >> 8) & 0xFF);
     buf[5] = (uint8_t)(temp_0_1k & 0xFF);
     buf[6] = (uint8_t)((temp_0_1k >> 8) & 0xFF);
+    buf[7] = charging;
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
-                    "Battery event: type=0x%02X soc=%u%% V=%umV T=%u(0.1K)",
-                    event_type, soc, voltage_mv, temp_0_1k);
+                    "Battery event: type=0x%02X soc=%u%% V=%umV T=%u(0.1K) chg=%d",
+                    event_type, soc, voltage_mv, temp_0_1k, charging);
 
     struct os_mbuf *txom = ble_hs_mbuf_from_flat(buf, sizeof(buf));
     if (!txom) {
@@ -2533,6 +2534,10 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
                 scenario = (sim_scenario_t)cmd_params[1];
             }
             int ret = sat_call_sim_set_enabled(enable, scenario);
+            /* Set connection handle so sim module can push URC to this client */
+            if (ret == 0 && enable) {
+                sat_call_sim_set_conn_handle(conn_handle);
+            }
             if (ret != 0) {
                 resp_code = SYS_RESP_ERROR;
             } else {

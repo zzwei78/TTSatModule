@@ -254,6 +254,7 @@ int gatt_system_server_send_sensor_data(void);
 #define BATTERY_EVENT_CHARGE_FULL       0x04  /* Battery fully charged */
 #define BATTERY_EVENT_TEMP_HIGH         0x05  /* Temperature >= high threshold */
 #define BATTERY_EVENT_TEMP_LOW          0x06  /* Temperature <= low threshold */
+#define BATTERY_EVENT_PERIODIC          0x07  /* Periodic heartbeat (every 2 min) */
 
 /* Event subscription bitmask (used in ENABLE_BATTERY_REPORT flags param) */
 #define BATTERY_REPORT_FLAG_SOC         0x01  /* Subscribe to SOC change events */
@@ -267,16 +268,18 @@ int gatt_system_server_send_sensor_data(void);
 /**
  * @brief Push a battery event notification to the connected app
  *
- * Called from power_manage battery event detector. Builds a 7-byte notification:
- *   [0x7E][event_type][soc][voltage_lo][voltage_hi][temp_lo][temp_hi]
+ * Called from power_manage battery event detector. Builds an 8-byte notification:
+ *   [0x7E][event_type][soc][v_lo][v_hi][t_lo][t_hi][charging]
  *
  * @param event_type  BATTERY_EVENT_* code
  * @param soc         Current SOC (0-100)
  * @param voltage_mv  Current battery voltage (mV)
  * @param temp_0_1k   Current temperature (0.1°K)
+ * @param charging    Charging status (1=charging, 0=not charging)
  * @return 0 on success, negative on error
  */
 int gatt_system_server_send_battery_event(uint8_t event_type, uint8_t soc,
-                                           uint16_t voltage_mv, uint16_t temp_0_1k);
+                                           uint16_t voltage_mv, uint16_t temp_0_1k,
+                                           uint8_t charging);
 
 #endif /* GATT_SYSTEM_SERVER_H */

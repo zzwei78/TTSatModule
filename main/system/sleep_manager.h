@@ -35,7 +35,7 @@ typedef enum {
 
 /* ========== Configuration Constants ========== */
 
-#define SLEEP_LIGHT_IDLE_SEC        60      /* First entry: idle before light sleep (60s) */
+#define SLEEP_LIGHT_IDLE_SEC        3600000  /* Disabled (1M seconds) — light sleep causes BLE supervision timeout with test clients */
 #define SLEEP_LIGHT_REENTER_SEC     2       /* Re-entry: quick re-sleep after wake */
 #ifdef SUPPORT_HARDWARE_V2
 #define SLEEP_DEEP_IDLE_SEC         120     /* V2.0: BLE disconnected, idle before deep sleep (2 min) */

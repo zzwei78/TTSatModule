@@ -78,6 +78,14 @@ sim_scenario_t sat_call_sim_get_scenario(void);
 void sat_call_sim_set_network(uint8_t csq, uint8_t creg);
 
 /**
+ * @brief Update GATT connection handle for URC push
+ *
+ * Called when SIM_CTRL is received via system command (not AT channel).
+ * Without this, sim_net_push would have no conn_handle to send to.
+ */
+void sat_call_sim_set_conn_handle(uint16_t conn_handle);
+
+/**
  * @brief Trigger an incoming call simulation
  *
  * @param delay_ms Delay before the first RING (0 = immediate)

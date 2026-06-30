@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include <string.h>
 #include "syslog.h"
+#include "esp_attr.h"
 
 /* Tag for logging */
 static const char *TAG = "OTA_PARTITION";
@@ -35,7 +36,7 @@ static esp_ota_handle_t g_ota_handle = 0;
 
 /* Write buffer for reducing flash write operations */
 #define OTA_WRITE_BUFFER_SIZE (4 * 1024)  // 4KB buffer
-static uint8_t g_write_buffer[OTA_WRITE_BUFFER_SIZE];
+EXT_RAM_BSS_ATTR static uint8_t g_write_buffer[OTA_WRITE_BUFFER_SIZE];
 static size_t g_buffer_offset = 0;  // Current buffer fill level
 
 /**

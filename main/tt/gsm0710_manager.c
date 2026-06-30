@@ -13,6 +13,7 @@
 #include "tt/tt_module.h"
 #include "tt/tt_hardware.h"
 #include "syslog.h"
+#include "esp_attr.h"
 
 /* External variable for BLE connection subscriptions */
 /* Note: conn_handle_subs is not used in LED_TEST (no BLE) */

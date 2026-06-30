@@ -63,7 +63,7 @@ extern "C" {
  * Used to compensate charging IR voltage drop.
  * Unit: milliohms (mΩ)
  */
-#define POWER_MANAGE_BATT_INTERNAL_R_MOHM    150     /* 150mΩ internal resistance */
+#define POWER_MANAGE_BATT_INTERNAL_R_MOHM    10      /* 10mΩ internal resistance (consistent with fuel_gauge.c) */
 
 /**
  * @brief Maximum IR compensation voltage
@@ -145,6 +145,16 @@ ip5561_handle_t power_manage_get_ip5561_handle(void);
  * @return Fuel gauge handle, or NULL if not initialized
  */
 fuel_gauge_handle_t power_manage_get_fuel_gauge_handle(void);
+
+/**
+ * @brief Check if battery is currently charging
+ *
+ * Uses IP5561 charging flag (authoritative) when available,
+ * falls back to fuel gauge current direction if IP5561 is not initialized.
+ *
+ * @return true if charging, false otherwise
+ */
+bool power_manage_is_charging(void);
 
 /**
  * @brief Get I2C bus handle
