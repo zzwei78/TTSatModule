@@ -22,6 +22,7 @@
 #include "system/syslog.h"
 #include "tt/tt_module_ota.h"
 #include "tt/tt_module.h"
+#include "system/sleep_manager.h"
 
 /* Tag for logging */
 static const char *TAG = "GATT_OTA";
@@ -31,7 +32,7 @@ static const char *TAG = "GATT_OTA";
 #define NORMAL_GATT_MTU_SIZE       512   // Normal MTU size (same as OTA - no MTU switching needed)
 
 /* OTA timeout settings */
-#define OTA_TIMEOUT_MS            8000  // OTA data reception timeout in milliseconds
+#define OTA_TIMEOUT_MS            30000  // OTA data reception timeout (30s — BLE can be slow)
 
 /* OTA server initialization flag */
 static bool g_ota_server_initialized = false;
@@ -132,6 +133,7 @@ static void ota_cleanup(void)
     g_ota_expected_seq = 0;
     g_ota_last_notified_progress = 0;  // Reset progress tracking
     ota_timeout_stop();
+    sleep_manager_set_inhibit(false);   /* Re-allow sleep after OTA */
 
     // Restore MTU with saved connection handle
     restore_normal_mtu(conn_handle);
@@ -290,6 +292,7 @@ static esp_err_t handle_ota_control_command(uint16_t conn_handle, const uint8_t 
             g_ota_first_packet = true;
             g_ota_expected_seq = 0;
             g_ota_last_notified_progress = 0;  // Reset progress tracking for new OTA
+            sleep_manager_set_inhibit(true);   /* Prevent sleep during OTA transfer */
 
             if (partition_type == OTA_PARTITION_MCU) {
                 ota_timeout_start();

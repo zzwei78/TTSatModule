@@ -40,7 +40,8 @@ typedef struct {
     const esp_partition_t *partition;
     size_t total_size;
     size_t written_size;
-    uint32_t crc32;
+    uint32_t crc32;        /* Expected CRC32 from APP */
+    uint32_t calc_crc32;   /* Calculated CRC32 during writes */
     ota_status_t status;
     bool initialized;
 } ota_context_t;

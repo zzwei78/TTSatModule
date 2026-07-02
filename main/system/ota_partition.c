@@ -27,6 +27,7 @@ static ota_context_t g_ota_ctx = {
     .total_size = 0,
     .written_size = 0,
     .crc32 = 0,
+    .calc_crc32 = 0,
     .status = OTA_PARTITION_STATUS_IDLE,
     .initialized = false
 };
@@ -34,9 +35,11 @@ static ota_context_t g_ota_ctx = {
 /* OTA handle for ESP32 update */
 static esp_ota_handle_t g_ota_handle = 0;
 
-/* Write buffer for reducing flash write operations */
+/* Write buffer for reducing flash write operations.
+ * MUST be in internal SRAM — ESP32-S3 flash operations may not
+ * reliably access PSRAM during erase/write cycles. */
 #define OTA_WRITE_BUFFER_SIZE (4 * 1024)  // 4KB buffer
-EXT_RAM_BSS_ATTR static uint8_t g_write_buffer[OTA_WRITE_BUFFER_SIZE];
+static uint8_t g_write_buffer[OTA_WRITE_BUFFER_SIZE];
 static size_t g_buffer_offset = 0;  // Current buffer fill level
 
 /**
@@ -96,6 +99,7 @@ esp_err_t ota_partition_init(ota_partition_type_t type, size_t total_size, uint3
         g_ota_ctx.total_size = total_size;
         g_ota_ctx.written_size = 0;
         g_ota_ctx.crc32 = expected_crc32;
+        g_ota_ctx.calc_crc32 = 0;  /* Reset incremental CRC */
         g_ota_ctx.status = OTA_PARTITION_STATUS_WRITING;
         g_ota_ctx.initialized = true;
 
@@ -109,6 +113,7 @@ esp_err_t ota_partition_init(ota_partition_type_t type, size_t total_size, uint3
         g_ota_ctx.total_size = total_size;
         g_ota_ctx.written_size = 0;
         g_ota_ctx.crc32 = expected_crc32;
+        g_ota_ctx.calc_crc32 = 0;  /* Reset incremental CRC */
         g_ota_ctx.status = OTA_PARTITION_STATUS_WRITING;
         g_ota_ctx.initialized = true;
 
@@ -205,6 +210,7 @@ esp_err_t ota_partition_write(const uint8_t *data, size_t len)
     }
 
     g_ota_ctx.written_size += len;
+    g_ota_ctx.calc_crc32 = esp_crc32_le(g_ota_ctx.calc_crc32, data, len);
 
     SYS_LOGD_MODULE(SYS_LOG_MODULE_OTA, TAG, "Buffered %d bytes, total: %d/%d, buffer: %d/%d",
              len, g_ota_ctx.written_size, g_ota_ctx.total_size, g_buffer_offset, OTA_WRITE_BUFFER_SIZE);
@@ -240,6 +246,15 @@ esp_err_t ota_partition_finalize(void)
         g_ota_ctx.status = OTA_PARTITION_STATUS_FAILED;
         g_ota_ctx.initialized = false;
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    /* CRC32 log only (not rejecting — APP CRC algorithm not yet confirmed).
+     * Will enable rejection once APP-side CRC32 variant is verified to match. */
+    if (g_ota_ctx.crc32 != 0) {
+        bool crc_match = (g_ota_ctx.calc_crc32 == g_ota_ctx.crc32);
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "CRC32: calc=0x%08x expected=0x%08x %s",
+                 g_ota_ctx.calc_crc32, g_ota_ctx.crc32,
+                 crc_match ? "OK" : "MISMATCH (not rejecting)");
     }
 
     g_ota_ctx.status = OTA_PARTITION_STATUS_VERIFYING;
