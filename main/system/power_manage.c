@@ -899,7 +899,8 @@ static void __attribute__((unused)) fuel_gauge_monitor_task(void *pvParameters)
             if (!tt_module_is_force_on()) {
                 tt_state_t tt_state = tt_module_get_state();
 
-                if (tt_state == TT_STATE_WORKING && voltage < POWER_MANAGE_TT_MODULE_V_OFF_MV) {
+                if ((tt_state == TT_STATE_WORKING || tt_state == TT_STATE_UPGRADE_MODE)
+                    && voltage < POWER_MANAGE_TT_MODULE_V_OFF_MV) {
                     SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
                         "[BATT] Low battery: %umV < %umV, auto-shutdown TT module",
                         voltage, POWER_MANAGE_TT_MODULE_V_OFF_MV);

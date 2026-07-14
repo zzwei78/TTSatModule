@@ -23,6 +23,8 @@
 #include "tt/tt_module_ota.h"
 #include "tt/tt_module.h"
 #include "system/sleep_manager.h"
+#include "fuel_gauge.h"
+#include "system/power_manage.h"
 
 /* Tag for logging */
 static const char *TAG = "GATT_OTA";
@@ -86,7 +88,7 @@ static uint16_t crc16_modbus(const uint8_t *data, size_t len);
 /**
  * @brief Set MTU size for OTA
  */
-static void set_ota_mtu(void)
+static void set_ota_mtu(uint16_t conn_handle)
 {
     int rc = ble_att_set_preferred_mtu(OTA_GATT_MTU_SIZE);
     if (rc != 0) {
@@ -94,6 +96,23 @@ static void set_ota_mtu(void)
     } else {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "MTU set to %d for OTA", OTA_GATT_MTU_SIZE);
     }
+
+    /* Wait for MTU exchange to complete — APP may send data immediately
+     * after receiving START OK. If MTU hasn't been applied yet, large
+     * packets get truncated, causing length mismatch errors. */
+    if (conn_handle != 0) {
+        uint16_t current_mtu = ble_att_mtu(conn_handle);
+        for (int i = 0; i < 10 && current_mtu < OTA_GATT_MTU_SIZE; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            current_mtu = ble_att_mtu(conn_handle);
+        }
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "MTU negotiated: %d (target=%d)",
+                 current_mtu, OTA_GATT_MTU_SIZE);
+    }
+
+    /* Request fast connection interval for OTA throughput */
+    extern int ble_gatt_server_request_ota_fast(void);
+    ble_gatt_server_request_ota_fast();
 }
 
 /**
@@ -134,6 +153,10 @@ static void ota_cleanup(void)
     g_ota_last_notified_progress = 0;  // Reset progress tracking
     ota_timeout_stop();
     sleep_manager_set_inhibit(false);   /* Re-allow sleep after OTA */
+
+    /* Restore normal BLE connection interval */
+    extern int ble_gatt_server_request_normal(void);
+    ble_gatt_server_request_normal();
 
     // Restore MTU with saved connection handle
     restore_normal_mtu(conn_handle);
@@ -267,6 +290,15 @@ static esp_err_t handle_ota_control_command(uint16_t conn_handle, const uint8_t 
     switch (packet->cmd) {
     case OTA_CMD_START_MCU:
     case OTA_CMD_START_TT:
+        /* Reject OTA during active voice call */
+        extern bool spp_voice_server_is_call_active(void);
+        if (spp_voice_server_is_call_active()) {
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA rejected: voice call active");
+            response = OTA_RESP_ERROR;
+            gatt_ota_server_send_status(conn_handle, OTA_STATUS_FAILED, 0);
+            break;
+        }
+
         // Check if OTA is already in progress
         if (g_ota_in_progress) {
             SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA already in progress");
@@ -275,40 +307,95 @@ static esp_err_t handle_ota_control_command(uint16_t conn_handle, const uint8_t 
             break;
         }
 
-        // Set preferred MTU (client should initiate exchange before OTA)
-        set_ota_mtu();
+        // Set preferred MTU and wait for exchange to complete
+        set_ota_mtu(conn_handle);
 
-        ota_partition_type_t partition_type;
         if (packet->cmd == OTA_CMD_START_MCU) {
-            partition_type = OTA_PARTITION_MCU;
-        } else {
-            partition_type = OTA_PARTITION_TT;
-        }
+            /* === MCU OTA: store to flash partition, then boot === */
 
-        esp_err_t ret = ota_partition_init(partition_type, packet->total_size, packet->crc32);
-        if (ret == ESP_OK) {
-            g_ota_in_progress = true;
-            g_ota_conn_handle = conn_handle;
-            g_ota_first_packet = true;
-            g_ota_expected_seq = 0;
-            g_ota_last_notified_progress = 0;  // Reset progress tracking for new OTA
-            sleep_manager_set_inhibit(true);   /* Prevent sleep during OTA transfer */
-
-            if (partition_type == OTA_PARTITION_MCU) {
-                ota_timeout_start();
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "MCU OTA started: size=%d, crc32=0x%08x",
-                         packet->total_size, packet->crc32);
-            } else {
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA started: size=%d, crc32=0x%08x",
-                         packet->total_size, packet->crc32);
+            /* Battery check — MCU OTA writes to flash and reboots,
+             * power loss during write can brick the device */
+            fuel_gauge_handle_t fg = power_manage_get_fuel_gauge_handle();
+            if (fg != NULL) {
+                uint16_t voltage = fuel_gauge_get_voltage(fg);
+                if (voltage > 0 && voltage < TT_OTA_MIN_BATTERY_MV) {
+                    SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "MCU OTA rejected: battery %umV < %umV",
+                             voltage, TT_OTA_MIN_BATTERY_MV);
+                    response = OTA_RESP_ERROR;
+                    break;
+                }
             }
 
-            response = OTA_RESP_OK;
-            gatt_ota_server_send_status(conn_handle, OTA_STATUS_WRITING, 0);
+            esp_err_t ret = ota_partition_init(OTA_PARTITION_MCU, packet->total_size, packet->crc32);
+            if (ret == ESP_OK) {
+                g_ota_in_progress = true;
+                g_ota_conn_handle = conn_handle;
+                g_ota_first_packet = true;
+                g_ota_expected_seq = 0;
+                g_ota_last_notified_progress = 0;
+                sleep_manager_set_inhibit(true);
+                ota_timeout_start();
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "MCU OTA started: size=%d", packet->total_size);
+                response = OTA_RESP_OK;
+                gatt_ota_server_send_status(conn_handle, OTA_STATUS_WRITING, 0);
+            } else {
+                SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "MCU OTA init failed: %s", esp_err_to_name(ret));
+                response = OTA_RESP_ERROR;
+                gatt_ota_server_send_status(conn_handle, OTA_STATUS_FAILED, 0);
+            }
         } else {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to start OTA: %s", esp_err_to_name(ret));
-            response = OTA_RESP_ERROR;
-            gatt_ota_server_send_status(conn_handle, OTA_STATUS_FAILED, 0);
+            /* === TT OTA: streaming mode (BLE → XMODEM → TT, no flash storage) === */
+            fuel_gauge_handle_t fg = power_manage_get_fuel_gauge_handle();
+            if (fg != NULL) {
+                uint16_t voltage = fuel_gauge_get_voltage(fg);
+                if (voltage > 0 && voltage < TT_OTA_MIN_BATTERY_MV) {
+                    SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA rejected: battery %umV < %umV",
+                             voltage, TT_OTA_MIN_BATTERY_MV);
+                    response = OTA_RESP_ERROR;
+                    break;
+                }
+            }
+
+            /* Define progress callback that forwards to BLE */
+            void tt_stream_progress_cb(tt_ota_state_t state, int progress) {
+                uint8_t gatt_status;
+                switch (state) {
+                    case TT_OTA_STATE_PREPARING:
+                    case TT_OTA_STATE_WAITING_READY:
+                    case TT_OTA_STATE_UPLOADING:
+                        gatt_status = OTA_STATUS_WRITING;
+                        break;
+                    case TT_OTA_STATE_VERIFYING:
+                        gatt_status = OTA_STATUS_VERIFYING;
+                        break;
+                    case TT_OTA_STATE_COMPLETED:
+                        gatt_status = OTA_STATUS_SUCCESS;
+                        break;
+                    case TT_OTA_STATE_FAILED:
+                        gatt_status = OTA_STATUS_FAILED;
+                        break;
+                    default:
+                        gatt_status = OTA_STATUS_WRITING;
+                        break;
+                }
+                gatt_ota_server_send_status(conn_handle, gatt_status, (uint8_t)progress);
+            }
+
+            esp_err_t ret = tt_module_ota_begin(packet->total_size, tt_stream_progress_cb);
+            if (ret == ESP_OK) {
+                g_ota_in_progress = true;
+                g_ota_conn_handle = conn_handle;
+                g_ota_first_packet = true;
+                g_ota_expected_seq = 0;
+                g_ota_last_notified_progress = 0;
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA begin: size=%d (prep in background)", packet->total_size);
+                response = OTA_RESP_OK;
+                /* APP should wait for OTA_STATUS_WRITING(5%) before sending data */
+            } else {
+                SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA begin failed: %s", esp_err_to_name(ret));
+                response = OTA_RESP_ERROR;
+                gatt_ota_server_send_status(conn_handle, OTA_STATUS_FAILED, 0);
+            }
         }
         break;
 
@@ -345,6 +432,16 @@ static esp_err_t handle_ota_control_command(uint16_t conn_handle, const uint8_t 
 static esp_err_t handle_ota_data_write(uint16_t conn_handle, const uint8_t *data, size_t len)
 {
     uint8_t response = OTA_RESP_OK;
+
+    /* Debug: log first N bytes of every data packet */
+    if (len > 0) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Data pkt: len=%d, first bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+                 len,
+                 len > 0 ? data[0] : 0, len > 1 ? data[1] : 0,
+                 len > 2 ? data[2] : 0, len > 3 ? data[3] : 0,
+                 len > 4 ? data[4] : 0, len > 5 ? data[5] : 0,
+                 len > 6 ? data[6] : 0, len > 7 ? data[7] : 0);
+    }
 
     if (data == NULL || len < 6) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Invalid data packet: too short (len=%d), aborting OTA", len);
@@ -440,11 +537,49 @@ static esp_err_t handle_ota_data_write(uint16_t conn_handle, const uint8_t *data
         g_ota_expected_seq++;
     }
 
-    // Reset timeout timer for MCU OTA
-    ota_partition_type_t part_type = ota_partition_get_type();
-    if (part_type == OTA_PARTITION_MCU) {
-        ota_timeout_start();  // Reset timeout timer on each data packet
+    // Route data based on OTA type
+    if (tt_module_ota_is_in_progress()) {
+        /* === TT streaming OTA: feed data to XMODEM === */
+
+        /* Check if TT module is ready for data (prep complete) */
+        if (!tt_module_ota_is_ready()) {
+            /* Prep not done yet — APP should wait for WRITING status.
+             * Return error so APP knows to slow down/wait. */
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA not ready for data yet (prep in progress)");
+            response = OTA_RESP_INVALID_STATE;
+            struct os_mbuf *txom = ble_hs_mbuf_from_flat(&response, 1);
+            if (txom) ble_gatts_notify_custom(conn_handle, ota_control_val_handle, txom);
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        /* Feed data to XMODEM */
+        esp_err_t feed_ret = tt_module_ota_feed(payload, data_len);
+        if (feed_ret != ESP_OK) {
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA feed failed (result=%d), aborting",
+                     tt_module_ota_get_result());
+            gatt_ota_server_send_status(conn_handle, OTA_STATUS_FAILED, 0);
+            tt_module_ota_cancel();  /* Cancel immediately — don't call finish (would block 120s) */
+            ota_cleanup();
+            return ESP_FAIL;
+        }
+
+        /* Send ACK */
+        response = OTA_RESP_OK;
+        struct os_mbuf *txom = ble_hs_mbuf_from_flat(&response, 1);
+        if (txom) ble_gatts_notify_custom(conn_handle, ota_control_val_handle, txom);
+
+        /* Check if all data received — trigger finish if so */
+        if (tt_module_ota_get_state() == TT_OTA_STATE_UPLOADING) {
+            /* APP signals completion by sending a zero-length data packet or
+             * we detect completion via total_size tracking inside feed().
+             * For now, APP sends an explicit ABORT->finalize or we rely on
+             * the total_size match. Check via a separate finalize command. */
+        }
+        return ESP_OK;
     }
+
+    /* === MCU OTA: write to flash partition === */
+    ota_timeout_start();  // Reset timeout timer on each data packet
 
     // Write data to partition
     esp_err_t ret = ota_partition_write(payload, data_len);
@@ -463,11 +598,9 @@ static esp_err_t handle_ota_data_write(uint16_t conn_handle, const uint8_t *data
     SYS_LOGD_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA progress: %d/%d bytes (%d%%)", written, total, progress);
 
     // Only send status notify every 5% progress change to reduce BLE traffic
-    // Also send on first packet (0%) and completion (100%)
     if (progress == 0 || progress >= g_ota_last_notified_progress + 5 || progress == 100) {
         gatt_ota_server_send_status(conn_handle, OTA_STATUS_WRITING, progress);
         g_ota_last_notified_progress = progress;
-        SYS_LOGD_MODULE(SYS_LOG_MODULE_OTA, TAG, "Status notify sent: %d%%", progress);
     }
 
     // Check if all data has been written (final packet)
@@ -496,75 +629,18 @@ static esp_err_t handle_ota_data_write(uint16_t conn_handle, const uint8_t *data
         // Finalize and verify
         ret = ota_partition_finalize();
         if (ret == ESP_OK) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA completed successfully");
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "MCU OTA completed successfully");
             gatt_ota_server_send_status(conn_handle, OTA_STATUS_SUCCESS, 100);
 
-            // Check partition type to determine next action
-            part_type = ota_partition_get_type();
-
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA partition type: %d", part_type);
-
-            // Handle MCU OTA - reboot to apply new firmware
-            if (part_type == OTA_PARTITION_MCU) {
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "MCU firmware updated, rebooting to apply...");
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Restarting in 3 seconds...");
-
-                // Delay to allow final status to be sent
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                esp_restart();
-
-                // Code will not reach here due to restart
-                return ESP_OK;
-            }
-
-            // Handle TT module OTA - start XMODEM update from partition
-            if (part_type == OTA_PARTITION_TT) {
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT module firmware downloaded, starting XMODEM update...");
-
-                // Notify client that TT module update is starting
-                gatt_ota_server_send_status(conn_handle, OTA_STATUS_WRITING, 0);
-
-                // Delay a bit to allow status to be sent
-                vTaskDelay(pdMS_TO_TICKS(500));
-
-                // Define progress callback to notify BLE client
-                void tt_ota_progress_callback(tt_ota_state_t state, int progress) {
-                    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA progress: state=%d, progress=%d%%", state, progress);
-
-                    // Map TT OTA state to GATT OTA status
-                    uint8_t gatt_status;
-                    switch (state) {
-                        case TT_OTA_STATE_UPLOADING:
-                        case TT_OTA_STATE_VERIFYING:
-                            gatt_status = OTA_STATUS_WRITING;
-                            break;
-                        case TT_OTA_STATE_COMPLETED:
-                            gatt_status = OTA_STATUS_SUCCESS;
-                            // Clean up OTA state when TT OTA completes
-                            ota_cleanup();
-                            break;
-                        case TT_OTA_STATE_FAILED:
-                            gatt_status = OTA_STATUS_FAILED;
-                            // Clean up OTA state on failure
-                            ota_cleanup();
-                            break;
-                        default:
-                            gatt_status = OTA_STATUS_WRITING;
-                            break;
-                    }
-
-                    // Send status update to BLE client
-                    gatt_ota_server_send_status(conn_handle, gatt_status, progress);
-                }
-
-                // Start TT module firmware update from partition
-                ret = tt_module_ota_start_update(tt_ota_progress_callback);
-                if (ret != ESP_OK) {
-                    SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to start TT module OTA: %s", esp_err_to_name(ret));
-                    gatt_ota_server_send_status(conn_handle, OTA_STATUS_FAILED, 0);
-                    ota_cleanup();
-                }
-            }
+            // MCU OTA: power off TT first, then reboot to apply new firmware
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "MCU firmware updated, powering off TT and rebooting...");
+            tt_module_user_power_off();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            sleep_manager_set_inhibit(false);
+            ota_cleanup();
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
+            return ESP_OK;  /* not reached */
         } else {
             SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA finalization failed: %s", esp_err_to_name(ret));
             gatt_ota_server_send_status(conn_handle, OTA_STATUS_FAILED, 100);
@@ -825,6 +901,13 @@ void gatt_ota_server_cleanup_on_disconnect(uint16_t conn_handle)
         if (g_ota_in_progress) {
             SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG,
                 "OTA connection (handle=%d) lost during OTA, cleaning up state", conn_handle);
+
+            /* Cancel TT streaming OTA if in progress (stops watchdog, recovers TT) */
+            if (tt_module_ota_is_in_progress()) {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "Cancelling TT OTA due to BLE disconnect");
+                tt_module_ota_cancel();
+            }
+
             ota_cleanup();
         }
     } else if (g_ota_in_progress) {

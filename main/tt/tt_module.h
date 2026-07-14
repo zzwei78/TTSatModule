@@ -61,6 +61,7 @@ typedef enum {
     TT_STATE_USER_OFF         = 4,  /* 用户关机（NVS持久化） */
     TT_STATE_WORKING          = 5,  /* 正常工作 */
     TT_STATE_UPDATING         = 6,  /* 升级状态（OTA） */
+    TT_STATE_UPGRADE_MODE     = 7,  /* 上次OTA未完成，TT模块处于升级模式 */
 } tt_state_t;
 
 /* ========== Tiantong Module Error Codes ========== */

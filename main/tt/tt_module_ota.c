@@ -1,5 +1,13 @@
 /*
- * tt_module_ota.c - Tiantong Module OTA Update Implementation
+ * tt_module_ota.c - Tiantong Module OTA Update (Streaming Implementation)
+ *
+ * Real-time streaming: BLE → 128B buffer → XMODEM → TT module.
+ * Based on HWA_OTA demo code (tiantong ota doc.docx).
+ *
+ * Flow:
+ *   begin() → prep task (stop MUX, AT+UPDATE, reset, setbaud, loadx, wait 'C')
+ *   feed()  → accumulate 128B → XMODEM packet → send via UART
+ *   finish()→ flush → EOT → wait "done" → recover TT
  *
  * SPDX-FileCopyrightText: 2021-2025 Espressif Systems (Shanghai) CO LTD
  *
@@ -14,728 +22,575 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_partition.h"
+#include "esp_timer.h"
 #include "driver/uart.h"
 #include "tt/tt_module_ota.h"
 #include "tt/tt_module.h"
 #include "system/syslog.h"
 #include "tt/tt_hardware.h"
-#include "system/ota_partition.h"
+#include "system/sleep_manager.h"
 
 static const char *TAG = "TT_MODULE_OTA";
 
-/* External functions */
-extern esp_err_t gsm0710_manager_stop(void);
-
-/* OTA Context */
-typedef struct {
-    tt_ota_state_t state;
-    bool initialized;
-    bool in_progress;
-    bool streaming_mode;
-    SemaphoreHandle_t mutex;
-    tt_ota_progress_cb_t progress_cb;
-    TaskHandle_t ota_task_handle;
-    const esp_partition_t *partition;
-    size_t partition_size;
-    size_t uploaded_size;
-    size_t total_size;
-    uint8_t packet_num;
-} tt_ota_context_t;
-
-/* Global OTA Context */
-static tt_ota_context_t g_tt_ota = {
-    .state = TT_OTA_STATE_IDLE,
-    .initialized = false,
-    .in_progress = false,
-    .streaming_mode = false,
-    .mutex = NULL,
-    .progress_cb = NULL,
-    .ota_task_handle = NULL,
-    .partition = NULL,
-    .partition_size = 0,
-    .uploaded_size = 0,
-    .total_size = 0,
-    .packet_num = 1
-};
+/* TT UART port (same as normal TT communication) */
+#define TT_OTA_UART_PORT      UART_NUM_1
 
 /* XMODEM Protocol Constants */
-#define XMODEM_SOH 0x01
-#define XMODEM_STX 0x02
-#define XMODEM_EOT 0x04
-#define XMODEM_ACK 0x06
-#define XMODEM_NAK 0x15
-#define XMODEM_CAN 0x18
-#define XMODEM_EOF 0x1A
-#define XMODEM_CRC 0x43
+#define XMODEM_SOH          0x01
+#define XMODEM_EOT          0x04
+#define XMODEM_ACK          0x06
+#define XMODEM_NAK          0x15
+#define XMODEM_CAN          0x18
+#define XMODEM_EOF          0x1A   /* pad byte for short packets */
+#define XMODEM_CRC          0x43   /* 'C' — CRC mode request from receiver */
 
-#define XMODEM_PACKET_SIZE 128
-#define XMODEM_PACKET_TOTAL 133  // 128 + 3 (SOH + packet # + ~packet #)
-#define XMODEM_TIMEOUT_MS 1000
-#define XMODEM_MAX_RETRIES 10
+#define XMODEM_PACKET_SIZE  128
+#define XMODEM_PACKET_TOTAL 133    /* SOH + seq + ~seq + 128 data + CRC16(2) */
+#define XMODEM_MAX_RETRIES  10
 
 /* Baudrate */
 #define TT_UART_BAUD_NORMAL  115200
-#define TT_UART_BAUD_HIGH     3000000
+#define TT_UART_BAUD_HIGH    921600
 
-/* Static OTA data buffer - avoids repeated malloc/free during OTA */
-static uint8_t g_ota_data_buffer[XMODEM_PACKET_SIZE];
+/* OTA timeouts (ms) */
+#define OTA_TIMEOUT_READY      30000   /* Wait for "ready" after reset */
+#define OTA_TIMEOUT_BAUD_OK    5000    /* Wait for "baud ok" */
+#define OTA_TIMEOUT_CRC        30000   /* Wait for 'C' after loadx */
+#define OTA_TIMEOUT_ACK        3000    /* Per-packet ACK timeout */
+#define OTA_TIMEOUT_DONE       120000  /* Wait for "done" after EOT */
+#define OTA_TIMEOUT_DATA_GAP   60000   /* Max gap between BLE data packets (60s) */
 
-/* Forward declarations */
-static void tt_ota_task(void *pvParameters);
-static int xmodem_send_packet(const uint8_t *data, size_t len, uint8_t packet_num);
-static int xmodem_receive_byte(int timeout_ms);
-static int xmodem_wait_for_crc(void);
+/* ========== OTA Context ========== */
 
-/**
- * @brief Initialize TT Module OTA Update
- */
-esp_err_t tt_module_ota_init(void)
+typedef struct {
+    /* State */
+    volatile tt_ota_state_t state;
+    volatile tt_ota_result_t result;
+    volatile bool in_progress;
+    volatile bool ready_for_data;   /* prep complete, XMODEM 'C' received */
+    volatile bool feed_failed;      /* set by feed() on XMODEM error */
+    volatile int64_t last_feed_time; /* Timestamp of last feed() call */
+
+    /* Management */
+    SemaphoreHandle_t mutex;
+    tt_ota_progress_cb_t progress_cb;
+    TaskHandle_t prep_task_handle;
+    bool initialized;
+
+    /* Data tracking */
+    volatile size_t total_size;
+    volatile size_t received_size;
+
+    /* XMODEM buffer (only accessed from feed/finish — single context) */
+    uint8_t xmodem_buf[XMODEM_PACKET_SIZE];
+    uint8_t buf_offset;
+    uint8_t packet_num;
+} tt_ota_context_t;
+
+static tt_ota_context_t g_tt_ota = {
+    .state = TT_OTA_STATE_IDLE,
+    .result = TT_OTA_RESULT_OK,
+    .in_progress = false,
+    .ready_for_data = false,
+    .feed_failed = false,
+    .last_feed_time = 0,
+    .mutex = NULL,
+    .progress_cb = NULL,
+    .prep_task_handle = NULL,
+    .initialized = false,
+    .total_size = 0,
+    .received_size = 0,
+    .buf_offset = 0,
+    .packet_num = 1,
+};
+
+/* ========== Raw UART Helpers ========== */
+
+static void ota_uart_flush(void)
 {
-    if (g_tt_ota.initialized) {
-        return ESP_OK;
+    uart_flush_input(TT_OTA_UART_PORT);
+}
+
+static esp_err_t ota_uart_send(const uint8_t *data, size_t len)
+{
+    int written = uart_write_bytes(TT_OTA_UART_PORT, data, len);
+    if (written != (int)len) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "UART write failed: %d/%d", written, (int)len);
+        return ESP_FAIL;
     }
-
-    g_tt_ota.mutex = xSemaphoreCreateMutex();
-    if (g_tt_ota.mutex == NULL) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to create mutex");
-        return ESP_ERR_NO_MEM;
-    }
-
-    g_tt_ota.state = TT_OTA_STATE_IDLE;
-    g_tt_ota.in_progress = false;
-    g_tt_ota.initialized = true;
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT Module OTA initialized");
+    uart_wait_tx_done(TT_OTA_UART_PORT, pdMS_TO_TICKS(1000));
     return ESP_OK;
 }
 
-/**
- * @brief Deinitialize TT Module OTA Update
- */
-esp_err_t tt_module_ota_deinit(void)
+static esp_err_t ota_uart_send_str(const char *str)
 {
-    if (!g_tt_ota.initialized) {
-        return ESP_OK;
-    }
-
-    // Cancel ongoing update if any
-    if (g_tt_ota.in_progress) {
-        tt_module_ota_cancel();
-    }
-
-    if (g_tt_ota.mutex) {
-        vSemaphoreDelete(g_tt_ota.mutex);
-        g_tt_ota.mutex = NULL;
-    }
-
-    g_tt_ota.initialized = false;
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT Module OTA deinitialized");
-    return ESP_OK;
+    return ota_uart_send((const uint8_t *)str, strlen(str));
 }
 
-/**
- * @brief Get current OTA state
- */
-tt_ota_state_t tt_module_ota_get_state(void)
+static int ota_uart_read_byte(uint32_t timeout_ms)
 {
-    return g_tt_ota.state;
+    uint8_t byte;
+    int len = uart_read_bytes(TT_OTA_UART_PORT, &byte, 1, pdMS_TO_TICKS(timeout_ms));
+    return (len == 1) ? byte : -1;
 }
 
-/**
- * @brief Check if OTA update is in progress
- */
-bool tt_module_ota_is_in_progress(void)
+static esp_err_t ota_uart_wait_string(const char *expected, uint32_t timeout_ms)
 {
-    return g_tt_ota.in_progress;
-}
+    size_t exp_len = strlen(expected);
+    size_t matched = 0;
+    char buf[128];
+    int buf_pos = 0;
+    int64_t start = esp_timer_get_time();
 
-/**
- * @brief Cancel ongoing OTA update
- */
-esp_err_t tt_module_ota_cancel(void)
-{
-    if (!g_tt_ota.in_progress) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    while ((esp_timer_get_time() - start) < (int64_t)timeout_ms * 1000) {
+        int byte = ota_uart_read_byte(100);
+        if (byte < 0) continue;
 
-    SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "Cancelling OTA update...");
-
-    // Signal the task to stop
-    g_tt_ota.in_progress = false;
-    g_tt_ota.state = TT_OTA_STATE_FAILED;
-
-    // Wait for task to finish
-    if (g_tt_ota.ota_task_handle) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (g_tt_ota.ota_task_handle) {
-            vTaskDelete(g_tt_ota.ota_task_handle);
-            g_tt_ota.ota_task_handle = NULL;
-        }
-    }
-
-    // Restore normal operation
-    tt_module_reset_state();
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA update cancelled");
-    return ESP_OK;
-}
-
-/**
- * @brief Start OTA update for Tiantong Module
- */
-esp_err_t tt_module_ota_start_update(tt_ota_progress_cb_t progress_cb)
-{
-    if (!g_tt_ota.initialized) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (g_tt_ota.in_progress) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA already in progress");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // Lock mutex
-    if (xSemaphoreTake(g_tt_ota.mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to acquire mutex");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    // Find ota_tt partition
-    g_tt_ota.partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "ota_tt");
-    if (g_tt_ota.partition == NULL) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "ota_tt partition not found");
-        xSemaphoreGive(g_tt_ota.mutex);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    g_tt_ota.partition_size = g_tt_ota.partition->size;
-    g_tt_ota.uploaded_size = 0;
-    g_tt_ota.progress_cb = progress_cb;
-    g_tt_ota.in_progress = true;
-    g_tt_ota.state = TT_OTA_STATE_PREPARING;
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Found ota_tt partition, size: %d bytes", g_tt_ota.partition_size);
-
-    // Create OTA task
-    BaseType_t ret = xTaskCreate(tt_ota_task, "tt_ota_task", 8192, NULL, 5, &g_tt_ota.ota_task_handle);
-    if (ret != pdPASS) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to create OTA task");
-        g_tt_ota.in_progress = false;
-        g_tt_ota.partition = NULL;
-        xSemaphoreGive(g_tt_ota.mutex);
-        return ESP_ERR_NO_MEM;
-    }
-
-    xSemaphoreGive(g_tt_ota.mutex);
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA update started from ota_tt partition");
-    return ESP_OK;
-}
-
-/**
- * @brief OTA Task - Main update procedure
- */
-static void tt_ota_task(void *pvParameters)
-{
-    esp_err_t ret;
-    int progress = 0;
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA task started");
-
-    // Step 1: Prepare for update
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Step 1: Preparing for update...");
-    g_tt_ota.state = TT_OTA_STATE_PREPARING;
-    if (g_tt_ota.progress_cb) {
-        g_tt_ota.progress_cb(g_tt_ota.state, 0);
-    }
-
-    // Stop current mode before OTA
-    tt_state_t current_state = tt_module_get_state();
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Current TT module state: %d", current_state);
-
-    if (current_state == TT_STATE_WORKING) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Stopping MUX mode for OTA...");
-        // Stop GSM0710 MUX manager to switch to AT mode
-        esp_err_t ret = gsm0710_manager_stop();
-        if (ret != ESP_OK) {
-            SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to stop MUX manager: %s", esp_err_to_name(ret));
-        }
-        // Give time for cleanup
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-
-    progress = 10;
-    if (g_tt_ota.progress_cb) {
-        g_tt_ota.progress_cb(g_tt_ota.state, progress);
-    }
-
-    // Step 2: Reset modem and wait for ready
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Step 2: Resetting modem...");
-    tt_module_reset();
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    // Step 3: Send AT+UPDATE command
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Step 3: Sending AT+UPDATE command...");
-    g_tt_ota.state = TT_OTA_STATE_WAITING_READY;
-
-    // Send AT+UPDATE and wait for "ready" response
-    tt_at_result_t result = tt_module_send_at_cmd("+UPDATE");
-    if (result != TT_AT_RESULT_OK) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to send AT+UPDATE command");
-        goto error_exit;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // Step 4: Change baudrate to high speed
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Step 4: Changing baudrate to %d...", TT_UART_BAUD_HIGH);
-
-    // Send setbaud command
-    char baud_cmd[64];
-    snprintf(baud_cmd, sizeof(baud_cmd), "setbaud %d\r\n", TT_UART_BAUD_HIGH);
-    // Note: This would need to be sent via raw UART, not through tt_module
-    // For now, this is a placeholder
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    progress = 20;
-    if (g_tt_ota.progress_cb) {
-        g_tt_ota.progress_cb(g_tt_ota.state, progress);
-    }
-
-    // Step 5: Send loadx command
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Step 5: Sending loadx command...");
-    // Send "loadx\r\n" command
-    // Wait for 'C' (CRC) character from modem
-
-    // Step 6: Upload firmware via XMODEM
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Step 6: Uploading firmware via XMODEM...");
-    g_tt_ota.state = TT_OTA_STATE_UPLOADING;
-
-    size_t offset = 0;
-    uint8_t packet_num = 1;
-    int retry_count = 0;
-    esp_err_t read_ret;
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Starting firmware upload from partition, total size: %d bytes", g_tt_ota.partition_size);
-
-    while (offset < g_tt_ota.partition_size && g_tt_ota.in_progress) {
-        size_t chunk_size = XMODEM_PACKET_SIZE;
-        if (offset + chunk_size > g_tt_ota.partition_size) {
-            chunk_size = g_tt_ota.partition_size - offset;
+        if (buf_pos < (int)sizeof(buf) - 1) {
+            buf[buf_pos++] = (char)byte;
+            buf[buf_pos] = '\0';
+        } else {
+            memmove(buf, buf + 1, buf_pos - 1);
+            buf_pos--;
+            buf[buf_pos++] = (char)byte;
+            buf[buf_pos] = '\0';
         }
 
-        // Read chunk from partition
-        read_ret = esp_partition_read(g_tt_ota.partition, offset, g_ota_data_buffer, chunk_size);
-        if (read_ret != ESP_OK) {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to read from partition at offset %d, size %d", offset, chunk_size);
-            retry_count++;
-            if (retry_count >= XMODEM_MAX_RETRIES) {
-                SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Max retries reached while reading from partition");
-                goto error_exit;
-            }
-            continue;
-        }
-
-        // Pad with EOF if needed
-        if (chunk_size < XMODEM_PACKET_SIZE) {
-            for (size_t i = chunk_size; i < XMODEM_PACKET_SIZE; i++) {
-                g_ota_data_buffer[i] = XMODEM_EOF;
-            }
-        }
-
-        // Send packet via XMODEM
-        ret = xmodem_send_packet(g_ota_data_buffer, XMODEM_PACKET_SIZE, packet_num);
-        if (ret != ESP_OK) {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to send packet %d", packet_num);
-            retry_count++;
-            if (retry_count >= XMODEM_MAX_RETRIES) {
-                SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Max retries reached");
-                goto error_exit;
-            }
-            continue;
-        }
-
-        retry_count = 0;
-        offset += chunk_size;
-        g_tt_ota.uploaded_size = offset;
-        packet_num++;
-
-        // Update progress
-        progress = 20 + (offset * 70 / g_tt_ota.partition_size);
-        if (g_tt_ota.progress_cb) {
-            g_tt_ota.progress_cb(g_tt_ota.state, progress);
-        }
-
-        // Log progress every 10%
-        static int last_logged_progress = 0;
-        int current_progress = (offset * 100) / g_tt_ota.partition_size;
-        if (current_progress / 10 > last_logged_progress) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Upload progress: %d%% (%d/%d bytes)", current_progress, offset, g_tt_ota.partition_size);
-            last_logged_progress = current_progress / 10;
-        }
-
-        // Small delay to prevent overwhelming the modem
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Firmware upload completed, total bytes: %d", offset);
-
-    // Step 7: Send EOT (End of Transmission)
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Step 7: Sending EOT...");
-    // Send XMODEM_EOT and wait for ACK
-
-    // Step 8: Verify completion
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Step 8: Verifying...");
-    g_tt_ota.state = TT_OTA_STATE_VERIFYING;
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // Success!
-    g_tt_ota.state = TT_OTA_STATE_COMPLETED;
-    g_tt_ota.in_progress = false;
-    progress = 100;
-
-    if (g_tt_ota.progress_cb) {
-        g_tt_ota.progress_cb(g_tt_ota.state, progress);
-    }
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA update completed successfully!");
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT module will reboot and go through normal boot process (AT mode -> SIMST -> MUX mode)");
-
-    // Note: TT module will reboot automatically after firmware update
-    // The normal boot process will handle:
-    // 1. TT module boots in AT mode
-    // 2. SIMST:1 detection will trigger MUX mode switch
-    // No manual restoration needed
-
-    g_tt_ota.ota_task_handle = NULL;
-    vTaskDelete(NULL);
-
-    return;
-
-error_exit:
-    SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA update failed!");
-    g_tt_ota.state = TT_OTA_STATE_FAILED;
-    g_tt_ota.in_progress = false;
-
-    if (g_tt_ota.progress_cb) {
-        g_tt_ota.progress_cb(g_tt_ota.state, progress);
-    }
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA failed, resetting TT module state to AT command mode");
-    tt_module_reset_state();
-
-    g_tt_ota.ota_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-
-/**
- * @brief Send XMODEM packet
- */
-static int xmodem_send_packet(const uint8_t *data, size_t len, uint8_t packet_num)
-{
-    uint8_t packet[XMODEM_PACKET_TOTAL];
-    uint16_t crc = 0;
-    int i;
-
-    // Build packet
-    packet[0] = XMODEM_SOH;
-    packet[1] = packet_num;
-    packet[2] = 0xFF - packet_num;
-
-    // Copy data
-    memcpy(&packet[3], data, len);
-
-    // Pad with EOF if needed
-    for (i = len; i < XMODEM_PACKET_SIZE; i++) {
-        packet[3 + i] = XMODEM_EOF;
-    }
-
-    // Calculate CRC
-    crc = 0;
-    for (i = 3; i < XMODEM_PACKET_TOTAL - 2; i++) {
-        crc = crc ^ (packet[i] << 8);
-        for (int j = 0; j < 8; j++) {
-            if (crc & 0x8000) {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc = crc << 1;
-            }
-        }
-    }
-
-    // Add CRC to packet
-    packet[XMODEM_PACKET_TOTAL - 2] = (crc >> 8) & 0xFF;
-    packet[XMODEM_PACKET_TOTAL - 1] = crc & 0xFF;
-
-    // Send packet via UART
-    // This would use tt_module_uart_write or direct UART write
-    // For now, placeholder
-    // tt_module_uart_write(packet, XMODEM_PACKET_TOTAL);
-
-    // Wait for ACK
-    int byte = xmodem_receive_byte(XMODEM_TIMEOUT_MS);
-    if (byte == XMODEM_ACK) {
-        return ESP_OK;
-    } else if (byte == XMODEM_NAK) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "Received NAK for packet %d", packet_num);
-        return ESP_ERR_INVALID_RESPONSE;
-    } else {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "No ACK for packet %d, received: 0x%02X", packet_num, byte);
-        return ESP_ERR_TIMEOUT;
-    }
-}
-
-/**
- * @brief Receive byte from modem with timeout
- */
-static int xmodem_receive_byte(int timeout_ms)
-{
-    // Placeholder - would use tt_module_uart_read with timeout
-    // For now, simulate waiting for ACK
-    vTaskDelay(pdMS_TO_TICKS(50));
-    return XMODEM_ACK;  // Simulate success
-}
-
-/**
- * @brief Wait for CRC character from modem
- */
-static int xmodem_wait_for_crc(void)
-{
-    int retries = XMODEM_MAX_RETRIES;
-
-    while (retries-- > 0) {
-        int byte = xmodem_receive_byte(XMODEM_TIMEOUT_MS);
-        if (byte == XMODEM_CRC) {
+        if (buf_pos >= (int)exp_len && strstr(buf, expected)) {
             return ESP_OK;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
-
     return ESP_ERR_TIMEOUT;
 }
 
-/**
- * @brief Start streaming OTA update for Tiantong Module
- */
-esp_err_t tt_module_ota_start_streaming(size_t total_size, tt_ota_progress_cb_t progress_cb)
+/* ========== XMODEM Implementation ========== */
+
+static uint16_t xmodem_crc16(const uint8_t *data, size_t len)
 {
-    if (!g_tt_ota.initialized) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (g_tt_ota.in_progress) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA already in progress");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // Lock mutex
-    if (xSemaphoreTake(g_tt_ota.mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to acquire mutex");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    // Initialize streaming OTA context
-    g_tt_ota.streaming_mode = true;
-    g_tt_ota.total_size = total_size;
-    g_tt_ota.uploaded_size = 0;
-    g_tt_ota.packet_num = 1;
-    g_tt_ota.progress_cb = progress_cb;
-    g_tt_ota.in_progress = true;
-    g_tt_ota.state = TT_OTA_STATE_PREPARING;
-
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Starting TT streaming OTA: total_size=%d", total_size);
-
-    // Prepare for update
-    tt_state_t current_state = tt_module_get_state();
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Current TT module state: %d", current_state);
-
-    if (current_state == TT_STATE_WORKING) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Stopping MUX mode for OTA...");
-        esp_err_t ret = gsm0710_manager_stop();
-        if (ret != ESP_OK) {
-            SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to stop MUX manager: %s", esp_err_to_name(ret));
+    uint16_t crc = 0;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
     }
+    return crc;
+}
 
-    // Report initial progress
-    if (g_tt_ota.progress_cb) {
-        g_tt_ota.progress_cb(g_tt_ota.state, 0);
+static esp_err_t xmodem_send_packet_and_wait(const uint8_t data[128], uint8_t pkt_num)
+{
+    uint8_t pkt[XMODEM_PACKET_TOTAL];
+    pkt[0] = XMODEM_SOH;
+    pkt[1] = pkt_num;
+    pkt[2] = ~pkt_num;
+    memcpy(&pkt[3], data, 128);
+    uint16_t crc = xmodem_crc16(&pkt[3], 128);
+    pkt[131] = (crc >> 8) & 0xFF;
+    pkt[132] = crc & 0xFF;
+
+    for (int retry = 0; retry < XMODEM_MAX_RETRIES; retry++) {
+        if (ota_uart_send(pkt, XMODEM_PACKET_TOTAL) != ESP_OK) {
+            continue;
+        }
+        int resp = ota_uart_read_byte(OTA_TIMEOUT_ACK);
+        if (resp == XMODEM_ACK) return ESP_OK;
+        if (resp == XMODEM_CAN) {
+            g_tt_ota.result = TT_OTA_RESULT_ERROR_CAN;
+            return ESP_FAIL;
+        }
+        /* NAK or timeout → retry */
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "XMODEM pkt %d: resp 0x%02X, retry %d", pkt_num, resp, retry);
     }
-
-    // Reset modem and wait for ready
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Resetting modem...");
-    tt_module_reset();
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    // Send AT+UPDATE command
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Sending AT+UPDATE command...");
-    g_tt_ota.state = TT_OTA_STATE_WAITING_READY;
-
-    tt_at_result_t result = tt_module_send_at_cmd("+UPDATE");
-    if (result != TT_AT_RESULT_OK) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to send AT+UPDATE command");
-        goto error_exit;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // Change baudrate to high speed
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Changing baudrate to %d...", TT_UART_BAUD_HIGH);
-
-    char baud_cmd[64];
-    snprintf(baud_cmd, sizeof(baud_cmd), "setbaud %d\r\n", TT_UART_BAUD_HIGH);
-    // TODO: Send baudrate command via raw UART
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    // Send loadx command
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Sending loadx command...");
-    // TODO: Send "loadx\r\n" command
-
-    // Wait for 'C' (CRC) character from modem
-    if (xmodem_wait_for_crc() != ESP_OK) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to receive CRC character");
-        goto error_exit;
-    }
-
-    g_tt_ota.state = TT_OTA_STATE_UPLOADING;
-
-    if (g_tt_ota.progress_cb) {
-        g_tt_ota.progress_cb(g_tt_ota.state, 0);
-    }
-
-    xSemaphoreGive(g_tt_ota.mutex);
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT streaming OTA ready for data");
-
-    return ESP_OK;
-
-error_exit:
-    g_tt_ota.in_progress = false;
-    g_tt_ota.state = TT_OTA_STATE_FAILED;
-    xSemaphoreGive(g_tt_ota.mutex);
+    g_tt_ota.result = TT_OTA_RESULT_ERROR_XMODEM;
     return ESP_FAIL;
 }
 
-/**
- * @brief Write firmware data during streaming OTA
- */
-esp_err_t tt_module_ota_write_data(const uint8_t *data, size_t len)
+static esp_err_t xmodem_send_eot(void)
 {
-    if (!g_tt_ota.in_progress || !g_tt_ota.streaming_mode) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Streaming OTA not in progress");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (data == NULL || len == 0) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Invalid data");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (len > 4096) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Data too large: %d (max 4096)", len);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    // Lock mutex
-    if (xSemaphoreTake(g_tt_ota.mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to acquire mutex");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    // Split data into XMODEM packets (128 bytes each)
-    size_t offset = 0;
-    esp_err_t ret;
-
-    while (offset < len && g_tt_ota.in_progress) {
-        size_t chunk_size = (len - offset > XMODEM_PACKET_SIZE) ? XMODEM_PACKET_SIZE : (len - offset);
-
-        // Copy to static buffer
-        memcpy(g_ota_data_buffer, data + offset, chunk_size);
-
-        // Pad with EOF if needed
-        if (chunk_size < XMODEM_PACKET_SIZE) {
-            for (size_t i = chunk_size; i < XMODEM_PACKET_SIZE; i++) {
-                g_ota_data_buffer[i] = XMODEM_EOF;
-            }
+    uint8_t eot = XMODEM_EOT;
+    for (int i = 0; i < 3; i++) {
+        ota_uart_send(&eot, 1);
+        int resp = ota_uart_read_byte(OTA_TIMEOUT_ACK);
+        if (resp == XMODEM_ACK) {
+            /* Per XMODEM spec: send second EOT */
+            ota_uart_send(&eot, 1);
+            ota_uart_read_byte(OTA_TIMEOUT_ACK);
+            return ESP_OK;
         }
+    }
+    return ESP_FAIL;
+}
 
-        // Send packet via XMODEM
-        ret = xmodem_send_packet(g_ota_data_buffer, XMODEM_PACKET_SIZE, g_tt_ota.packet_num);
-        if (ret != ESP_OK) {
-            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to send packet %d", g_tt_ota.packet_num);
-            xSemaphoreGive(g_tt_ota.mutex);
-            return ret;
-        }
+/* ========== Recovery ========== */
 
-        offset += chunk_size;
-        g_tt_ota.uploaded_size += chunk_size;
-        g_tt_ota.packet_num++;
+static void ota_recover_tt(void)
+{
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Recovering TT module...");
+    uart_set_baudrate(TT_OTA_UART_PORT, TT_UART_BAUD_NORMAL);
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-        // Update progress
-        int progress = (g_tt_ota.uploaded_size * 100) / g_tt_ota.total_size;
-        if (g_tt_ota.progress_cb) {
-            g_tt_ota.progress_cb(g_tt_ota.state, progress);
-        }
+    tt_hw_power_off();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    tt_hw_power_on();
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
-        // Log progress every 10%
-        static int last_logged_progress = 0;
-        if (progress / 10 > last_logged_progress) {
-            SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Upload progress: %d%% (%d/%d bytes)",
-                     progress, g_tt_ota.uploaded_size, g_tt_ota.total_size);
-            last_logged_progress = progress / 10;
-        }
+    tt_module_deinit();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    tt_module_init(10);
+    tt_module_start();
 
-        // Small delay to prevent overwhelming the modem
-        vTaskDelay(pdMS_TO_TICKS(5));
+    sleep_manager_set_inhibit(false);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT module recovered");
+}
+
+/* ========== Finish Task (auto-triggered when all data received) ========== */
+
+static void ota_finish_task(void *pv)
+{
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Finish task: all data received, finalizing...");
+    tt_module_ota_finish();
+    vTaskDelete(NULL);
+}
+
+/* ========== Prep Task (background) ========== */
+
+static void ota_prep_task(void *pv)
+{
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "=== TT OTA Prep Started ===");
+
+    /* Check if TT is already in upgrade mode (interrupted OTA recovery) */
+    bool already_in_upgrade_mode = (tt_module_get_state() == TT_STATE_UPGRADE_MODE);
+
+    /* Step 1: Always stop TT communication.
+     * This stops the UART AT RX task that would otherwise compete for UART reads. */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Prep 1: Stop TT communication (stops UART RX task)");
+    tt_module_stop();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    uart_set_baudrate(TT_OTA_UART_PORT, TT_UART_BAUD_NORMAL);
+    ota_uart_flush();
+
+    if (!already_in_upgrade_mode) {
+        /* Step 2: AT+UPDATE (only for normal mode, skip for UPGRADE_MODE) */
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Prep 2: Send AT+UPDATE");
+        ota_uart_send_str("AT+UPDATE\r\n");
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Waiting 3s for TT to process AT+UPDATE...");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    } else {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Prep 2: Skip AT+UPDATE (already in UPGRADE_MODE)");
     }
 
-    xSemaphoreGive(g_tt_ota.mutex);
+    /* Step 3: Hardware reset (both paths — TT re-enters upgrade mode if needed) */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Prep 3: Hardware reset TT");
+    tt_hw_power_off();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    tt_hw_power_on();
+
+    /* Wait for "ready" (both paths) */
+    g_tt_ota.state = TT_OTA_STATE_WAITING_READY;
+    if (g_tt_ota.progress_cb) g_tt_ota.progress_cb(g_tt_ota.state, 5);
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Waiting for 'ready'...");
+    if (ota_uart_wait_string("ready", OTA_TIMEOUT_READY) != ESP_OK) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Timeout: 'ready'");
+        g_tt_ota.result = TT_OTA_RESULT_ERROR_READY_TIMEOUT;
+        goto prep_failed;
+    }
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Got 'ready'");
+
+    /* Step 4: Switch baudrate (common path) */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Prep 4: setbaud %d", TT_UART_BAUD_HIGH);
+    ota_uart_send_str("setbaud 921600\r\n");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    uart_set_baudrate(TT_OTA_UART_PORT, TT_UART_BAUD_HIGH);
+    ota_uart_flush();
+
+    if (ota_uart_wait_string("baud ok", OTA_TIMEOUT_BAUD_OK) != ESP_OK) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Timeout: 'baud ok'");
+        g_tt_ota.result = TT_OTA_RESULT_ERROR_BAUD_TIMEOUT;
+        goto prep_failed;
+    }
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Baudrate OK at %d", TT_UART_BAUD_HIGH);
+
+    /* Step 5: loadx + wait for 'C' */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Prep 5: loadx, wait for 'C'");
+    ota_uart_send_str("loadx\r\n");
+
+    bool got_c = false;
+    int64_t start = esp_timer_get_time();
+    while ((esp_timer_get_time() - start) < (int64_t)OTA_TIMEOUT_CRC * 1000) {
+        int byte = ota_uart_read_byte(1000);
+        if (byte == XMODEM_CRC) { got_c = true; break; }
+    }
+    if (!got_c) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Timeout: 'C'");
+        g_tt_ota.result = TT_OTA_RESULT_ERROR_CRC_TIMEOUT;
+        goto prep_failed;
+    }
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Got 'C' — XMODEM ready");
+    g_tt_ota.state = TT_OTA_STATE_UPLOADING;
+    g_tt_ota.ready_for_data = true;
+    g_tt_ota.last_feed_time = esp_timer_get_time();
+    if (g_tt_ota.progress_cb) g_tt_ota.progress_cb(g_tt_ota.state, 5);
+
+    /* Start data gap watchdog — aborts if BLE data stops for 60s */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Data gap watchdog armed (%ds)", OTA_TIMEOUT_DATA_GAP / 1000);
+    while (g_tt_ota.in_progress && g_tt_ota.ready_for_data) {
+        int64_t gap = esp_timer_get_time() - g_tt_ota.last_feed_time;
+        if (gap > (int64_t)OTA_TIMEOUT_DATA_GAP * 1000) {
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Data gap timeout: %lldms since last feed", (int64_t)(gap / 1000));
+            g_tt_ota.result = TT_OTA_RESULT_ERROR_DONE_TIMEOUT;
+            g_tt_ota.state = TT_OTA_STATE_FAILED;
+            g_tt_ota.ready_for_data = false;
+            if (g_tt_ota.progress_cb) g_tt_ota.progress_cb(g_tt_ota.state, 0);
+            ota_recover_tt();
+            g_tt_ota.in_progress = false;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    /* Prep task done — exit. feed()/finish() handle the rest. */
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "=== Prep Complete, ready for data ===");
+    g_tt_ota.prep_task_handle = NULL;
+    vTaskDelete(NULL);
+    return;
+
+prep_failed:
+    SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "=== Prep FAILED ===");
+    g_tt_ota.state = TT_OTA_STATE_FAILED;
+    g_tt_ota.ready_for_data = false;
+    if (g_tt_ota.progress_cb) g_tt_ota.progress_cb(g_tt_ota.state, 0);
+
+    ota_recover_tt();
+
+    g_tt_ota.in_progress = false;
+    g_tt_ota.prep_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ========== Public API ========== */
+
+esp_err_t tt_module_ota_init(void)
+{
+    if (g_tt_ota.initialized) return ESP_OK;
+    g_tt_ota.mutex = xSemaphoreCreateMutex();
+    if (!g_tt_ota.mutex) return ESP_ERR_NO_MEM;
+    g_tt_ota.initialized = true;
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA initialized");
     return ESP_OK;
 }
 
-/**
- * @brief Finalize streaming OTA update
- */
-esp_err_t tt_module_ota_finalize_streaming(void)
+esp_err_t tt_module_ota_deinit(void)
 {
-    if (!g_tt_ota.in_progress || !g_tt_ota.streaming_mode) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Streaming OTA not in progress");
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (!g_tt_ota.initialized) return ESP_OK;
+    if (g_tt_ota.in_progress) tt_module_ota_cancel();
+    if (g_tt_ota.mutex) { vSemaphoreDelete(g_tt_ota.mutex); g_tt_ota.mutex = NULL; }
+    g_tt_ota.initialized = false;
+    return ESP_OK;
+}
 
-    // Lock mutex
+tt_ota_state_t tt_module_ota_get_state(void) { return g_tt_ota.state; }
+tt_ota_result_t tt_module_ota_get_result(void) { return g_tt_ota.result; }
+bool tt_module_ota_is_in_progress(void) { return g_tt_ota.in_progress; }
+bool tt_module_ota_is_ready(void) { return g_tt_ota.ready_for_data; }
+
+esp_err_t tt_module_ota_begin(size_t total_size, tt_ota_progress_cb_t progress_cb)
+{
+    if (!g_tt_ota.initialized) return ESP_ERR_INVALID_STATE;
+    if (g_tt_ota.in_progress) return ESP_ERR_INVALID_STATE;
+
     if (xSemaphoreTake(g_tt_ota.mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Failed to acquire mutex");
         return ESP_ERR_TIMEOUT;
     }
 
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Finalizing TT streaming OTA...");
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Total uploaded: %d bytes", g_tt_ota.uploaded_size);
+    /* Reset context */
+    g_tt_ota.state = TT_OTA_STATE_PREPARING;
+    g_tt_ota.result = TT_OTA_RESULT_OK;
+    g_tt_ota.in_progress = true;
+    g_tt_ota.ready_for_data = false;
+    g_tt_ota.feed_failed = false;
+    g_tt_ota.total_size = total_size;
+    g_tt_ota.received_size = 0;
+    g_tt_ota.buf_offset = 0;
+    g_tt_ota.packet_num = 1;
+    g_tt_ota.progress_cb = progress_cb;
 
-    // Send EOT (End of Transmission)
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Sending EOT...");
-    // TODO: Send XMODEM_EOT and wait for ACK
+    /* Inhibit sleep */
+    sleep_manager_set_inhibit(true);
 
-    // Verify completion
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Verifying...");
-    g_tt_ota.state = TT_OTA_STATE_VERIFYING;
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // Success!
-    g_tt_ota.state = TT_OTA_STATE_COMPLETED;
-    g_tt_ota.in_progress = false;
-    g_tt_ota.streaming_mode = false;
-
-    if (g_tt_ota.progress_cb) {
-        g_tt_ota.progress_cb(g_tt_ota.state, 100);
+    /* Start prep task */
+    BaseType_t ret = xTaskCreate(ota_prep_task, "tt_ota_prep", 8192, NULL, 5,
+                                  &g_tt_ota.prep_task_handle);
+    if (ret != pdPASS) {
+        g_tt_ota.in_progress = false;
+        sleep_manager_set_inhibit(false);
+        xSemaphoreGive(g_tt_ota.mutex);
+        return ESP_ERR_NO_MEM;
     }
 
-    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT streaming OTA completed successfully!");
-
     xSemaphoreGive(g_tt_ota.mutex);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT OTA begin: total_size=%d", (int)total_size);
+    return ESP_OK;
+}
+
+esp_err_t tt_module_ota_feed(const uint8_t *data, size_t len)
+{
+    if (!g_tt_ota.in_progress) return ESP_ERR_INVALID_STATE;
+    if (!g_tt_ota.ready_for_data) return ESP_ERR_INVALID_STATE;
+    if (g_tt_ota.feed_failed) return ESP_FAIL;
+
+    size_t offset = 0;
+    while (offset < len) {
+        /* Fill XMODEM buffer */
+        size_t space = XMODEM_PACKET_SIZE - g_tt_ota.buf_offset;
+        size_t to_copy = (len - offset < space) ? (len - offset) : space;
+        memcpy(&g_tt_ota.xmodem_buf[g_tt_ota.buf_offset], &data[offset], to_copy);
+        g_tt_ota.buf_offset += to_copy;
+        offset += to_copy;
+
+        /* When buffer is full, send XMODEM packet */
+        if (g_tt_ota.buf_offset >= XMODEM_PACKET_SIZE) {
+            if (xmodem_send_packet_and_wait(g_tt_ota.xmodem_buf, g_tt_ota.packet_num) != ESP_OK) {
+                SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "XMODEM failed at packet %d", g_tt_ota.packet_num);
+                g_tt_ota.feed_failed = true;
+                return ESP_FAIL;
+            }
+            g_tt_ota.packet_num++;
+            g_tt_ota.buf_offset = 0;
+        }
+    }
+
+    g_tt_ota.received_size += len;
+    g_tt_ota.last_feed_time = esp_timer_get_time();  /* Refresh data gap watchdog */
+
+    /* Progress: 5% - 85% mapped to data transfer */
+    if (g_tt_ota.total_size > 0 && g_tt_ota.progress_cb) {
+        int pct = 5 + (int)(g_tt_ota.received_size * 80 / g_tt_ota.total_size);
+        if (pct > 85) pct = 85;
+        g_tt_ota.progress_cb(TT_OTA_STATE_UPLOADING, pct);
+    }
+
+    /* Auto-detect completion: all data received → trigger finish in background */
+    if (g_tt_ota.total_size > 0 && g_tt_ota.received_size >= g_tt_ota.total_size) {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "All data received (%d/%d bytes), auto-finishing",
+                 (int)g_tt_ota.received_size, (int)g_tt_ota.total_size);
+        g_tt_ota.ready_for_data = false;  /* Stop accepting more data */
+        xTaskCreate(ota_finish_task, "tt_ota_fin", 8192, NULL, 5, NULL);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t tt_module_ota_finish(void)
+{
+    if (!g_tt_ota.in_progress) return ESP_ERR_INVALID_STATE;
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Finishing TT OTA: received %d bytes, %d packets",
+             (int)g_tt_ota.received_size, g_tt_ota.packet_num - 1);
+
+    /* Flush remaining buffer (pad with EOF) */
+    if (g_tt_ota.buf_offset > 0) {
+        for (int i = g_tt_ota.buf_offset; i < XMODEM_PACKET_SIZE; i++) {
+            g_tt_ota.xmodem_buf[i] = XMODEM_EOF;
+        }
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Flushing final partial packet (%d bytes data)", g_tt_ota.buf_offset);
+        if (xmodem_send_packet_and_wait(g_tt_ota.xmodem_buf, g_tt_ota.packet_num) != ESP_OK) {
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Final packet XMODEM failed");
+            goto finish_failed;
+        }
+        g_tt_ota.buf_offset = 0;
+    }
+
+    /* Send EOT */
+    if (g_tt_ota.progress_cb) g_tt_ota.progress_cb(TT_OTA_STATE_VERIFYING, 85);
+    g_tt_ota.state = TT_OTA_STATE_VERIFYING;
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Sending EOT...");
+    if (xmodem_send_eot() != ESP_OK) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "EOT failed");
+        goto finish_failed;
+    }
+
+    /* Wait for "done" or "md5 failed" */
+    char resp_buf[128] = {0};
+    int buf_pos = 0;
+    int64_t start = esp_timer_get_time();
+
+    while ((esp_timer_get_time() - start) < (int64_t)OTA_TIMEOUT_DONE * 1000) {
+        int byte = ota_uart_read_byte(1000);
+        if (byte < 0) {
+            /* Update progress during wait */
+            if (g_tt_ota.progress_cb) {
+                int elapsed_pct = (int)((esp_timer_get_time() - start) * 10 / ((int64_t)OTA_TIMEOUT_DONE * 1000));
+                g_tt_ota.progress_cb(TT_OTA_STATE_VERIFYING, 85 + elapsed_pct);
+            }
+            continue;
+        }
+        if (buf_pos < (int)sizeof(resp_buf) - 1) {
+            resp_buf[buf_pos++] = (char)byte;
+            resp_buf[buf_pos] = '\0';
+        }
+
+        if (strstr(resp_buf, "done")) {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT reports: done");
+            goto finish_success;
+        }
+        if (strstr(resp_buf, "md5 failed")) {
+            SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "TT reports: md5 failed");
+            g_tt_ota.result = TT_OTA_RESULT_ERROR_MD5;
+            goto finish_failed;
+        }
+    }
+
+    SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Timeout waiting for 'done'");
+    g_tt_ota.result = TT_OTA_RESULT_ERROR_DONE_TIMEOUT;
+    goto finish_failed;
+
+finish_success:
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "=== TT OTA SUCCESS ===");
+    g_tt_ota.state = TT_OTA_STATE_COMPLETED;
+    g_tt_ota.ready_for_data = false;
+
+    if (g_tt_ota.progress_cb) g_tt_ota.progress_cb(g_tt_ota.state, 95);
+
+    ota_recover_tt();
+
+    if (g_tt_ota.progress_cb) g_tt_ota.progress_cb(g_tt_ota.state, 100);
+    g_tt_ota.in_progress = false;
+    return ESP_OK;
+
+finish_failed:
+    SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "=== TT OTA FAILED (result=%d) ===", g_tt_ota.result);
+    g_tt_ota.state = TT_OTA_STATE_FAILED;
+    g_tt_ota.ready_for_data = false;
+
+    if (g_tt_ota.progress_cb) g_tt_ota.progress_cb(g_tt_ota.state, 0);
+
+    ota_recover_tt();
+
+    g_tt_ota.in_progress = false;
+    return ESP_FAIL;
+}
+
+esp_err_t tt_module_ota_cancel(void)
+{
+    if (!g_tt_ota.in_progress) return ESP_ERR_INVALID_STATE;
+
+    SYS_LOGW_MODULE(SYS_LOG_MODULE_OTA, TAG, "Cancelling TT OTA...");
+    g_tt_ota.in_progress = false;
+    g_tt_ota.ready_for_data = false;
+    g_tt_ota.state = TT_OTA_STATE_FAILED;
+    g_tt_ota.result = TT_OTA_RESULT_ERROR_CAN;
+
+    if (g_tt_ota.prep_task_handle) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (g_tt_ota.prep_task_handle) {
+            vTaskDelete(g_tt_ota.prep_task_handle);
+            g_tt_ota.prep_task_handle = NULL;
+        }
+    }
+
+    ota_recover_tt();
     return ESP_OK;
 }

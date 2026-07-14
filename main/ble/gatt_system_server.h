@@ -91,6 +91,9 @@
 #define SYS_CMD_ENABLE_BATTERY_REPORT   0x7E  // Enable battery event notifications
 #define SYS_CMD_DISABLE_BATTERY_REPORT  0x7F  // Disable battery event notifications
 
+/* TT Status Notification (device → APP push, unsolicited) */
+#define TT_STATUS_NOTIFY_ID             0x08  /* Identifier byte for TT status push */
+
 /* System Command/Response Packet Configuration */
 #define SYS_CMD_PACKET_MAX_PARAMS       96      // Maximum parameter bytes
 #define SYS_CMD_PACKET_MAX_SIZE         (1 + 1 + SYS_CMD_PACKET_MAX_PARAMS + 2)  // seq + cmd + params + crc16
@@ -264,6 +267,17 @@ int gatt_system_server_send_sensor_data(void);
 
 /* Default SOC change threshold if APP doesn't specify */
 #define BATTERY_REPORT_DEFAULT_SOC_THRESHOLD  1   /* 1% */
+
+/**
+ * @brief Push TT module status notification to APP (unsolicited)
+ *
+ * Used when TT enters UPGRADE_MODE or recovers from it.
+ * Format: [0x08][tt_state]
+ *
+ * @param tt_state  Current TT module state (tt_state_t)
+ * @return 0 on success, negative on error
+ */
+int gatt_system_server_send_tt_status(uint8_t tt_state);
 
 /**
  * @brief Push a battery event notification to the connected app

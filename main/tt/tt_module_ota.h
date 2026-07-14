@@ -1,5 +1,8 @@
 /*
- * tt_module_ota.h - Tiantong Module OTA Update Interface
+ * tt_module_ota.h - Tiantong Module OTA Update Interface (Streaming)
+ *
+ * Real-time streaming OTA: BLE data → 128B buffer → XMODEM → TT module.
+ * No flash partition needed (TT firmware 2-3MB too large for 4MB flash).
  *
  * SPDX-FileCopyrightText: 2021-2025 Espressif Systems (Shanghai) CO LTD
  *
@@ -15,114 +18,113 @@
 
 /* OTA Update States */
 typedef enum {
-    TT_OTA_STATE_IDLE = 0,           // Idle, not updating
-    TT_OTA_STATE_PREPARING,          // Preparing for update (stopping services, etc.)
-    TT_OTA_STATE_WAITING_READY,      // Waiting for modem to be ready
-    TT_OTA_STATE_UPLOADING,          // Uploading firmware via XMODEM
-    TT_OTA_STATE_VERIFYING,          // Verifying firmware
-    TT_OTA_STATE_COMPLETED,          // Update completed successfully
-    TT_OTA_STATE_FAILED              // Update failed
+    TT_OTA_STATE_IDLE = 0,
+    TT_OTA_STATE_PREPARING,         /* Stopping MUX, resetting, AT+UPDATE */
+    TT_OTA_STATE_WAITING_READY,     /* Waiting for TT "ready" / "baud ok" / 'C' */
+    TT_OTA_STATE_UPLOADING,         /* XMODEM data transfer */
+    TT_OTA_STATE_VERIFYING,         /* Waiting for "done" */
+    TT_OTA_STATE_COMPLETED,
+    TT_OTA_STATE_FAILED
 } tt_ota_state_t;
 
-/* OTA Update Result */
+/* OTA Update Result (detailed failure reason) */
 typedef enum {
-    TT_OTA_RESULT_OK = 0,            // Success
-    TT_OTA_RESULT_ERROR_UART,        // UART error
-    TT_OTA_RESULT_ERROR_TIMEOUT,     // Timeout
-    TT_OTA_RESULT_ERROR_MODEM,       // Modem not ready
-    TT_OTA_RESULT_ERROR_TRANSMISSION,// Transmission error
-    TT_OTA_RESULT_ERROR_VERIFY       // Verification error
+    TT_OTA_RESULT_OK = 0,
+    TT_OTA_RESULT_ERROR_BATTERY,        /* Battery too low */
+    TT_OTA_RESULT_ERROR_READY_TIMEOUT,  /* "ready" timeout */
+    TT_OTA_RESULT_ERROR_BAUD_TIMEOUT,   /* "baud ok" timeout */
+    TT_OTA_RESULT_ERROR_CRC_TIMEOUT,    /* 'C' (XMODEM start) timeout */
+    TT_OTA_RESULT_ERROR_XMODEM,         /* XMODEM packet failed (NAK > max retries) */
+    TT_OTA_RESULT_ERROR_CAN,            /* TT module sent CAN (abort) */
+    TT_OTA_RESULT_ERROR_MD5,            /* "md5 failed" from TT */
+    TT_OTA_RESULT_ERROR_DONE_TIMEOUT,   /* "done" timeout */
+    TT_OTA_RESULT_ERROR_UART,           /* UART communication error */
+    TT_OTA_RESULT_ERROR_NOT_READY,      /* feed() called before prep complete */
+    TT_OTA_RESULT_ERROR_PARTITION,      /* Partition read error */
 } tt_ota_result_t;
 
 /* OTA Update Progress Callback */
 typedef void (*tt_ota_progress_cb_t)(tt_ota_state_t state, int progress);
 
+/* Minimum battery voltage for TT OTA (mV) */
+#define TT_OTA_MIN_BATTERY_MV   3500
+
 /**
- * @brief Initialize TT Module OTA Update
- *
- * @return esp_err_t ESP_OK on success
+ * @brief Initialize TT Module OTA subsystem
  */
 esp_err_t tt_module_ota_init(void);
 
 /**
- * @brief Deinitialize TT Module OTA Update
- *
- * @return esp_err_t ESP_OK on success
+ * @brief Deinitialize TT Module OTA subsystem
  */
 esp_err_t tt_module_ota_deinit(void);
 
 /**
- * @brief Start OTA update for Tiantong Module
+ * @brief Begin TT OTA — prepare TT module for XMODEM transfer
  *
- * This function will:
- * 1. Stop normal communication (MUX mode, AT command task)
- * 2. Reset modem to normal AT mode
- * 3. Send AT+UPDATE command to enter update mode
- * 4. Change baudrate to high speed (3000000)
- * 5. Read firmware from ota_tt partition and send via XMODEM protocol
- * 6. Verify and complete
+ * Starts a background task that:
+ * 1. Stops TT communication (tt_module_stop)
+ * 2. Sends AT+UPDATE at 115200
+ * 3. Waits 3s, hardware reset TT
+ * 4. Waits for "ready"
+ * 5. Switches baudrate to 921600
+ * 6. Sends "loadx", waits for 'C'
  *
- * @param progress_cb Optional callback for progress updates
- * @return esp_err_t ESP_OK on success
+ * Returns immediately. Caller should poll tt_module_ota_is_ready() or
+ * wait for progress callback reporting UPLOADING state.
+ *
+ * @param total_size Total firmware size (from APP)
+ * @param progress_cb Progress callback
+ * @return ESP_OK if started, error if already in progress or battery low
  */
-esp_err_t tt_module_ota_start_update(tt_ota_progress_cb_t progress_cb);
+esp_err_t tt_module_ota_begin(size_t total_size, tt_ota_progress_cb_t progress_cb);
+
+/**
+ * @brief Check if TT module is ready for data (prep complete)
+ *
+ * @return true if XMODEM transfer is active and ready for firmware data
+ */
+bool tt_module_ota_is_ready(void);
+
+/**
+ * @brief Feed firmware data to TT module via XMODEM
+ *
+ * Accumulates data into 128-byte XMODEM packets and sends them.
+ * Called from BLE OTA data handler for each received packet.
+ *
+ * @param data Firmware data bytes
+ * @param len Data length
+ * @return ESP_OK on success, error if XMODEM failed or not ready
+ */
+esp_err_t tt_module_ota_feed(const uint8_t *data, size_t len);
+
+/**
+ * @brief Finish TT OTA — flush remaining data, send EOT, wait for done
+ *
+ * Called after all firmware data has been fed.
+ *
+ * @return ESP_OK on success, error on failure
+ */
+esp_err_t tt_module_ota_finish(void);
 
 /**
  * @brief Cancel ongoing OTA update
- *
- * @return esp_err_t ESP_OK on success
  */
 esp_err_t tt_module_ota_cancel(void);
 
 /**
  * @brief Get current OTA state
- *
- * @return tt_ota_state_t Current state
  */
 tt_ota_state_t tt_module_ota_get_state(void);
 
 /**
+ * @brief Get detailed failure result (valid when state == FAILED)
+ */
+tt_ota_result_t tt_module_ota_get_result(void);
+
+/**
  * @brief Check if OTA update is in progress
- *
- * @return true if updating, false otherwise
  */
 bool tt_module_ota_is_in_progress(void);
-
-/**
- * @brief Start streaming OTA update for Tiantong Module
- *
- * This function will:
- * 1. Stop normal communication (MUX mode, AT command task)
- * 2. Reset modem to normal AT mode
- * 3. Send AT+UPDATE command to enter update mode
- * 4. Change baudrate to high speed (3000000)
- * 5. Wait for firmware data to be streamed via tt_module_ota_write_data()
- *
- * @param total_size Total firmware size to expect
- * @param progress_cb Optional callback for progress updates
- * @return esp_err_t ESP_OK on success
- */
-esp_err_t tt_module_ota_start_streaming(size_t total_size, tt_ota_progress_cb_t progress_cb);
-
-/**
- * @brief Write firmware data during streaming OTA
- *
- * This function writes data chunks directly to the TT module via XMODEM.
- * Each chunk can be up to 4KB in size for efficiency.
- *
- * @param data Firmware data buffer
- * @param len Data length (max 4096 bytes)
- * @return esp_err_t ESP_OK on success
- */
-esp_err_t tt_module_ota_write_data(const uint8_t *data, size_t len);
-
-/**
- * @brief Finalize streaming OTA update
- *
- * This function sends EOT and verifies completion.
- *
- * @return esp_err_t ESP_OK on success
- */
-esp_err_t tt_module_ota_finalize_streaming(void);
 
 #endif /* TT_MODULE_OTA_H */

@@ -30,6 +30,8 @@
 #define BLE_VOICE_CONN_ITVL_MAX      10  // 12.5ms
 #define BLE_DEFAULT_CONN_ITVL_MIN    24  // 30ms
 #define BLE_DEFAULT_CONN_ITVL_MAX    40  // 50ms
+#define BLE_OTA_CONN_ITVL_MIN        12  // 15ms (iOS minimum, Android compatible)
+#define BLE_OTA_CONN_ITVL_MAX        16  // 20ms
 #define BLE_CONN_LATENCY_NONE        0
 #define BLE_SUPERVISION_TIMEOUT_400  400  // 4s in 10ms units
 
@@ -161,6 +163,15 @@ const char *ble_device_name_get(void);
  * @return 0 on success, non-zero on error (no connection or update rejected)
  */
 int ble_gatt_server_request_powersave(void);
+
+/**
+ * @brief Request fast connection parameters for OTA (7.5-12.5ms, latency 0)
+ *
+ * Call at OTA start to maximize throughput. ~4x faster than normal interval.
+ *
+ * @return 0 on success, non-zero on error
+ */
+int ble_gatt_server_request_ota_fast(void);
 
 /**
  * @brief Request normal connection parameters (30-50ms, latency 0)

@@ -20,6 +20,7 @@
 #include "system/power_manage.h"
 #include "config/user_params.h"
 #include "fuel_gauge.h"
+#include "tt/tt_module_ota.h"
 
 /* Satellite call simulation (GATT-only interception) */
 #include "sim/sat_call_sim.h"
@@ -109,6 +110,7 @@ static void release_power_lock(void)
 /* Global variables for UART AT Port */
 static bool g_simst_detected = false;
 static bool g_tt_module_ready = false;  // TT module ready (^SIMST: detected)
+static volatile bool g_upgrade_ready_detected = false;  // TT sent "ready" (upgrade mode)
 static SemaphoreHandle_t g_simst_sem = NULL;
 static TaskHandle_t g_mux_init_task_handle = NULL;
 static SemaphoreHandle_t g_at_cmd_mutex = NULL;  // Mutex for AT command synchronization
@@ -193,6 +195,7 @@ static void uart_log_deinit(void)
 /**
  * @brief UART Log RX Task for reading log data from TT Module
  */
+__attribute__((unused))
 static void uart_log_rx_task(void *pvParameters)
 {
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "UART%d Log RX Task started", TT_UART_LOG_PORT_NUM);
@@ -405,6 +408,17 @@ static void uart_at_rx_task(void *pvParameters)
                 }
             }
 
+            /* Check for "ready" — TT in upgrade mode sends this instead of ^SIMST */
+            if (!g_simst_detected && !g_upgrade_ready_detected) {
+                /* Null-terminate for strstr */
+                g_uart_at_rx_buf[len < TT_UART_RX_BUF_SIZE ? len : TT_UART_RX_BUF_SIZE - 1] = '\0';
+                if (strstr((char *)g_uart_at_rx_buf, "ready") != NULL) {
+                    SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                                    "Detected 'ready' from TT — upgrade mode");
+                    g_upgrade_ready_detected = true;
+                }
+            }
+
             // Route AT response using unified routing function
             // This function will route responses based on the current command context:
             // - LOCAL context: Save to local buffer (for synchronous commands)
@@ -449,15 +463,16 @@ static void tt_mux_init_task(void *pvParameters)
 {
     esp_err_t ret = ESP_OK;
     char at_response[TT_AT_RESP_BUF_SIZE];
-    bool mutex_taken = false;  /* Track mutex ownership for cleanup */
+    bool mutex_taken __attribute__((unused)) = false;  /* Track mutex ownership for cleanup */
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "MUX Initialization Task started");
 
     /* Cleanup label for error handling */
-    bool cleanup_needed = false;
+    bool cleanup_needed __attribute__((unused)) = false;
 
     // === SIMST detection with power-cycle retry ===
     bool simst_detected = false;
+    g_upgrade_ready_detected = false;  /* Reset before detection */
 
     for (int attempt = 1; attempt <= SIMST_MAX_RETRIES; attempt++) {
         SYS_LOGI_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Waiting for SIMST:1... (attempt %d/%d, timeout=%ds)",
@@ -465,6 +480,22 @@ static void tt_mux_init_task(void *pvParameters)
 
         int waited_sec = 0;
         while (waited_sec < SIMST_WAIT_TIMEOUT_SEC) {
+            /* Check if "ready" was detected by UART RX task (upgrade mode) */
+            if (g_upgrade_ready_detected) {
+                SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                                "TT sent 'ready' — entering UPGRADE_MODE");
+                set_tt_state(TT_STATE_UPGRADE_MODE);
+                /* TT hardware IS powered — mark it so sleep manager keeps power on */
+                g_tt_module_powered = true;
+                extern void sleep_manager_notify_tt_powered_on(void);
+                sleep_manager_notify_tt_powered_on();
+                /* Notify APP via BLE that TT needs OTA recovery */
+                extern int gatt_system_server_send_tt_status(uint8_t tt_state);
+                gatt_system_server_send_tt_status((uint8_t)TT_STATE_UPGRADE_MODE);
+                g_mux_init_task_handle = NULL;
+                vTaskDelete(NULL);
+                return;
+            }
             if (g_simst_sem != NULL && xSemaphoreTake(g_simst_sem, pdMS_TO_TICKS(5000)) == pdTRUE) {
                 simst_detected = true;
                 break;
@@ -514,6 +545,9 @@ static void tt_mux_init_task(void *pvParameters)
     }
 
     if (!simst_detected) {
+        /* "ready" detection is handled in the SIMST wait loop above
+         * (g_upgrade_ready_detected flag set by UART RX task).
+         * If we reach here, neither SIMST nor "ready" was detected. */
         SYS_LOGE_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
                         "SIMST not detected after %d attempts, declaring hardware fault",
                         SIMST_MAX_RETRIES);
@@ -1720,6 +1754,12 @@ static tt_at_result_t tt_module_send_at_cmd_local(const char *cmd, char *respons
  */
 static tt_at_result_t tt_module_send_at_cmd_gatt_internal(const char *cmd, uint16_t conn_handle)
 {
+    /* Block AT commands during TT OTA upgrade */
+    if (tt_module_ota_is_in_progress()) {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "AT blocked: TT OTA in progress");
+        return TT_AT_RESULT_BUSY;
+    }
+
 #if ENABLE_SAT_CALL_SIM
     /* Simulation interception: handle AT command locally if sim is enabled */
     if (sat_call_sim_is_enabled()) {
@@ -1787,6 +1827,7 @@ static tt_at_result_t tt_module_send_at_cmd_gatt_internal(const char *cmd, uint1
  * @param data Response/notification data
  * @param len Data length
  */
+__attribute__((unused))
 static void tt_module_forward_response_to_gatt(const uint8_t *data, size_t len)
 {
     if (data == NULL || len == 0) {
@@ -2421,6 +2462,10 @@ bool tt_module_is_user_control_allowed(void)
         case TT_STATE_UPDATING:
             SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Cannot control: module is UPDATING");
             return false;
+        case TT_STATE_UPGRADE_MODE:
+            /* Allow power OFF (user can defer OTA), but power ON is blocked separately */
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "UPGRADE_MODE: power off allowed, power on blocked");
+            return true;
         case TT_STATE_INITIALIZING:
             SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Cannot control: module is INITIALIZING");
             return false;
@@ -2531,6 +2576,13 @@ esp_err_t tt_module_user_power_on(void)
 
     // Step 1: Check if user control is allowed
     if (!tt_module_is_user_control_allowed()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Step 1b: Block power-on in UPGRADE_MODE — must complete OTA first
+    if (g_tt_module.state == TT_STATE_UPGRADE_MODE) {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                        "Cannot power on in UPGRADE_MODE — complete OTA via APP first");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2740,8 +2792,9 @@ esp_err_t tt_module_force_on(void)
     }
 
     // OTA in progress - not allowed
-    if (state == TT_STATE_UPDATING) {
-        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG, "Force ON: rejected (OTA in progress)");
+    if (state == TT_STATE_UPDATING || state == TT_STATE_UPGRADE_MODE) {
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_TT_MODULE, TAG,
+                        "Force ON: rejected (state=%d, OTA/upgrade mode)", state);
         g_tt_force_on = false;
         return ESP_ERR_NOT_ALLOWED;
     }
@@ -2845,6 +2898,7 @@ tt_module_status_t tt_module_get_status(void)
         case TT_STATE_WORKING:
             return TT_MODULE_STATUS_WORKING;
         case TT_STATE_UPDATING:
+        case TT_STATE_UPGRADE_MODE:
             return TT_MODULE_STATUS_OTA_UPDATING;
         case TT_STATE_HARDWARE_FAULT:
             return TT_MODULE_STATUS_ERROR;

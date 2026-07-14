@@ -1012,6 +1012,28 @@ int ble_gatt_server_request_normal(void)
     return rc;
 }
 
+int ble_gatt_server_request_ota_fast(void)
+{
+    uint16_t conn_handle = ble_conn_manager_get_primary_handle();
+    if (conn_handle == 0) {
+        return BLE_HS_ENOTCONN;
+    }
+
+    struct ble_gap_upd_params params = {
+        .itvl_min = BLE_OTA_CONN_ITVL_MIN,
+        .itvl_max = BLE_OTA_CONN_ITVL_MAX,
+        .latency = BLE_CONN_LATENCY_NONE,
+        .supervision_timeout = BLE_SUPERVISION_TIMEOUT_400,
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+
+    int rc = ble_gap_update_params(conn_handle, &params);
+    MODLOG_DFLT(INFO, "OTA fast params requested: itvl=%d-%d latency=0 rc=%d\n",
+                BLE_OTA_CONN_ITVL_MIN, BLE_OTA_CONN_ITVL_MAX, rc);
+    return rc;
+}
+
 int ble_gatt_server_init(void)
 {
     esp_err_t ret;

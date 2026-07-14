@@ -32,6 +32,7 @@
 #include "system/power_manage.h"
 #include "config/user_params.h"
 #include "ble/gatt_ota_server.h"
+#include "tt/tt_module_ota.h"
 #include "audio/voice_packet_handler.h"
 #include "fuel_gauge.h"
 #include "IP5561.h"
@@ -878,8 +879,9 @@ static void print_system_command(const uint8_t *data, size_t len)
 }
 
 /**
- * @brief Handle system control command
+ * @brief Handle system control command (legacy — unused, kept for reference)
  */
+__attribute__((unused))
 static esp_err_t handle_system_control_command(uint16_t conn_handle, const uint8_t *data, size_t len)
 {
     if (data == NULL || len < 1) {
@@ -1801,6 +1803,25 @@ static esp_err_t send_command_response(uint16_t conn_handle, const system_cmd_pa
     return ESP_OK;
 }
 
+int gatt_system_server_send_tt_status(uint8_t tt_state)
+{
+    uint16_t conn_handle = ble_conn_manager_get_primary_handle();
+    if (conn_handle == 0) {
+        return BLE_HS_ENOTCONN;
+    }
+
+    uint8_t buf[2];
+    buf[0] = TT_STATUS_NOTIFY_ID;
+    buf[1] = tt_state;
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "TT status notify: state=%d", tt_state);
+
+    struct os_mbuf *txom = ble_hs_mbuf_from_flat(buf, sizeof(buf));
+    if (!txom) return BLE_HS_ENOMEM;
+
+    return ble_gatts_notify_custom(conn_handle, system_control_val_handle, txom);
+}
+
 /**
  * @brief Handle system control command (async version with structured packets)
  *
@@ -1849,6 +1870,26 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
     uint8_t resp_data[256] = {0};
     size_t resp_len = 0;
     uint8_t resp_code = SYS_RESP_OK;
+
+    /* Block TT/reboot commands during any OTA (MCU or TT) to prevent bricking */
+    if (tt_module_ota_is_in_progress() || gatt_ota_is_in_progress()) {
+        switch (cmd_code) {
+        case SYS_CMD_SYSTEM_REBOOT:     /* 0x20 */
+        case SYS_CMD_REBOOT_MCU:        /* 0x22 */
+        case SYS_CMD_REBOOT_TT:         /* 0x23 */
+        case SYS_CMD_SET_TT_POWER:      /* 0x24 */
+        case SYS_CMD_RESET_TT_HARDWARE: /* 0x25 */
+        case SYS_CMD_TT_FORCE_ON:       /* 0x72 */
+        case SYS_CMD_TT_FORCE_OFF:      /* 0x73 */
+            SYS_LOGW_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                           "Command 0x%02X blocked: OTA in progress", cmd_code);
+            resp_code = SYS_RESP_ERROR;
+            send_command_response(conn_handle, cmd, resp_code, resp_data, resp_len);
+            return ESP_OK;
+        default:
+            break;  /* Allow non-TT commands (battery query, sensor, etc.) */
+        }
+    }
 
     switch (cmd_code) {
     case SYS_CMD_GET_BATTERY_INFO:
