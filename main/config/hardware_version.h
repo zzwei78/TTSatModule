@@ -10,7 +10,7 @@
  */
 #pragma once
 
-//#define SUPPORT_HARDWARE_V2   /* Uncomment for V2.0, comment out for V1.0 */
+#define SUPPORT_HARDWARE_V2   /* Uncomment for V2.0, comment out for V1.0 */
 
 #ifdef SUPPORT_HARDWARE_V2
 #define HW_VERSION_STRING "V2.0"

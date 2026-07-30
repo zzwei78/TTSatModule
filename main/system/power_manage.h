@@ -8,6 +8,21 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+
+/* ========== IP5561 Protection Feature Switches ========== */
+/* Set to 1 to enable, 0 to disable. Defaults can be overridden in sdkconfig. */
+#ifndef IP5561_ENABLE_LIGHT_LOAD_PROT
+#define IP5561_ENABLE_LIGHT_LOAD_PROT    0   /* Light-load auto-shutdown */
+#endif
+#ifndef IP5561_ENABLE_CHARGE_TIMEOUT
+#define IP5561_ENABLE_CHARGE_TIMEOUT     0   /* Charge safety timeout */
+#endif
+#ifndef IP5561_ENABLE_NTC_PROT
+#define IP5561_ENABLE_NTC_PROT           0   /* NTC temperature protection */
+#endif
+#ifndef IP5561_ENABLE_BOOST_PROT
+#define IP5561_ENABLE_BOOST_PROT         0   /* Boost OCP/OVP protection */
+#endif
 #include "IP5561.h"
 #include "fuel_gauge.h"
 #include "da228ec.h"

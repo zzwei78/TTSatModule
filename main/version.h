@@ -22,10 +22,10 @@ extern "C" {
 #define FIRMWARE_BUILD_TIME        __TIME__
 
 /* Version String */
-#define FIRMWARE_VERSION_STRING    "1.2.0"
+#define FIRMWARE_VERSION_STRING    "1.2.2"
 
 /* Product Information */
-#define PRODUCT_MANUFACTURER       "TTCat"
+#define PRODUCT_MANUFACTURER       "SatCat"
 #define PRODUCT_MODEL_NUMBER       "TTSat-1000"
 #define PRODUCT_HARDWARE_REVISION  "2.0"
 #define PRODUCT_SERIAL_NUMBER      NULL  /* Set dynamically from device ID */

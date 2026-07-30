@@ -955,24 +955,44 @@ int16_t power_manage_get_avg_current(void)
  */
 static esp_err_t power_manage_apply_ip5561_config(void)
 {
-    /* WPC: disabled (not used, will be developed separately) */
-    ip5561_set_wpc_enable(g_ip5561_handle, false);
-
-    /* NTC: disabled (thermistor not connected on current board) */
+    /* NTC temperature protection */
+#if !IP5561_ENABLE_NTC_PROT
     ip5561_disable_ntc(g_ip5561_handle);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "NTC protection: disabled");
+#else
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "NTC protection: enabled");
+#endif
 
     /* VOUT: disabled (unused port, save power) */
     ip5561_disable_vout(g_ip5561_handle);
 
-    /* Light load detection: disabled (prevent auto-shutdown of outputs) */
+    /* Light load auto-shutdown */
+#if !IP5561_ENABLE_LIGHT_LOAD_PROT
     ip5561_configure_light_load(g_ip5561_handle, false, false, 0);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Light-load protection: disabled");
+#else
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Light-load protection: enabled");
+#endif
+
+    /* Charge safety timeout (0x21 bit7) */
+    {
+        uint8_t chg_tmo = 0;
+        ip5561_read_reg(g_ip5561_handle, 0x21, &chg_tmo, false);
+#if !IP5561_ENABLE_CHARGE_TIMEOUT
+        chg_tmo &= ~(1 << 7);
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Charge timeout: disabled");
+#else
+        chg_tmo |= (1 << 7);
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Charge timeout: enabled");
+#endif
+        ip5561_write_reg(g_ip5561_handle, 0x21, chg_tmo, false);
+    }
 
     /* SYS_CTL4 (0x31): Enable long-press 2S key wakeup + keep default key-off mode */
     {
         uint8_t sys_ctl4 = 0;
         ip5561_read_reg(g_ip5561_handle, 0x31, &sys_ctl4, false);
         sys_ctl4 |= (1 << 2);               /* En_Long_Wk = 1 (long press 2s wakeup) */
-        /* Keep Set_Key bits [1:0] at default (10 = two short presses to power off) */
         ip5561_write_reg(g_ip5561_handle, 0x31, sys_ctl4, false);
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "SYS_CTL4: 0x%02X (En_Long_Wk=1)", sys_ctl4);
     }
@@ -1006,7 +1026,21 @@ static esp_err_t power_manage_apply_ip5561_config(void)
     ip5561_write_reg(g_ip5561_handle, 0xB9, 60, false);   /* VBUS_5V */
     ip5561_write_reg(g_ip5561_handle, 0xBB, 40, false);   /* VBUS_9V */
 
+    /* Boost OCP/OVP protection */
+#if !IP5561_ENABLE_BOOST_PROT
     ip5561_disable_boost_protections(g_ip5561_handle, false);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Boost protection: disabled");
+#else
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Boost protection: enabled");
+#endif
+
+    /* Clear OCP flags before enabling WPC (per factory test reference) */
+    ip5561_write_reg(g_ip5561_handle, 0xFC, 0x05, true);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* WPC: enable LAST (after Boost is stable) — per factory test sequence */
+    ip5561_set_wpc_enable(g_ip5561_handle, true);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "WPC enabled (after Boost stable)");
 
     /* Save configuration fingerprint (only stable registers) */
     ip5561_get_sys_ctl0(g_ip5561_handle, &g_ip5561_fingerprint.sys_ctl0);

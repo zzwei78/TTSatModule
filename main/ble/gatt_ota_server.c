@@ -427,25 +427,26 @@ static esp_err_t handle_ota_control_command(uint16_t conn_handle, const uint8_t 
 }
 
 /**
- * @brief Handle OTA data write (with sequence number and CRC16)
+ * @brief Handle OTA data write (each BLE write = one complete OTA packet)
  */
 static esp_err_t handle_ota_data_write(uint16_t conn_handle, const uint8_t *data, size_t len)
 {
     uint8_t response = OTA_RESP_OK;
 
-    /* Debug: log first N bytes of every data packet */
-    if (len > 0) {
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG, "Data pkt: len=%d, first bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 len,
-                 len > 0 ? data[0] : 0, len > 1 ? data[1] : 0,
-                 len > 2 ? data[2] : 0, len > 3 ? data[3] : 0,
-                 len > 4 ? data[4] : 0, len > 5 ? data[5] : 0,
-                 len > 6 ? data[6] : 0, len > 7 ? data[7] : 0);
+    /* Log first data packet with MTU and interval info */
+    if (g_ota_first_packet) {
+        struct ble_gap_conn_desc desc;
+        int itvl_ms = 0;
+        if (ble_gap_conn_find(conn_handle, &desc) == 0) {
+            itvl_ms = desc.conn_itvl * 5 / 4;
+        }
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_OTA, TAG,
+            "First data pkt: len=%d, mtu=%d, conn_itvl=%dms",
+            len, ble_att_mtu(conn_handle), itvl_ms);
     }
 
     if (data == NULL || len < 6) {
         SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG, "Invalid data packet: too short (len=%d), aborting OTA", len);
-        // Send error response and terminate OTA
         uint8_t error_resp = OTA_RESP_INVALID_PACKET;
         struct os_mbuf *txom = ble_hs_mbuf_from_flat(&error_resp, 1);
         if (txom) {
@@ -460,17 +461,13 @@ static esp_err_t handle_ota_data_write(uint16_t conn_handle, const uint8_t *data
     uint16_t seq = le16toh(*(uint16_t*)&data[0]);
     uint16_t data_len = le16toh(*(uint16_t*)&data[2]);
 
-    SYS_LOGD_MODULE(SYS_LOG_MODULE_OTA, TAG, "OTA data packet: seq=%d, data_len=%d, total_len=%d",
-             seq, data_len, len);
-
     // Validate packet length
     size_t expected_len = 4 + data_len + 2;  // header + data + crc16
     if (len != expected_len) {
         uint16_t current_mtu = ble_att_mtu(conn_handle);
         SYS_LOGE_MODULE(SYS_LOG_MODULE_OTA, TAG,
-                 "Packet length mismatch: expected=%d, actual=%d, current_mtu=%d, aborting OTA",
+                 "Packet length mismatch: expected=%d, actual=%d, mtu=%d, aborting OTA",
                  expected_len, len, current_mtu);
-        // Send error response and terminate OTA
         uint8_t error_resp = OTA_RESP_INVALID_PACKET;
         struct os_mbuf *txom = ble_hs_mbuf_from_flat(&error_resp, 1);
         if (txom) {
@@ -788,7 +785,7 @@ static const struct ble_gatt_svc_def ota_service_defs[] = {
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
             },
             {
-                /* Data Characteristic */
+                /* Data Characteristic — Write With Response */
                 .uuid = BLE_UUID16_DECLARE(BLE_SVC_OTA_CHR_DATA_UUID16),
                 .access_cb = ota_service_handler,
                 .val_handle = &ota_data_val_handle,
