@@ -28,6 +28,7 @@
 #include "audio/audiosvc.h"
 #include "config/user_params.h"
 #include "system/ble_monitor.h"
+#include "system/led_manager.h"
 #include "ble/ble_gatt_server.h"
 #include "ble/spp_voice_server.h"
 
@@ -41,11 +42,7 @@ static const char *TAG = "SLEEP_MGR";
 #define TT_NO_NET_CHECK_SEC        60    /* Query CREG every 60s */
 #define TT_NO_NET_TIMEOUT_SEC      600   /* 10 min → auto power off TT */
 
-/* ========== Pwrkey Monitor (V2 only) ========== */
-#define PWRKEY_POLL_MS             20    /* Poll interval */
-#define PWRKEY_DEBOUNCE_MS         50    /* Min press to register (debounce) */
-#define PWRKEY_SHORT_THRESHOLD_MS  2000  /* < 2s = short press */
-#define PWRKEY_LONG_THRESHOLD_MS   5000  /* ≥ 5s while held = force deep sleep */
+/* Pwrkey thresholds now in sleep_manager.h */
 
 /* ========== RTC Data (survives deep sleep) ========== */
 
@@ -108,8 +105,11 @@ static volatile bool g_pwrkey_task_running = false;
 /* TEMP_AWAKE timer */
 static TimerHandle_t g_temp_awake_timer = NULL;
 
-/* Deep sleep idle counter (seconds, reset when BLE connected or TT on) */
+/* Deep sleep idle counter (seconds, reset on command/activity) */
 static int32_t g_deep_sleep_idle_sec = 0;
+
+/* Pre-sleep notification flag (reset on activity, set at 9 min) */
+static bool g_pre_notify_sent = false;
 
 /* Track if we just woke from light sleep (for quick re-entry) */
 static bool g_just_woke_from_light_sleep = false;
@@ -124,10 +124,14 @@ static volatile bool g_deferred_init_done = false;
 
 /* ========== Internal Functions ========== */
 
+#if SLEEP_LIGHT_SLEEP_ENABLE
 static void enter_light_sleep(void);
+#endif
 static void enter_deep_sleep_internal(void);
 static void configure_gpio_for_deep_sleep(void);
+#if SLEEP_TEMP_AWAKE_ENABLE
 static void temp_awake_timer_callback(TimerHandle_t xTimer);
+#endif
 static void deferred_full_init_task(void *pvParameters);
 static void pwrkey_init_and_start(void);
 
@@ -312,6 +316,9 @@ esp_err_t sleep_manager_init(void)
         if (ext1_status & (1ULL << GPIO_PWRKEY)) {
             g_wakeup_cause = SLEEP_WAKEUP_PWRKEY;
             g_current_mode = SLEEP_MODE_ACTIVE;
+            /* Pwrkey wake: TT auto-start is requested via wake cause.
+             * The manual-off flag is cleared in app_main() AFTER user_params_init()
+             * (clearing it here is a no-op because user_params is not initialized yet). */
         } else
 #endif
         if (ext1_status & (1ULL << BB_WAKEUP_AP_PIN)) {
@@ -426,7 +433,8 @@ void sleep_manager_notify_activity(const char *source)
 {
     int64_t old_time = g_last_activity_time;
     g_last_activity_time = esp_timer_get_time();
-    g_just_woke_from_light_sleep = false;  /* Real activity, use full idle timeout */
+    g_just_woke_from_light_sleep = false;
+    g_pre_notify_sent = false;  /* Reset pre-sleep notification */
     int32_t elapsed = (int32_t)((g_last_activity_time - old_time) / 1000000);
     SYS_LOGI(TAG, "Activity [%s] (prev=%ds ago)", source ? source : "?", elapsed);
 }
@@ -435,6 +443,7 @@ void sleep_manager_refresh_idle(void)
 {
     g_last_activity_time = esp_timer_get_time();
     g_just_woke_from_light_sleep = false;
+    g_pre_notify_sent = false;
 }
 
 void sleep_manager_notify_ble_connected(void)
@@ -444,6 +453,7 @@ void sleep_manager_notify_ble_connected(void)
     g_deep_sleep_idle_sec = 0;  /* Reset deep sleep counter */
     SYS_LOGI(TAG, "BLE connected (count=%d)", g_ble_conn_count);
 
+#if SLEEP_TEMP_AWAKE_ENABLE
     /* If in TEMP_AWAKE, cancel timer and transition to ACTIVE */
     if (g_current_mode == SLEEP_MODE_TEMP_AWAKE && g_temp_awake_timer != NULL) {
         /* Attempt to stop the timer with timeout */
@@ -478,6 +488,7 @@ void sleep_manager_notify_ble_connected(void)
             }
         }
     }
+#endif /* SLEEP_TEMP_AWAKE_ENABLE */
 }
 
 void sleep_manager_notify_ble_disconnected(void)
@@ -493,20 +504,24 @@ void sleep_manager_notify_tt_powered_on(void)
 {
     g_tt_powered = true;
     g_last_activity_time = esp_timer_get_time();
-    g_deep_sleep_idle_sec = 0;  /* Reset deep sleep counter */
-    g_tt_no_net_sec = 0;        /* Reset auto收网 counter */
+    g_deep_sleep_idle_sec = 0;
+    g_tt_no_net_sec = 0;
     g_tt_net_check_cnt = 0;
     g_tt_was_registered = true;
     SYS_LOGI(TAG, "TT module powered ON");
+    /* TT on, before signal acquired: signal LED red solid */
+    led_set_signal_status(LED_SIGNAL_NO_SIGNAL);
 }
 
 void sleep_manager_notify_tt_powered_off(void)
 {
     g_tt_powered = false;
     g_last_activity_time = esp_timer_get_time();
-    g_tt_no_net_sec = 0;        /* Reset auto收网 counter */
+    g_tt_no_net_sec = 0;
     g_tt_net_check_cnt = 0;
     SYS_LOGI(TAG, "TT module powered OFF");
+    /* TT off: signal LED red blink */
+    led_set_signal_status(LED_SIGNAL_TT_OFF);
 }
 
 void sleep_manager_set_inhibit(bool inhibit)
@@ -610,185 +625,146 @@ static void sleep_decision_task(void *pvParameters)
     while (g_sleep_task_running) {
         vTaskDelay(pdMS_TO_TICKS(1000));
 
-        if (g_inhibit_sleep || g_current_mode == SLEEP_MODE_TEMP_AWAKE) {
+        if (g_inhibit_sleep) {
             continue;
         }
 
-        /* Check charging status — skip all sleep modes while charging */
+#if SLEEP_TEMP_AWAKE_ENABLE
+        if (g_current_mode == SLEEP_MODE_TEMP_AWAKE) {
+            continue;
+        }
+#endif
+
+        /* Check charging status — skip all sleep while charging */
         {
             uint8_t chg_flags = 0;
             bool is_charging = false;
             if (power_manage_get_charging_status(&chg_flags) == ESP_OK) {
-                is_charging = (chg_flags & 0x04) != 0;   /* bit2: charging */
+                is_charging = (chg_flags & 0x04) != 0;
             }
             bool is_wpc = power_manage_is_wpc_charging();
             if (is_charging || is_wpc) {
-                g_deep_sleep_idle_sec = 0;  /* reset counter */
-                continue;  /* skip sleep while charging */
+                g_deep_sleep_idle_sec = 0;
+                g_pre_notify_sent = false;
+                continue;
             }
         }
 
-        /* Check BLE connection directly via NimBLE (for diagnostics only) */
-        int ble_count = 0;
-        for (uint16_t h = 0; h < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; h++) {
-            struct ble_gap_conn_desc d;
-            if (ble_gap_conn_find(h, &d) == 0) {
-                ble_count++;
-            }
-        }
-
-        /* Correct cache if NimBLE consistently shows fewer connections.
-         * Only correct DOWN when nimble > 0 (avoid false-negative clearing to 0).
-         * This fixes stale entries from missed disconnect callbacks. */
-        if (ble_count != g_ble_conn_count) {
-            if (ble_count > 0 && ble_count < g_ble_conn_count) {
-                /* Safe correction: nimble sees real connections, just fewer than cache */
-                static int s_correct_log_cnt = 0;
-                if (s_correct_log_cnt++ % 30 == 0) {  /* Log once per 30s */
-                    SYS_LOGW(TAG, "BLE cache corrected: %d → %d (nimble ground truth)",
-                             g_ble_conn_count, ble_count);
-                }
-                g_ble_conn_count = ble_count;
-            } else if (ble_count == 0 && g_ble_conn_count > 0) {
-                /* NimBLE says 0 but cache says >0 — don't correct (could be false negative).
-                 * Log sparingly. */
-                static int s_mismatch_log_cnt = 0;
-                if (s_mismatch_log_cnt++ % 60 == 0) {  /* Log once per 60s */
-                    SYS_LOGW(TAG, "BLE mismatch: nimble=0 cache=%d (not correcting)", g_ble_conn_count);
-                }
-            }
-        }
-
-        /* === BLE connected or TT on → reset deep sleep counter, check light sleep === */
-        if (is_ble_connected() || g_tt_powered) {
+        /* Never sleep during active voice call */
+        if (spp_voice_server_is_call_active()) {
             g_deep_sleep_idle_sec = 0;
-
-            /* --- Auto收网: periodically check TT network registration --- */
-            if (g_tt_powered && tt_module_get_state() == TT_STATE_WORKING) {
-                if (++g_tt_net_check_cnt >= TT_NO_NET_CHECK_SEC) {
-                    g_tt_net_check_cnt = 0;
-
-                    char creg_resp[128] = {0};
-                    tt_at_result_t at_ret = tt_module_send_at_cmd_wait(
-                        "AT+CREG?", creg_resp, sizeof(creg_resp), 3000);
-
-                    bool registered = false;
-                    if (at_ret == TT_AT_RESULT_OK) {
-                        /* Parse +CREG: <n>,<stat> — stat 1=home, 5=roaming = registered */
-                        char *p = strstr(creg_resp, "+CREG:");
-                        if (p) {
-                            int n_val = 0, stat = 0;
-                            if (sscanf(p, "+CREG: %d,%d", &n_val, &stat) == 2) {
-                                registered = (stat == 1 || stat == 5);
-                            }
-                        }
-                    }
-
-                    if (registered) {
-                        if (!g_tt_was_registered) {
-                            SYS_LOGI(TAG, "[Auto收网] Network registered, counter reset");
-                        }
-                        g_tt_no_net_sec = 0;
-                        g_tt_was_registered = true;
-                    } else {
-                        g_tt_no_net_sec += TT_NO_NET_CHECK_SEC;
-                        g_tt_was_registered = false;
-                        /* Progress log every 5 min */
-                        if (g_tt_no_net_sec % 300 == 0) {
-                            SYS_LOGW(TAG, "[Auto收网] No network for %u/%u sec",
-                                     g_tt_no_net_sec, TT_NO_NET_TIMEOUT_SEC);
-                        }
-                    }
-
-                    /* Timeout: auto power off TT */
-                    if (g_tt_no_net_sec >= TT_NO_NET_TIMEOUT_SEC) {
-                        /* Safety: don't auto-off if user force-on or call active */
-                        extern bool tt_module_is_force_on(void);
-                        if (tt_module_is_force_on()) {
-                            SYS_LOGW(TAG, "[Auto收网] Force-on active, skipping");
-                            g_tt_no_net_sec = 0;
-                            continue;
-                        }
-                        if (spp_voice_server_is_call_active()) {
-                            SYS_LOGW(TAG, "[Auto收网] Call active, skipping");
-                            g_tt_no_net_sec = 0;
-                            continue;
-                        }
-
-                        SYS_LOGW(TAG, "[Auto收网] No network %us, powering off TT",
-                                 g_tt_no_net_sec);
-                        /* Network timeout shutdown: same hardware power-off as
-                         * user_power_off but does NOT set NVS manual_off flag,
-                         * allowing TT to auto-restart on next TEMP_AWAKE. */
-                        tt_module_network_timeout_off();
-                        /* notify_tt_powered_off already called by tt_module */
-                        g_tt_no_net_sec = 0;
-                        continue;  /* Re-evaluate state next iteration */
-                    }
-                }
-            }
-
-            /* Skip light sleep if TT is initializing */
-            if (g_tt_powered && tt_module_get_state() == TT_STATE_INITIALIZING) {
-                continue;
-            }
-
-            /* Never enter light sleep during an active voice call */
-            if (spp_voice_server_is_call_active()) {
-                continue;
-            }
-
-            int64_t now = esp_timer_get_time();
-            int32_t idle_sec = (int32_t)((now - g_last_activity_time) / 1000000);
-            int32_t light_threshold = g_just_woke_from_light_sleep
-                                     ? SLEEP_LIGHT_REENTER_SEC : SLEEP_LIGHT_IDLE_SEC;
-
-            if (idle_sec >= light_threshold) {
-                SYS_LOGI(TAG, "Entering LIGHT_SLEEP (ble=%d, tt=%d, idle=%ds)",
-                         ble_count, g_tt_powered, idle_sec);
-
-                enter_light_sleep();
-
-                g_current_mode = SLEEP_MODE_ACTIVE;
-                g_just_woke_from_light_sleep = true;
-                g_last_activity_time = esp_timer_get_time();
-
-                esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-                if (cause == ESP_SLEEP_WAKEUP_BT) {
-                    SYS_LOGI(TAG, "Woke from LIGHT_SLEEP [BLE]");
-                } else if (cause == ESP_SLEEP_WAKEUP_GPIO) {
-                    SYS_LOGI(TAG, "Woke from LIGHT_SLEEP [GPIO21]");
-                } else if (cause == ESP_SLEEP_WAKEUP_TIMER) {
-                    SYS_LOGI(TAG, "Woke from LIGHT_SLEEP [TIMER]");
-                } else {
-                    SYS_LOGI(TAG, "Woke from LIGHT_SLEEP [cause=%d]", cause);
-                }
-            }
+            g_pre_notify_sent = false;
             continue;
         }
 
-        /* === BLE disconnected AND TT off → count up for deep sleep === */
-        g_deep_sleep_idle_sec++;
+        /* --- Auto收网: check TT network registration (runs regardless of sleep state) --- */
+        if (g_tt_powered && tt_module_get_state() == TT_STATE_WORKING) {
+            if (++g_tt_net_check_cnt >= TT_NO_NET_CHECK_SEC) {
+                g_tt_net_check_cnt = 0;
 
-        /* Debug: print every 10s to see why ble_count=0 */
-        if (g_deep_sleep_idle_sec % 10 == 0) {
-            SYS_LOGI(TAG, "Deep sleep counting: ble_nimble=%d, ble_cache=%d, tt=%d, idle=%ds",
-                     ble_count, g_ble_conn_count, g_tt_powered, g_deep_sleep_idle_sec);
+                char creg_resp[128] = {0};
+                tt_at_result_t at_ret = tt_module_send_at_cmd_wait(
+                    "AT+CREG?", creg_resp, sizeof(creg_resp), 3000);
+
+                bool registered = false;
+                if (at_ret == TT_AT_RESULT_OK) {
+                    char *p = strstr(creg_resp, "+CREG:");
+                    if (p) {
+                        int n_val = 0, stat = 0;
+                        if (sscanf(p, "+CREG: %d,%d", &n_val, &stat) == 2) {
+                            registered = (stat == 1 || stat == 5);
+                        }
+                    }
+                }
+
+                if (registered) {
+                    if (!g_tt_was_registered) {
+                        SYS_LOGI(TAG, "[Auto收网] Network registered, counter reset");
+                        led_set_signal_status(LED_SIGNAL_CONNECTED);
+                    }
+                    g_tt_no_net_sec = 0;
+                    g_tt_was_registered = true;
+                } else {
+                    if (g_tt_was_registered) {
+                        led_set_signal_status(LED_SIGNAL_SEARCHING);
+                    }
+                    g_tt_no_net_sec += TT_NO_NET_CHECK_SEC;
+                    g_tt_was_registered = false;
+                    if (g_tt_no_net_sec % 300 == 0) {
+                        SYS_LOGW(TAG, "[Auto收网] No network for %u/%u sec",
+                                 g_tt_no_net_sec, TT_NO_NET_TIMEOUT_SEC);
+                    }
+                }
+
+                if (g_tt_no_net_sec >= TT_NO_NET_TIMEOUT_SEC) {
+                    extern bool tt_module_is_force_on(void);
+                    if (tt_module_is_force_on()) {
+                        SYS_LOGW(TAG, "[Auto收网] Force-on active, skipping");
+                        g_tt_no_net_sec = 0;
+                        continue;
+                    }
+                    if (spp_voice_server_is_call_active()) {
+                        SYS_LOGW(TAG, "[Auto收网] Call active, skipping");
+                        g_tt_no_net_sec = 0;
+                        continue;
+                    }
+
+                    SYS_LOGW(TAG, "[Auto收网] No network %us, powering off TT",
+                             g_tt_no_net_sec);
+                    tt_module_network_timeout_off();
+                    g_tt_no_net_sec = 0;
+                    continue;
+                }
+            }
         }
 
-        if (g_deep_sleep_idle_sec >= SLEEP_DEEP_IDLE_SEC) {
-            /* Final safety check: never enter deep sleep with BLE connected.
-             * is_ble_connected() checks the callback-maintained cache first. */
-            if (is_ble_connected()) {
-                SYS_LOGW(TAG, "Deep sleep aborted: BLE still connected (cache=%d)",
-                         g_ble_conn_count);
-                g_deep_sleep_idle_sec = 0;
+        /* --- Calculate idle time from last command/activity --- */
+        int64_t now = esp_timer_get_time();
+        int32_t idle_sec = (int32_t)((now - g_last_activity_time) / 1000000);
+
+        /* --- Determine deep sleep threshold --- */
+        bool ble_connected = is_ble_connected();
+        int32_t threshold;
+        if (!ble_connected && !g_tt_powered) {
+            threshold = SLEEP_DEEP_IDLE_DISCONNECTED_SEC;  /* 5 min */
+        } else {
+            threshold = SLEEP_DEEP_IDLE_CONNECTED_SEC;     /* 10 min */
+        }
+
+        /* --- Pre-sleep notification at 9 min (only for 10 min threshold) --- */
+        if (threshold == SLEEP_DEEP_IDLE_CONNECTED_SEC &&
+            idle_sec >= SLEEP_PRE_NOTIFY_SEC && !g_pre_notify_sent) {
+            g_pre_notify_sent = true;
+            uint16_t remaining = (uint16_t)(threshold - idle_sec);
+            SYS_LOGI(TAG, "Pre-sleep notification: %us until deep sleep", remaining);
+            gatt_system_server_send_sleep_warning(remaining);
+        }
+
+        /* --- Light sleep (if enabled) --- */
+#if SLEEP_LIGHT_SLEEP_ENABLE
+        if (g_tt_powered && tt_module_get_state() == TT_STATE_INITIALIZING) {
+            continue;  /* Don't sleep while TT initializing */
+        }
+
+        {
+            int32_t light_threshold = g_just_woke_from_light_sleep
+                                     ? SLEEP_LIGHT_REENTER_SEC : SLEEP_LIGHT_IDLE_SEC;
+            if (idle_sec >= light_threshold && idle_sec < threshold) {
+                SYS_LOGI(TAG, "Entering LIGHT_SLEEP (ble=%d, tt=%d, idle=%ds)",
+                         ble_connected, g_tt_powered, idle_sec);
+                enter_light_sleep();
+                g_current_mode = SLEEP_MODE_ACTIVE;
+                g_just_woke_from_light_sleep = true;
+                g_last_activity_time = esp_timer_get_time();
                 continue;
             }
+        }
+#endif
 
-            SYS_LOGI(TAG, "Entering DEEP_SLEEP / shutdown (ble_nimble=%d, ble_cache=%d, tt=%d, idle=%ds)",
-                     ble_count, g_ble_conn_count, g_tt_powered, g_deep_sleep_idle_sec);
-
+        /* --- Deep sleep entry --- */
+        if (idle_sec >= threshold) {
+            SYS_LOGI(TAG, "Entering DEEP_SLEEP (ble=%d, tt=%d, idle=%ds, threshold=%ds)",
+                     ble_connected, g_tt_powered, idle_sec, threshold);
             enter_deep_sleep_internal();
             /* Does not return */
         }
@@ -801,6 +777,7 @@ static void sleep_decision_task(void *pvParameters)
 
 /* ========== Light Sleep ========== */
 
+#if SLEEP_LIGHT_SLEEP_ENABLE
 static void enter_light_sleep(void)
 {
     g_current_mode = SLEEP_MODE_LIGHT_SLEEP;
@@ -824,6 +801,7 @@ static void enter_light_sleep(void)
     /* === Code continues here after wakeup === */
     gpio_set_level(AP_WAKEUP_BB_PIN, 0);
 }
+#endif /* SLEEP_LIGHT_SLEEP_ENABLE */
 
 /* ========== Deep Sleep ========== */
 
@@ -922,54 +900,81 @@ static void pwrkey_monitor_task(void *pvParameters)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (!g_pwrkey_task_running) break;
 
-        int64_t press_start_us = esp_timer_get_time();
-        bool very_long_triggered = false;
+        /* Ignore all key presses during active call */
+        if (spp_voice_server_is_call_active()) {
+            SYS_LOGI(TAG, "Pwrkey press ignored — call active");
+            continue;
+        }
 
-        /* Poll only during press — check for release or 5s threshold */
+        int64_t press_start_us = esp_timer_get_time();
+
+        /* Poll until release */
         while (g_pwrkey_task_running) {
             vTaskDelay(pdMS_TO_TICKS(PWRKEY_POLL_MS));
 
             bool pressed = !gpio_get_level(GPIO_PWRKEY);  /* Active LOW */
+            if (pressed) continue;  /* Still holding, keep waiting */
+
+            /* === Released — determine action by duration === */
             int64_t held_ms = (esp_timer_get_time() - press_start_us) / 1000;
 
-            if (!pressed) {
-                /* === Released === */
-                if (held_ms < PWRKEY_DEBOUNCE_MS) {
-                    /* Debounce — ignore */
-                } else if (held_ms >= PWRKEY_SHORT_THRESHOLD_MS) {
-                    /* Long press 2-5s: toggle TT power.
-                     * But NOT during an active call — accidental long press
-                     * would kill the call. Just refresh idle instead. */
-                    if (spp_voice_server_is_call_active()) {
-                        SYS_LOGW(TAG, "Pwrkey long (%lldms) ignored — call active", held_ms);
-                        sleep_manager_notify_activity("pwrkey");
-                    } else if (tt_module_is_powered()) {
-                        SYS_LOGI(TAG, "Pwrkey long (%lldms) -> TT off", held_ms);
-                        tt_module_user_power_off();
-                    } else {
-                        SYS_LOGI(TAG, "Pwrkey long (%lldms) -> TT on", held_ms);
-                        tt_module_user_power_on();
-                    }
+            if (held_ms < PWRKEY_DEBOUNCE_MS) {
+                /* < 50ms: debounce, ignore */
+                break;
+            }
+
+            if (held_ms < PWRKEY_SHORT_THRESHOLD_MS) {
+                /* Short press < 2s: turn on TT (if off) or refresh idle */
+                if (tt_module_is_powered()) {
+                    SYS_LOGI(TAG, "Pwrkey short (%lldms) -> refresh idle", held_ms);
+                    sleep_manager_notify_activity("pwrkey");
                 } else {
-                    /* Short press < 2s: activity refresh */
-                    SYS_LOGI(TAG, "Pwrkey short (%lldms) -> activity", held_ms);
+                    SYS_LOGI(TAG, "Pwrkey short (%lldms) -> TT power on", held_ms);
+                    tt_module_user_power_on();
                     sleep_manager_notify_activity("pwrkey");
                 }
                 break;
             }
 
-            /* Still holding — check very long (5s) */
-            if (!very_long_triggered && held_ms >= PWRKEY_LONG_THRESHOLD_MS) {
-                very_long_triggered = true;
-                SYS_LOGW(TAG, "Pwrkey held %lldms -> force deep sleep", held_ms);
+            if (held_ms < PWRKEY_SLEEP_THRESHOLD_MS) {
+                /* 2-5s: no action */
+                SYS_LOGI(TAG, "Pwrkey %lldms (2-5s zone) — no action", held_ms);
+                break;
+            }
 
+            if (held_ms < PWRKEY_RESET_THRESHOLD_MS) {
+                /* 5-10s: force TT off + deep sleep (unless charging) */
+                uint8_t chg_flags = 0;
+                bool charging = false;
+                if (power_manage_get_charging_status(&chg_flags) == ESP_OK) {
+                    charging = (chg_flags & 0x04) != 0;
+                }
+                if (charging) {
+                    SYS_LOGI(TAG, "Pwrkey %lldms — ignored (charging)", held_ms);
+                    sleep_manager_notify_activity("pwrkey");
+                    break;
+                }
+
+                SYS_LOGW(TAG, "Pwrkey %lldms -> force TT off + deep sleep", held_ms);
                 if (tt_module_is_powered()) {
-                    SYS_LOGI(TAG, "Force sleep: powering off TT first");
                     tt_module_user_power_off();
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                 }
                 sleep_manager_enter_deep_sleep();
                 /* Does not return */
+                break;
             }
+
+            /* >= 10s: hardware reboot TT */
+            SYS_LOGW(TAG, "Pwrkey %lldms -> hardware reboot TT", held_ms);
+            if (tt_module_is_powered()) {
+                /* TT on: stop → start (full hardware power cycle) */
+                tt_module_user_power_off();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            tt_module_user_power_on();
+            sleep_manager_notify_activity("pwrkey");
+            break;
         }
     }
 
@@ -1064,6 +1069,9 @@ static void enter_deep_sleep_internal(void)
     /* Configure GPIO for minimum leakage */
     configure_gpio_for_deep_sleep();
 
+    /* Turn off all LEDs before entering deep sleep */
+    led_all_off();
+
     /* Configure wakeup sources */
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 
@@ -1101,10 +1109,19 @@ static void enter_deep_sleep_internal(void)
         }
     }
 
-    /* Periodic timer wakeup for BLE advertising */
+    /* Periodic timer wakeup for BLE advertising (TEMP_AWAKE) */
+#if SLEEP_TEMP_AWAKE_ENABLE
     esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_DEEP_TIMER_SEC * 1000000ULL);
+#endif
 
-    SYS_LOGI(TAG, "Entering DEEP_SLEEP (battery=%umV)", rtc_data.last_battery_mv);
+    SYS_LOGI(TAG, "Entering DEEP_SLEEP (battery=%umV, timer=%ds, tt=%d)",
+             rtc_data.last_battery_mv,
+#if SLEEP_TEMP_AWAKE_ENABLE
+             SLEEP_DEEP_TIMER_SEC,
+#else
+             0,
+#endif
+             g_tt_powered);
 
     /* Enter deep sleep - does not return, chip resets on wakeup */
     esp_deep_sleep_start();
@@ -1116,6 +1133,8 @@ void sleep_manager_enter_deep_sleep(void)
 }
 
 /* ========== TEMP_AWAKE Timer ========== */
+
+#if SLEEP_TEMP_AWAKE_ENABLE
 
 /**
  * @brief TEMP_AWAKE timeout handler task (runs with its own stack)
@@ -1158,13 +1177,12 @@ static void temp_awake_timeout_task(void *pvParameters)
         uint8_t chg_flags = 0;
         bool is_charging = false;
         if (power_manage_get_charging_status(&chg_flags) == ESP_OK) {
-            is_charging = (chg_flags & 0x04) != 0;   /* bit2: charging */
+            is_charging = (chg_flags & 0x04) != 0;
         }
         bool is_wpc = power_manage_is_wpc_charging();
         if (is_charging || is_wpc) {
             SYS_LOGI(TAG, "TEMP_AWAKE: Charging (wired=%d, wpc=%d), aborting deep sleep",
                      is_charging, is_wpc);
-            /* Switch to ACTIVE mode and start normal sleep decision task */
             g_current_mode = SLEEP_MODE_ACTIVE;
             g_deep_sleep_idle_sec = 0;
             sleep_manager_task_start();
@@ -1180,10 +1198,6 @@ static void temp_awake_timeout_task(void *pvParameters)
 
 /**
  * @brief TEMP_AWAKE timer callback (runs in Timer Service context)
- *
- * IMPORTANT: Keep this function minimal! The Timer Service task has a small
- * stack (~2KB). We only spawn a dedicated task here to do the heavy work
- * (logging, BLE scanning, I2C reads, deep sleep entry).
  */
 static void temp_awake_timer_callback(TimerHandle_t xTimer)
 {
@@ -1198,8 +1212,6 @@ void sleep_manager_temp_awake_timeout(void)
 
 /**
  * @brief Create and start the TEMP_AWAKE timer
- *
- * Called from app_main() after minimal init during timer wakeup.
  */
 esp_err_t sleep_manager_start_temp_awake_timer(void)
 {
@@ -1210,7 +1222,7 @@ esp_err_t sleep_manager_start_temp_awake_timer(void)
     g_temp_awake_timer = xTimerCreate(
         "temp_awake",
         pdMS_TO_TICKS(SLEEP_TEMP_AWAKE_SEC * 1000),
-        pdFALSE,   /* One-shot */
+        pdFALSE,
         NULL,
         temp_awake_timer_callback
     );
@@ -1224,3 +1236,11 @@ esp_err_t sleep_manager_start_temp_awake_timer(void)
     SYS_LOGI(TAG, "TEMP_AWAKE timer started (%ds)", SLEEP_TEMP_AWAKE_SEC);
     return ESP_OK;
 }
+
+#else /* !SLEEP_TEMP_AWAKE_ENABLE */
+
+/* Stubs when TEMP_AWAKE disabled */
+void sleep_manager_temp_awake_timeout(void) { /* no-op */ }
+esp_err_t sleep_manager_start_temp_awake_timer(void) { return ESP_OK; }
+
+#endif /* SLEEP_TEMP_AWAKE_ENABLE */

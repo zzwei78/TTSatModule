@@ -133,9 +133,8 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting application...");
 
-    /* Initialize LEDs FIRST — release deep sleep hold, configure all LEDs */
+    /* Initialize LEDs FIRST — release deep sleep hold, configure RGB LEDs */
     led_manager_init();
-    led_start_heartbeat(LED_3);  /* Blue LED heartbeat */
 
     /* Initialize NVS — used to store PHY calibration data */
     esp_err_t ret = nvs_flash_init();
@@ -158,6 +157,16 @@ void app_main(void)
         SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "User params loaded (flags: 0x%02X, low_batt_thresh: %umV)",
                         params ? params->flags : 0,
                         params ? params->low_battery_threshold_mv : USER_PARAMS_DEFAULT_LOW_BATT_MV);
+    }
+
+    /* Pwrkey wakeup: user pressed the button to use the device → clear manual-off
+     * flag so the TT module auto-starts below. Must run AFTER user_params_init()
+     * (the earlier clear in sleep_manager_init() is a no-op before this point). */
+    if (sleep_manager_get_wakeup_cause() == SLEEP_WAKEUP_PWRKEY) {
+        if (user_params_is_tt_manual_off()) {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "PWRKEY wake: clearing TT manual-off flag");
+            user_params_set_tt_manual_off(false);
+        }
     }
 
     /* Initialize system log module */

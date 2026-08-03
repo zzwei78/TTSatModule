@@ -211,6 +211,17 @@ void power_manage_get_sensor_data(uint8_t *flags,
                                    int32_t *mx, int32_t *my, int32_t *mz);
 
 /**
+ * @brief Get computed pointing angles from cached sensor data
+ *
+ * 方位角 (azimuth):  horizontal compass heading, 0=North, 90=East, 180=South, 270=West
+ * 仰角 (elevation): vertical tilt angle, 0=flat, + = tilted up, - = tilted down (range -90~+90)
+ *
+ * @param[out] azimuth   computed heading in degrees (NULL ok)
+ * @param[out] elevation computed tilt in degrees (NULL ok)
+ */
+void power_manage_get_sensor_angles(int16_t *azimuth, float *elevation);
+
+/**
  * @brief Enable/disable sensor data report via BLE
  */
 void power_manage_set_sensor_report(bool enable);
@@ -292,6 +303,14 @@ esp_err_t power_manage_get_vbus_adc(uint16_t *vbus_voltage, int16_t *vbus_curren
  * @return ESP_OK on success
  */
 esp_err_t power_manage_get_ntc_data(uint16_t *ntc_voltage, int16_t *temperature);
+
+/**
+ * @brief Get real battery temperature (from IP5561 NTC thermistor)
+ *
+ * CW2217E has no real temp sensor; battery temp comes from the IP5561 NTC1 pin.
+ * @return Temperature in 0.1°K (same format as fuel_gauge_get_temperature)
+ */
+uint16_t power_manage_get_battery_temp_0_1k(void);
 
 /**
  * @brief Set charge voltage

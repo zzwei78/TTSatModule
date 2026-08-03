@@ -13,6 +13,15 @@
 #include "esp_err.h"
 #include "config/hardware_version.h"
 
+/* ========== Feature Switches ========== */
+/* Set to 1 to enable, 0 to disable */
+#ifndef SLEEP_LIGHT_SLEEP_ENABLE
+#define SLEEP_LIGHT_SLEEP_ENABLE       0   /* Light sleep (CPU pause between BLE events) */
+#endif
+#ifndef SLEEP_TEMP_AWAKE_ENABLE
+#define SLEEP_TEMP_AWAKE_ENABLE       1   /* TEMP_AWAKE (periodic timer wake + advertise) */
+#endif
+
 /* ========== Sleep State Machine ========== */
 
 typedef enum {
@@ -35,17 +44,26 @@ typedef enum {
 
 /* ========== Configuration Constants ========== */
 
-#define SLEEP_LIGHT_IDLE_SEC        3600000  /* Disabled (1M seconds) — light sleep causes BLE supervision timeout with test clients */
-#define SLEEP_LIGHT_REENTER_SEC     2       /* Re-entry: quick re-sleep after wake */
-#ifdef SUPPORT_HARDWARE_V2
-#define SLEEP_DEEP_IDLE_SEC         120     /* V2.0: BLE disconnected, idle before deep sleep (2 min) */
-#define SLEEP_DEEP_TIMER_SEC        1800    /* V2.0: Deep sleep interval between timer wakeups (30 min) */
-#else
-#define SLEEP_DEEP_IDLE_SEC         300     /* V1.0: BLE disconnected, idle before deep sleep (5 min) */
-#define SLEEP_DEEP_TIMER_SEC        60      /* V1.0: Deep sleep interval between timer wakeups (1 min) */
-#endif
-#define SLEEP_TEMP_AWAKE_SEC        25      /* Timer wakeup: BLE advertise duration */
-#define SLEEP_LIGHT_TIMER_SEC       30      /* Light sleep timer interval (battery check) */
+/* Deep sleep entry thresholds */
+#define SLEEP_DEEP_IDLE_DISCONNECTED_SEC   300   /* BLE disconnected + TT off: 5 min idle */
+#define SLEEP_DEEP_IDLE_CONNECTED_SEC      600   /* BLE connected or TT on: 10 min no command */
+#define SLEEP_PRE_NOTIFY_SEC               540   /* 9 min: push "sleep imminent" notification */
+#define SLEEP_DEEP_TIMER_SEC               600   /* Deep sleep timer interval: 10 min */
+
+/* Light sleep (if enabled) */
+#define SLEEP_LIGHT_IDLE_SEC               600   /* Light sleep idle threshold */
+#define SLEEP_LIGHT_REENTER_SEC            2     /* Quick re-sleep after wake */
+#define SLEEP_LIGHT_TIMER_SEC             30    /* Light sleep timer interval */
+
+/* TEMP_AWAKE (if enabled) */
+#define SLEEP_TEMP_AWAKE_SEC              25    /* Timer wakeup: BLE advertise duration */
+
+/* Pwrkey thresholds (ms) */
+#define PWRKEY_POLL_MS                     20    /* Poll interval during press */
+#define PWRKEY_DEBOUNCE_MS                 50    /* Min press to register */
+#define PWRKEY_SHORT_THRESHOLD_MS          2000  /* < 2s: short press (open TT / refresh idle) */
+#define PWRKEY_SLEEP_THRESHOLD_MS          5000  /* 5-10s release: force TT off + deep sleep */
+#define PWRKEY_RESET_THRESHOLD_MS          10000 /* >= 10s release: hardware reboot TT */
 
 /* ========== Public API ========== */
 
@@ -115,6 +133,17 @@ bool sleep_manager_is_deep_sleep_wakeup(void);
  * @brief Check if currently in TEMP_AWAKE mode (timer wakeup, minimal init)
  */
 bool sleep_manager_is_temp_awake(void);
+
+/**
+ * @brief Push "sleep imminent" notification to connected APP
+ *
+ * Called by sleep manager 1 minute before entering deep sleep.
+ * Format: [0x09][seconds_until_sleep (uint16 LE)]
+ *
+ * @param seconds_until_sleep Seconds remaining before deep sleep
+ * @return 0 on success, negative on error
+ */
+int gatt_system_server_send_sleep_warning(uint16_t seconds_until_sleep);
 
 /**
  * @brief Get the deep sleep wakeup cause

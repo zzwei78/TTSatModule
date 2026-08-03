@@ -58,7 +58,7 @@ esp_err_t tt_hw_init(void)
     gpio_hold_dis(BOOST_PWR_MODE_GPIO);
     gpio_hold_dis(GPIO_TT_LDO_EN);
     gpio_hold_dis(GPIO_NUM_8);   /* IP5561 KEY (GPIO8) */
-    gpio_hold_dis(GPIO_LED3);    /* LED, just in case */
+    gpio_hold_dis(GPIO_NUM_12);    /* LED3 pin (defined in led_manager.h) */
 #endif
     gpio_deep_sleep_hold_dis();
 

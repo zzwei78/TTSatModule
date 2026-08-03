@@ -21,7 +21,7 @@
 /* V2.0: GPIO1 is active-low boost IC enable, managed by power_manage boost manager */
 #define GPIO_TT_LDO_EN      GPIO_NUM_38     /* V2 LDO Enable (active HIGH, TT module private) */
 #define GPIO_PWRKEY         GPIO_NUM_9      /* V2 Power Key input (active LOW) */
-#define GPIO_LED3           GPIO_NUM_10     /* V2 LED Blue (power-on heartbeat) */
+/* GPIO_LED3 defined in led_manager.h as GPIO 12 (RGB LED2 Blue) */
 #define BOOST_PWR_EN_GPIO   GPIO_NUM_1      /* Boost IC Enable (active LOW: LOW=on) */
 #define BOOST_PWR_MODE_GPIO GPIO_NUM_36     /* Boost IC Mode (HIGH=normal, LOW=low-power) */
 #define TT_PWR_ON_LEVEL     0               /* LOW = power on */

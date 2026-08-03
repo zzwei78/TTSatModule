@@ -25,6 +25,9 @@
 #include "ble/spp_at_server.h"
 #include "config/user_params.h"
 #include "config/hardware_version.h"
+#include "system/led_manager.h"
+
+#define SENSOR_IDLE_SLEEP_ENABLE 0
 
 static const char *TAG = "POWER_MANAGE";
 
@@ -74,6 +77,10 @@ static struct {
 /* Monitor task handles */
 static TaskHandle_t g_ip5561_manage_task = NULL;
 static TaskHandle_t g_fuel_gauge_task_handle = NULL;
+static TaskHandle_t g_sensor_task_handle = NULL;
+
+/* Sensor report session timer (reset on each ENABLE, used for 30s auto-disable) */
+static volatile uint32_t g_sensor_session_ms = 0;
 
 /* Monitor task running flags */
 static bool g_ip5561_manage_running = false;
@@ -703,6 +710,27 @@ static esp_err_t get_battery_decision_voltage(uint16_t *decision_voltage, bool *
 
 /* ========== Battery Event Detection ========== */
 
+/* Get real battery temperature from IP5561 NTC thermistor.
+ * Returns 0.1°K (same format as fuel_gauge_get_temperature).
+ * The CW2217E fuel gauge has no real temp sensor (its reg 0x06 is a host-written
+ * compensation value that is never written → bogus), so the actual battery
+ * temperature must come from the IP5561 NTC1 pin (real thermistor).
+ * Falls back to fuel gauge temp only if IP5561 NTC read fails. */
+uint16_t power_manage_get_battery_temp_0_1k(void)
+{
+    if (g_ip5561_handle != NULL) {
+        int16_t temp_c = 0;
+        if (ip5561_get_ntc_temperature(g_ip5561_handle, &temp_c, NULL) == ESP_OK) {
+            return (uint16_t)(temp_c * 10 + 2732);  /* °C → 0.1°K */
+        }
+        /* NTC read failed (e.g. not yet settled at boot) — fall through to gauge */
+    }
+    if (g_fuel_gauge_handle != NULL) {
+        return fuel_gauge_get_temperature(g_fuel_gauge_handle);  /* degraded fallback */
+    }
+    return 2732;  /* 0°C default */
+}
+
 static void battery_event_check(void)
 {
     if (!g_batt_report_enabled || g_fuel_gauge_handle == NULL) {
@@ -712,7 +740,7 @@ static void battery_event_check(void)
     uint16_t voltage = fuel_gauge_get_voltage(g_fuel_gauge_handle);
     int16_t current = fuel_gauge_get_current(g_fuel_gauge_handle);
     uint16_t soc = fuel_gauge_get_state_of_charge(g_fuel_gauge_handle);
-    uint16_t temp_0_1k = fuel_gauge_get_temperature(g_fuel_gauge_handle);
+    uint16_t temp_0_1k = power_manage_get_battery_temp_0_1k();
 
     /* Convert temperature: 0.1°K → °C */
     int temp_c = (int)temp_0_1k / 10 - 273;
@@ -724,6 +752,9 @@ static void battery_event_check(void)
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
         "[BATT_EVENT] V=%umV I=%dmA SOC=%u%% T=%d°C charging=%d (flags=0x%02X)",
         voltage, current, soc, temp_c, charging_now, g_batt_report_flags);
+
+    /* Update battery LED (every check cycle) */
+    led_set_battery_status(soc, charging_now, soc >= 100);
 
     /* Initialize baseline on first call */
     if (!g_batt_event_inited) {
@@ -865,11 +896,12 @@ static void __attribute__((unused)) fuel_gauge_monitor_task(void *pvParameters)
          * APP convention: discharge positive, charge negative */
         g_avg_current_ma = -(int16_t)avg_current_ma;
 
-        /* ========== Print battery status ========== */
-        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-            "[%s] V=%umV, I_now=%dmA, I_avg=%dmA, SOC=%u%%, P_avg=%dmW, Coulomb=%u",
-            fuel_gauge_name(),
-            voltage, instant_current, avg_current_ma, soc, avg_power, coulomb_count);
+        /* ========== Update LED indicators (always, regardless of report setting) ========== */
+        {
+            bool led_charging = power_manage_is_charging();
+            bool led_full = (soc >= 100);
+            led_set_battery_status(soc, led_charging, led_full);
+        }
 
         /* ========== Low Battery TT Module Auto-Shutdown Check ========== */
         {
@@ -1222,31 +1254,58 @@ static void ip5561_manage_task(void *pvParameters)
                 uint16_t vbat_adc = ip5561_get_battery_voltage(g_ip5561_handle);
                 uint16_t vbat_mv = (uint16_t)(vbat_adc * 0.26855f);
 
-                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                    "[IP5561 Manage] CTL0=0x%02X | CHG: vbus=%d activ=%d done=%d phase=%d | Vbat=%umV Ibat=%dmA",
-                    sys_ctl0, vbus_in, chg_activ, chg_done, chg_phase, vbat_mv, ibat);
+                /* --- NTC temperature state (0xFB @ 0xEA) ---
+                 * bits7:4 = Hot / MHot / MLow / Cold */
+                uint8_t ntc_state = 0;
+                ip5561_read_reg(g_ip5561_handle, 0xFB, &ntc_state, true);
+                bool ntc_hot  = (ntc_state & 0x80) != 0;
+                bool ntc_mhot = (ntc_state & 0x40) != 0;
+                bool ntc_mlow = (ntc_state & 0x20) != 0;
+                bool ntc_cold = (ntc_state & 0x10) != 0;
 
-                /* --- OCP check (0xFC @ 0xEA) --- */
+                /* --- OCP / short-circuit state (0xFC @ 0xEA) ---
+                 * bit0=VBUS OCP, bit1=VOUT OCP, bit2=Boost OCP, bit3=Boost short-circuit */
                 uint8_t ocp_state = 0;
-                if (ip5561_read_reg(g_ip5561_handle, 0xFC, &ocp_state, true) == ESP_OK) {
-                    if (ocp_state & 0x05) {  /* bit2=boost_uv, bit0=boost_scdt */
-                        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                                        "[IP5561 Manage] OCP triggered (0x%02X), clearing...",
-                                        ocp_state);
-                        ip5561_write_reg(g_ip5561_handle, 0xFC, ocp_state | 0x05, true);
-                    }
+                ip5561_read_reg(g_ip5561_handle, 0xFC, &ocp_state, true);
+                bool ocp_vbus    = (ocp_state & 0x01) != 0;
+                bool ocp_vout    = (ocp_state & 0x02) != 0;
+                bool ocp_boost   = (ocp_state & 0x04) != 0;
+                bool ocp_boostsc = (ocp_state & 0x08) != 0;
+
+                /* Compact fault flag string: empty when everything OK */
+                char fault_str[64];
+                if (ntc_hot || ntc_mhot || ntc_mlow || ntc_cold ||
+                    ocp_vbus || ocp_vout || ocp_boost || ocp_boostsc) {
+                    snprintf(fault_str, sizeof(fault_str),
+                             "FLT:NTC[0x%02X]%s%s%s%s OCP[0x%02X]%s%s%s%s",
+                             ntc_state,
+                             ntc_hot ? " Hot" : "", ntc_mhot ? " MHot" : "",
+                             ntc_mlow ? " MLow" : "", ntc_cold ? " Cold" : "",
+                             ocp_state,
+                             ocp_vbus ? " vbus" : "", ocp_vout ? " vout" : "",
+                             ocp_boost ? " boost" : "", ocp_boostsc ? " SC" : "");
+                } else {
+                    snprintf(fault_str, sizeof(fault_str), "FLT:OK");
                 }
 
-                /* --- NTC alert check (0xFB @ 0xEA) --- */
-                uint8_t ntc_state = 0;
-                if (ip5561_read_reg(g_ip5561_handle, 0xFB, &ntc_state, true) == ESP_OK) {
-                    if (ntc_state & 0xF0) {  /* any temperature flag */
-                        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                                        "[IP5561 Manage] NTC alert (0x%02X): Hot=%d MHot=%d MLow=%d Cold=%d",
-                                        ntc_state,
-                                        (ntc_state >> 7) & 1, (ntc_state >> 6) & 1,
-                                        (ntc_state >> 5) & 1, (ntc_state >> 4) & 1);
-                    }
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[IP5561 Manage] CTL0=0x%02X | CHG: vbus=%d activ=%d done=%d phase=%d | "
+                    "Vbat=%umV Ibat=%dmA | %s",
+                    sys_ctl0, vbus_in, chg_activ, chg_done, chg_phase, vbat_mv, ibat, fault_str);
+
+                /* --- OCP check: auto-clear VBUS/Boost OCP (0xFC @ 0xEA) --- */
+                if (ocp_state & 0x05) {
+                    SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                                    "[IP5561 Manage] OCP triggered (0x%02X), clearing...",
+                                    ocp_state);
+                    ip5561_write_reg(g_ip5561_handle, 0xFC, ocp_state | 0x05, true);
+                }
+
+                /* --- NTC alert (keep warning when any temperature flag set) --- */
+                if (ntc_state & 0xF0) {
+                    SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                                    "[IP5561 Manage] NTC alert (0x%02X): Hot=%d MHot=%d MLow=%d Cold=%d",
+                                    ntc_state, ntc_hot, ntc_mhot, ntc_mlow, ntc_cold);
                 }
 
                 /* --- Reset detection via config fingerprint --- */
@@ -1281,7 +1340,7 @@ static void ip5561_manage_task(void *pvParameters)
             }
         }
         
-        next_delay_ms = 5000;
+        //next_delay_ms = 5000;
 
         /* Wait with 10s granularity for quick stop response */
         uint32_t remaining = next_delay_ms;
@@ -1509,8 +1568,17 @@ esp_err_t power_manage_init(void)
 
     /* Start sensor monitor task if any sensor detected */
     if (g_da228ec_handle != NULL || g_sc7a20h_handle != NULL || g_mmc5603_handle != NULL) {
-        xTaskCreate(sensor_monitor_task, "sensor_mon", 3072, NULL, 1, NULL);
+        xTaskCreate(sensor_monitor_task, "sensor_mon", 3072, NULL, 1, &g_sensor_task_handle);
     }
+
+    /* Initial battery LED update (don't wait for first 60s cycle) */
+    if (g_fuel_gauge_handle != NULL) {
+        uint16_t init_soc = fuel_gauge_get_state_of_charge(g_fuel_gauge_handle);
+        bool init_charging = power_manage_is_charging();
+        led_set_battery_status(init_soc, init_charging, init_soc >= 100);
+    }
+    /* Signal LED: TT not started yet → red blink (TT off indication) */
+    led_set_signal_status(LED_SIGNAL_TT_OFF);
 
     return ESP_OK;
 }
@@ -1523,12 +1591,24 @@ esp_err_t power_manage_init(void)
  */
 
 /* Debug calculation toggles (for hardware comparison testing) */
-#define SENSOR_DEBUG_LOG_INTERVAL_MS   30000   /* Debug log interval (30s) */
+#define SENSOR_DEBUG_LOG_INTERVAL_MS   2000   /* Debug log interval (time-based) */
 #define SENSOR_DEBUG_TILT_ANGLE        1       /* 1=calculate and log tilt angle */
 #define SENSOR_DEBUG_COMPASS_HEADING   1       /* 1=calculate and log compass heading */
 
-#if SENSOR_DEBUG_TILT_ANGLE
-/* Calculate tilt angle (仰角/pitch) from accelerometer data.
+/* Sensor high-rate report intervals (active push when enabled) */
+#define SENSOR_REPORT_FAST_INTERVAL_MS     50      /* 20Hz when idle */
+#define SENSOR_REPORT_THROTTLE_INTERVAL_MS 500     /* 2Hz during voice call (avoid impacting voice) */
+#define SENSOR_REPORT_SESSION_TIMEOUT_MS   30000   /* 30s no re-enable → auto-disable */
+
+/* Idle sampling policy (configurable):
+ *   1 = idle(report disabled)时任务阻塞休眠，不采样 → 省电(默认)
+ *   0 = idle时仍以慢速后台采样(保持 cache/调试日志新鲜)，但不推送 */
+#ifndef SENSOR_IDLE_SLEEP_ENABLE
+#define SENSOR_IDLE_SLEEP_ENABLE           1
+#endif
+#define SENSOR_IDLE_BACKGROUND_MS          500     /* idle 后台采样间隔(仅当 IDLE_SLEEP=0 时生效) */
+
+/* Calculate tilt angle (仰角/elevation) from accelerometer data.
  * Returns signed angle in degrees:
  *   0° = flat, positive = tilted up, negative = tilted down
  * Range: -90° ~ +90°
@@ -1540,10 +1620,8 @@ static float sensor_calc_tilt(int16_t ax, int16_t ay, int16_t az)
      * Uses Y axis as tilt direction (front edge up/down) */
     return atan2f(y, sqrtf(x * x + z * z)) * 180.0f / 3.14159265f;
 }
-#endif
 
-#if SENSOR_DEBUG_COMPASS_HEADING
-/* Calculate compass heading from magnetometer data.
+/* Calculate compass heading (方位角/azimuth) from magnetometer data.
  * Returns heading in degrees (0=North, 90=East, 180=South, 270=West).
  * mx/my/mz in mG. */
 static int16_t sensor_calc_heading(int32_t mx, int32_t my, int32_t mz)
@@ -1553,15 +1631,58 @@ static int16_t sensor_calc_heading(int32_t mx, int32_t my, int32_t mz)
     if (heading < 0) heading += 360.0f;
     return (int16_t)heading;
 }
-#endif
+
+/* Public accessor: compute pointing angles from the latest cached sensor data.
+ * 方位角=azimuth (from magnetometer), 仰角=elevation (from accelerometer). */
+void power_manage_get_sensor_angles(int16_t *azimuth, float *elevation)
+{
+    int16_t az = 0;
+    float el = 0.0f;
+
+    if (g_sensor_cache.flags & 0x01) {           /* accel valid → elevation */
+        el = sensor_calc_tilt(g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az);
+    }
+    if (g_sensor_cache.flags & 0x02) {           /* mag valid → azimuth */
+        az = sensor_calc_heading(g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
+    }
+
+    if (azimuth) *azimuth = az;
+    if (elevation) *elevation = el;
+}
 
 static void sensor_monitor_task(void *pvParameters)
 {
     SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "Sensor monitor task started");
 
-    uint32_t log_counter = 0;  /* Counts 500ms ticks; log every 60 ticks (30s) */
+    uint32_t debug_log_ms = 0;   /* Time accumulator for debug log */
+
+    extern bool spp_voice_server_is_call_active(void);
 
     while (1) {
+        bool call_active = spp_voice_server_is_call_active();
+        uint32_t delay_ms;
+
+#if SENSOR_IDLE_SLEEP_ENABLE
+        /* Power-save: when report is disabled, block until ENABLE wakes us.
+         * No I2C reads while idle. */
+        if (!g_sensor_cache.report_enabled) {
+            xTaskNotifyWait(0, ULONG_MAX, NULL, portMAX_DELAY);
+            debug_log_ms = 0;
+            continue;  /* re-check report_enabled */
+        }
+        delay_ms = call_active ? SENSOR_REPORT_THROTTLE_INTERVAL_MS
+                               : SENSOR_REPORT_FAST_INTERVAL_MS;
+#else
+        /* Always sample. Fast push when enabled; slow background when idle. */
+        if (g_sensor_cache.report_enabled) {
+            delay_ms = call_active ? SENSOR_REPORT_THROTTLE_INTERVAL_MS
+                                   : SENSOR_REPORT_FAST_INTERVAL_MS;
+        } else {
+            delay_ms = SENSOR_IDLE_BACKGROUND_MS;
+        }
+#endif
+
+        /* Read sensors */
         uint8_t flags = 0;
 
         if (g_da228ec_handle != NULL) {
@@ -1594,44 +1715,56 @@ static void sensor_monitor_task(void *pvParameters)
 
         g_sensor_cache.flags = flags;
 
-        /* Debug log (every 30s, not every 500ms) */
-        if (++log_counter >= (SENSOR_DEBUG_LOG_INTERVAL_MS / 500)) {
-            log_counter = 0;
+        /* Push sample to APP only when report enabled (fire-and-forget NOTIFY; no retry) */
+        if (g_sensor_cache.report_enabled && flags) {
+            gatt_system_server_send_sensor_data();
+        }
+
+        /* Session timeout: auto-disable if APP hasn't re-enabled in time (active push only) */
+        if (g_sensor_cache.report_enabled) {
+            g_sensor_session_ms += delay_ms;
+            if (g_sensor_session_ms >= SENSOR_REPORT_SESSION_TIMEOUT_MS) {
+                SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                    "[SENSOR] report session timeout (%ums), auto-disable", g_sensor_session_ms);
+                g_sensor_cache.report_enabled = false;
+                continue;  /* next iteration sleeps / goes background */
+            }
+        }
+
+        /* Debug log (time-based, independent of dynamic rate) */
+        debug_log_ms += delay_ms;
+        if (debug_log_ms >= SENSOR_DEBUG_LOG_INTERVAL_MS) {
+            debug_log_ms = 0;
 
 #if SENSOR_DEBUG_TILT_ANGLE && SENSOR_DEBUG_COMPASS_HEADING
             float tilt = sensor_calc_tilt(g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az);
             int16_t heading = sensor_calc_heading(g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
             SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | tilt=%.1f° heading=%d°",
+                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | tilt=%.1f° heading=%d° (%ums)",
                 g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
                 g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz,
-                tilt, heading);
+                tilt, heading, delay_ms);
 #elif SENSOR_DEBUG_TILT_ANGLE
             float tilt = sensor_calc_tilt(g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az);
             SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | tilt=%.1f°",
+                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | tilt=%.1f° (%ums)",
                 g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
-                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz, tilt);
+                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz, tilt, delay_ms);
 #elif SENSOR_DEBUG_COMPASS_HEADING
             int16_t heading = sensor_calc_heading(g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
             SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | heading=%d°",
+                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG | heading=%d° (%ums)",
                 g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
-                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz, heading);
+                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz, heading, delay_ms);
 #else
             SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
-                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG",
+                "[SENSOR] accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG (%ums)",
                 g_sensor_cache.ax, g_sensor_cache.ay, g_sensor_cache.az,
-                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz);
+                g_sensor_cache.mx, g_sensor_cache.my, g_sensor_cache.mz, delay_ms);
 #endif
         }
 
-        /* Send BLE notification if report enabled (every cycle, not throttled) */
-        if (g_sensor_cache.report_enabled && flags) {
-            gatt_system_server_send_sensor_data();
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
 
@@ -1659,6 +1792,13 @@ void power_manage_get_sensor_data(uint8_t *flags,
 void power_manage_set_sensor_report(bool enable)
 {
     g_sensor_cache.report_enabled = enable;
+    if (enable) {
+        g_sensor_session_ms = 0;  /* each ENABLE renews the 30s session */
+        if (g_sensor_task_handle != NULL) {
+            /* Wake the sampling task to start pushing immediately */
+            xTaskNotifyGive(g_sensor_task_handle);
+        }
+    }
 }
 
 bool power_manage_is_sensor_report_enabled(void)

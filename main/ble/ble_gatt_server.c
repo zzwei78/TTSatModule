@@ -492,6 +492,10 @@ static int handle_gap_event_disconnect(struct ble_gap_event *event, void *arg)
     bool call_preserved = spp_voice_server_on_ble_disconnect(
         event->disconnect.conn.conn_handle, event->disconnect.reason);
 
+    /* Stop high-rate sensor stream on disconnect so the sampling task sleeps (power save) */
+    extern void power_manage_set_sensor_report(bool enable);
+    power_manage_set_sensor_report(false);
+
 #ifdef CONFIG_BLE_MULTI_CONN_ENABLE
     ble_conn_role_t role = ble_conn_manager_get_role(event->disconnect.conn.conn_handle);
     ble_conn_manager_remove_connection(event->disconnect.conn.conn_handle);

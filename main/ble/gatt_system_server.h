@@ -17,6 +17,7 @@
 #define BLE_SVC_SYSTEM_CHR_CONTROL_UUID16    0xABFD  // Control characteristic (system commands)
 #define BLE_SVC_SYSTEM_CHR_INFO_UUID16       0xABFE  // Info characteristic (read system info)
 #define BLE_SVC_SYSTEM_CHR_STATUS_UUID16     0xABFF  // Status characteristic (notify status changes)
+#define BLE_SVC_SYSTEM_CHR_SENSOR_UUID16     0xABF2  // Sensor characteristic (high-rate notify stream)
 
 /* System Control Commands */
 #define SYS_CMD_GET_BATTERY_INFO         0x01  // Get battery information

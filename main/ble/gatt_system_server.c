@@ -170,6 +170,7 @@ static bool is_dangerous_command(uint8_t cmd) {
 static uint16_t system_control_val_handle = 0;
 static uint16_t system_info_val_handle = 0;
 static uint16_t system_status_val_handle = 0;
+static uint16_t system_sensor_val_handle = 0;
 
 /* Command queue configuration */
 #define SYS_CMD_QUEUE_SIZE            8       // Maximum pending commands
@@ -293,7 +294,7 @@ static esp_err_t get_battery_info(system_battery_info_t *info)
 
     /* Step 6: Read remaining battery parameters */
     info->soh_percent = fuel_gauge_get_state_of_health(battery_handle);
-    info->temperature_0_1k = fuel_gauge_get_temperature(battery_handle);
+    info->temperature_0_1k = power_manage_get_battery_temp_0_1k();
     info->full_charge_capacity_mah = fuel_gauge_get_full_charge_capacity(battery_handle);
     info->remaining_capacity_mah = fuel_gauge_get_remaining_capacity(battery_handle);
 
@@ -1332,6 +1333,22 @@ static int system_service_handler(uint16_t conn_handle, uint16_t attr_handle,
             if (handle_system_info_read(conn_handle) != ESP_OK) {
                 return BLE_HS_ENOMEM;
             }
+        } else if (attr_handle == system_sensor_val_handle) {
+            /* Read latest sensor sample: 13 bytes (same layout as the notify stream) */
+            uint8_t flags = 0;
+            int16_t ax = 0, ay = 0, az = 0;
+            int32_t mx = 0, my = 0, mz = 0;
+            power_manage_get_sensor_data(&flags, &ax, &ay, &az, &mx, &my, &mz);
+            uint8_t buf[13];
+            buf[0] = flags;
+            buf[1] = (uint8_t)(ax & 0xFF);  buf[2] = (uint8_t)((ax >> 8) & 0xFF);
+            buf[3] = (uint8_t)(ay & 0xFF);  buf[4] = (uint8_t)((ay >> 8) & 0xFF);
+            buf[5] = (uint8_t)(az & 0xFF);  buf[6] = (uint8_t)((az >> 8) & 0xFF);
+            buf[7] = (uint8_t)(mx & 0xFF);  buf[8] = (uint8_t)((mx >> 8) & 0xFF);
+            buf[9] = (uint8_t)(my & 0xFF);  buf[10] = (uint8_t)((my >> 8) & 0xFF);
+            buf[11] = (uint8_t)(mz & 0xFF); buf[12] = (uint8_t)((mz >> 8) & 0xFF);
+            os_mbuf_append(ctxt->om, buf, sizeof(buf));
+            return 0;
         }
         break;
 
@@ -1652,6 +1669,13 @@ static const struct ble_gatt_svc_def system_service_defs[] = {
                 .access_cb = system_service_handler,
                 .val_handle = &system_status_val_handle,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+            },
+            {
+                /* Sensor Characteristic (high-rate data stream, NOTIFY) */
+                .uuid = BLE_UUID16_DECLARE(BLE_SVC_SYSTEM_CHR_SENSOR_UUID16),
+                .access_cb = system_service_handler,
+                .val_handle = &system_sensor_val_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
             }, {
                 0, /* No more characteristics */
             }
@@ -1684,29 +1708,33 @@ int gatt_system_server_send_sensor_data(void)
         return ESP_OK;  /* No valid data */
     }
 
-    /* Build notification payload: [0x74][flags][ax_lo][ax_hi]... */
-    uint8_t buf[14];
-    buf[0] = SYS_CMD_GET_SENSOR_STATUS;  /* Report ID */
-    buf[1] = flags;
-    buf[2] = (uint8_t)(ax & 0xFF);
-    buf[3] = (uint8_t)((ax >> 8) & 0xFF);
-    buf[4] = (uint8_t)(ay & 0xFF);
-    buf[5] = (uint8_t)((ay >> 8) & 0xFF);
-    buf[6] = (uint8_t)(az & 0xFF);
-    buf[7] = (uint8_t)((az >> 8) & 0xFF);
-    buf[8] = (uint8_t)(mx & 0xFF);
-    buf[9] = (uint8_t)((mx >> 8) & 0xFF);
-    buf[10] = (uint8_t)(my & 0xFF);
-    buf[11] = (uint8_t)((my >> 8) & 0xFF);
-    buf[12] = (uint8_t)(mz & 0xFF);
-    buf[13] = (uint8_t)((mz >> 8) & 0xFF);
+    /* Build notification payload on dedicated sensor characteristic (0xABF2).
+     * No report-ID prefix (the characteristic itself identifies the stream):
+     * [flags][ax_lo][ax_hi][ay_lo][ay_hi][az_lo][az_hi]
+     * [mx_lo][mx_hi][my_lo][my_hi][mz_lo][mz_hi] = 13 bytes */
+    uint8_t buf[13];
+    buf[0] = flags;
+    buf[1] = (uint8_t)(ax & 0xFF);
+    buf[2] = (uint8_t)((ax >> 8) & 0xFF);
+    buf[3] = (uint8_t)(ay & 0xFF);
+    buf[4] = (uint8_t)((ay >> 8) & 0xFF);
+    buf[5] = (uint8_t)(az & 0xFF);
+    buf[6] = (uint8_t)((az >> 8) & 0xFF);
+    buf[7] = (uint8_t)(mx & 0xFF);
+    buf[8] = (uint8_t)((mx >> 8) & 0xFF);
+    buf[9] = (uint8_t)(my & 0xFF);
+    buf[10] = (uint8_t)((my >> 8) & 0xFF);
+    buf[11] = (uint8_t)(mz & 0xFF);
+    buf[12] = (uint8_t)((mz >> 8) & 0xFF);
 
     struct os_mbuf *txom = ble_hs_mbuf_from_flat(buf, sizeof(buf));
     if (!txom) {
         return BLE_HS_ENOMEM;
     }
 
-    return ble_gatts_notify_custom(conn_handle, system_control_val_handle, txom);
+    /* Fire-and-forget NOTIFY: caller does not retry on failure (high-rate stream,
+     * a dropped packet is acceptable — next sample arrives in 50ms). */
+    return ble_gatts_notify_custom(conn_handle, system_sensor_val_handle, txom);
 }
 
 int gatt_system_server_send_battery_event(uint8_t event_type, uint8_t soc,
@@ -1815,6 +1843,28 @@ int gatt_system_server_send_tt_status(uint8_t tt_state)
     buf[1] = tt_state;
 
     SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG, "TT status notify: state=%d", tt_state);
+
+    struct os_mbuf *txom = ble_hs_mbuf_from_flat(buf, sizeof(buf));
+    if (!txom) return BLE_HS_ENOMEM;
+
+    return ble_gatts_notify_custom(conn_handle, system_control_val_handle, txom);
+}
+
+int gatt_system_server_send_sleep_warning(uint16_t seconds_until_sleep)
+{
+    uint16_t conn_handle = ble_conn_manager_get_primary_handle();
+    if (conn_handle == 0) {
+        return BLE_HS_ENOTCONN;
+    }
+
+    /* [0x09][seconds_lo][seconds_hi] */
+    uint8_t buf[3];
+    buf[0] = 0x09;
+    buf[1] = (uint8_t)(seconds_until_sleep & 0xFF);
+    buf[2] = (uint8_t)((seconds_until_sleep >> 8) & 0xFF);
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                    "Sleep imminent: %us until deep sleep", seconds_until_sleep);
 
     struct os_mbuf *txom = ble_hs_mbuf_from_flat(buf, sizeof(buf));
     if (!txom) return BLE_HS_ENOMEM;
@@ -2527,6 +2577,15 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
             int16_t ax = 0, ay = 0, az = 0;
             int32_t mx = 0, my = 0, mz = 0;
             power_manage_get_sensor_data(&flags, &ax, &ay, &az, &mx, &my, &mz);
+
+            /* Also print the device-computed pointing angles (方位角/仰角) */
+            int16_t azimuth = 0;
+            float elevation = 0.0f;
+            power_manage_get_sensor_angles(&azimuth, &elevation);
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_BLE_GATT, TAG,
+                "[SENSOR] 方位角=%d° 仰角=%.1f° (accel=[%d,%d,%d]mg mag=[%ld,%ld,%ld]mG)",
+                azimuth, elevation, ax, ay, az, (long)mx, (long)my, (long)mz);
+
             resp_data[0] = flags;
             memcpy(&resp_data[1], &ax, 2);
             memcpy(&resp_data[3], &ay, 2);
