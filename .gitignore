@@ -85,3 +85,8 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# Runtime debug artifacts (logs / audio captures)
+*.pcm
+esp32_log.txt
+esp_log.txt
