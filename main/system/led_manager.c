@@ -244,6 +244,13 @@ void led_all_off(void)
     led_set_state(1, LED_COLOR_OFF, LED_MODE_OFF);
 }
 
+/* ========== Both LEDs same state (e.g. calibration indicator) ========== */
+void led_set_both(led_color_t color, led_mode_t mode)
+{
+    led_set_state(0, color, mode);
+    led_set_state(1, color, mode);
+}
+
 /* ========== Legacy API ========== */
 void led_set(led_id_t id, bool on)
 {

@@ -222,6 +222,29 @@ void power_manage_get_sensor_data(uint8_t *flags,
 void power_manage_get_sensor_angles(int16_t *azimuth, float *elevation);
 
 /**
+ * @brief Run magnetometer hard-iron calibration (key-triggered test)
+ *
+ * Collects min/max of each mag axis while the user rotates the device, then
+ * stores offset = (min+max)/2 in NVS. Blocks for ~20s. Both blue LEDs blink.
+ * Subsequent mag reads subtract the offset automatically.
+ */
+void power_manage_mag_calibration_run(void);
+
+/* ========== Discharge Output Protection ========== */
+
+/**
+ * @brief Set discharge output protection config (persisted to NVS)
+ * @param enabled       true = cut external output (WPC + VBUS out) at low SOC
+ * @param threshold_pct SOC% at which to cut (5~95, 0 keeps previous threshold)
+ */
+esp_err_t power_manage_set_discharge_limit(bool enabled, uint8_t threshold_pct);
+
+/**
+ * @brief Get discharge output protection config + current output state
+ */
+void power_manage_get_discharge_limit(bool *enabled, uint8_t *threshold_pct, bool *output_off);
+
+/**
  * @brief Enable/disable sensor data report via BLE
  */
 void power_manage_set_sensor_report(bool enable);

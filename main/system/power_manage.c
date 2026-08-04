@@ -16,6 +16,8 @@
 #include "driver/rtc_io.h"
 #include "esp_bt.h"
 #include "esp_rom_gpio.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "IP5561.h"
 #include "system/power_manage.h"
 #include "syslog.h"
@@ -66,6 +68,24 @@ static sc7a20h_handle_t g_sc7a20h_handle = NULL;
 /* MMC5603 device handle (3-axis magnetometer) */
 static mmc5603_handle_t g_mmc5603_handle = NULL;
 
+/* Magnetometer hard-iron calibration (per-device offset, stored in NVS) */
+#define MAG_CAL_NVS_NAMESPACE   "mag_cal"
+#define MAG_CAL_NVS_KEY         "offset"
+#define MAG_CAL_DURATION_MS     20000   /* calibration collection window */
+#define MAG_CAL_SAMPLE_MS       50      /* sample interval during calibration */
+#define MAG_CAL_MIN_SWING_MG    200     /* min axis swing (mG) to trust that axis;
+                                         * below this the axis wasn't rotated enough → keep old offset */
+typedef struct {
+    int32_t off_x, off_y, off_z;   /* hard-iron offset (mG), subtracted from raw */
+    bool valid;                    /* true after a successful calibration */
+} mag_cal_t;
+static mag_cal_t g_mag_cal = {0};
+static volatile bool g_mag_calibrating = false;  /* set during calibration (sensor task skips mag) */
+
+/* Forward declarations (defined after sensor_monitor_task) */
+static void mag_cal_load(void);
+static void mag_cal_save(void);
+
 /* Cached sensor data */
 static struct {
     int16_t ax, ay, az;         /* mg */
@@ -81,6 +101,18 @@ static TaskHandle_t g_sensor_task_handle = NULL;
 
 /* Sensor report session timer (reset on each ENABLE, used for 30s auto-disable) */
 static volatile uint32_t g_sensor_session_ms = 0;
+
+/* ========== Discharge Output Protection (power-bank output cut at low SOC) ========== */
+#define DISCHARGE_LIMIT_NVS_NS       "dchg_lim"
+#define DISCHARGE_LIMIT_NVS_KEY      "cfg"
+#define DISCHARGE_LIMIT_DEFAULT_PCT  20      /* default threshold (%) */
+#define DISCHARGE_LIMIT_HYSTERESIS   5       /* re-enable at threshold + 5% */
+typedef struct {
+    bool    enabled;        /* protection on/off */
+    uint8_t threshold_pct;  /* cut external output when SOC <= this */
+} discharge_limit_cfg_t;
+static discharge_limit_cfg_t g_discharge_limit = { .enabled = true, .threshold_pct = DISCHARGE_LIMIT_DEFAULT_PCT };
+static bool g_discharge_output_off = false;  /* current external-output state (true=cut) */
 
 /* Monitor task running flags */
 static bool g_ip5561_manage_running = false;
@@ -731,6 +763,102 @@ uint16_t power_manage_get_battery_temp_0_1k(void)
     return 2732;  /* 0°C default */
 }
 
+/* ========== Discharge Output Protection ========== */
+
+/* Load discharge-limit config from NVS (called once at init) */
+static void discharge_limit_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(DISCHARGE_LIMIT_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    discharge_limit_cfg_t buf = {0};
+    size_t len = sizeof(buf);
+    if (nvs_get_blob(h, DISCHARGE_LIMIT_NVS_KEY, &buf, &len) == ESP_OK &&
+        buf.threshold_pct >= 5 && buf.threshold_pct <= 95) {
+        g_discharge_limit = buf;
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[DCHG_LIM] loaded: enabled=%d threshold=%u%%",
+            g_discharge_limit.enabled, g_discharge_limit.threshold_pct);
+    }
+    nvs_close(h);
+}
+
+static void discharge_limit_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(DISCHARGE_LIMIT_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    nvs_set_blob(h, DISCHARGE_LIMIT_NVS_KEY, &g_discharge_limit, sizeof(g_discharge_limit));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* Check SOC vs threshold; cut/restore external charge output (WPC + VBUS out) with hysteresis.
+ * Called from battery_event_check (~every 10s). Pushes a battery event on state change. */
+static void discharge_limit_check(uint16_t soc, uint16_t voltage_mv, bool charging)
+{
+    if (g_ip5561_handle == NULL) {
+        return;
+    }
+
+    /* Protection disabled: ensure external output is enabled */
+    if (!g_discharge_limit.enabled) {
+        if (g_discharge_output_off) {
+            ip5561_set_wpc_enable(g_ip5561_handle, true);
+            ip5561_configure_vbus_output(g_ip5561_handle, true);
+            g_discharge_output_off = false;
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[DCHG_LIM] protection off → output enabled");
+        }
+        return;
+    }
+
+    /* Cut when SOC <= threshold; restore with hysteresis at threshold + 5% */
+    if (!g_discharge_output_off && soc <= g_discharge_limit.threshold_pct) {
+        ip5561_set_wpc_enable(g_ip5561_handle, false);
+        ip5561_configure_vbus_output(g_ip5561_handle, false);
+        g_discharge_output_off = true;
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[DCHG_LIM] SOC=%u%% <= %u%% → external output CUT (WPC+VBUS out off)",
+            soc, g_discharge_limit.threshold_pct);
+        gatt_system_server_send_battery_event(BATTERY_EVENT_DISCHARGE_CUT,
+                                              soc, voltage_mv,
+                                              power_manage_get_battery_temp_0_1k(), charging);
+    } else if (g_discharge_output_off &&
+               soc >= g_discharge_limit.threshold_pct + DISCHARGE_LIMIT_HYSTERESIS) {
+        ip5561_set_wpc_enable(g_ip5561_handle, true);
+        ip5561_configure_vbus_output(g_ip5561_handle, true);
+        g_discharge_output_off = false;
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[DCHG_LIM] SOC=%u%% >= %u%% → external output RESTORED",
+            soc, g_discharge_limit.threshold_pct + DISCHARGE_LIMIT_HYSTERESIS);
+        gatt_system_server_send_battery_event(BATTERY_EVENT_DISCHARGE_RESTORE,
+                                              soc, voltage_mv,
+                                              power_manage_get_battery_temp_0_1k(), charging);
+    }
+}
+
+esp_err_t power_manage_set_discharge_limit(bool enabled, uint8_t threshold_pct)
+{
+    g_discharge_limit.enabled = enabled;
+    if (threshold_pct >= 5 && threshold_pct <= 95) {
+        g_discharge_limit.threshold_pct = threshold_pct;
+    }  /* else: only toggle enable, keep previous threshold */
+    discharge_limit_save();
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+        "[DCHG_LIM] set: enabled=%d threshold=%u%% (saved)",
+        g_discharge_limit.enabled, g_discharge_limit.threshold_pct);
+    return ESP_OK;
+}
+
+void power_manage_get_discharge_limit(bool *enabled, uint8_t *threshold_pct, bool *output_off)
+{
+    if (enabled)      *enabled = g_discharge_limit.enabled;
+    if (threshold_pct) *threshold_pct = g_discharge_limit.threshold_pct;
+    if (output_off)   *output_off = g_discharge_output_off;
+}
+
 static void battery_event_check(void)
 {
     if (!g_batt_report_enabled || g_fuel_gauge_handle == NULL) {
@@ -755,6 +883,9 @@ static void battery_event_check(void)
 
     /* Update battery LED (every check cycle) */
     led_set_battery_status(soc, charging_now, soc >= 100);
+
+    /* Discharge output protection: cut/restore external charge output by SOC */
+    discharge_limit_check(soc, voltage, charging_now);
 
     /* Initialize baseline on first call */
     if (!g_batt_event_inited) {
@@ -1571,6 +1702,14 @@ esp_err_t power_manage_init(void)
         xTaskCreate(sensor_monitor_task, "sensor_mon", 3072, NULL, 1, &g_sensor_task_handle);
     }
 
+    /* Load magnetometer hard-iron calibration from NVS (if previously calibrated) */
+    if (g_mmc5603_handle != NULL) {
+        mag_cal_load();
+    }
+
+    /* Load discharge output protection config from NVS */
+    discharge_limit_load();
+
     /* Initial battery LED update (don't wait for first 60s cycle) */
     if (g_fuel_gauge_handle != NULL) {
         uint16_t init_soc = fuel_gauge_get_state_of_charge(g_fuel_gauge_handle);
@@ -1703,12 +1842,13 @@ static void sensor_monitor_task(void *pvParameters)
             }
         }
 
-        if (g_mmc5603_handle != NULL) {
+        if (g_mmc5603_handle != NULL && !g_mag_calibrating) {
             int32_t x, y, z;
             if (mmc5603_read_xyz(g_mmc5603_handle, &x, &y, &z) == ESP_OK) {
-                g_sensor_cache.mx = x;
-                g_sensor_cache.my = y;
-                g_sensor_cache.mz = z;
+                /* Apply hard-iron calibration offset (raw − offset) */
+                g_sensor_cache.mx = x - g_mag_cal.off_x;
+                g_sensor_cache.my = y - g_mag_cal.off_y;
+                g_sensor_cache.mz = z - g_mag_cal.off_z;
                 flags |= 0x02;
             }
         }
@@ -1766,6 +1906,132 @@ static void sensor_monitor_task(void *pvParameters)
 
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
+}
+
+/* ========== Magnetometer Hard-Iron Calibration (test, key-triggered) ========== */
+
+/* Load calibration offset from NVS (called once at init) */
+static void mag_cal_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(MAG_CAL_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    mag_cal_t buf = {0};
+    size_t len = sizeof(buf);
+    if (nvs_get_blob(h, MAG_CAL_NVS_KEY, &buf, &len) == ESP_OK && buf.valid) {
+        g_mag_cal = buf;
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[MAG_CAL] loaded offset: [%ld, %ld, %ld] mG",
+            (long)g_mag_cal.off_x, (long)g_mag_cal.off_y, (long)g_mag_cal.off_z);
+    } else {
+        SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[MAG_CAL] no stored calibration (raw mode)");
+    }
+    nvs_close(h);
+}
+
+static void mag_cal_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(MAG_CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[MAG_CAL] NVS open failed");
+        return;
+    }
+    nvs_set_blob(h, MAG_CAL_NVS_KEY, &g_mag_cal, sizeof(g_mag_cal));
+    esp_err_t ret = nvs_commit(h);
+    nvs_close(h);
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[MAG_CAL] saved offset (%s)",
+                    ret == ESP_OK ? "OK" : esp_err_to_name(ret));
+}
+
+/* Run hard-iron calibration: collect min/max of each mag axis while the user
+ * rotates the device through all orientations, then offset = (min+max)/2.
+ * Blocks for MAG_CAL_DURATION_MS. Both blue LEDs blink during calibration. */
+void power_manage_mag_calibration_run(void)
+{
+    if (g_mmc5603_handle == NULL) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[MAG_CAL] MMC5603 not available, aborted");
+        return;
+    }
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+        "[MAG_CAL] START (%ums) — rotate device 360° in all orientations",
+        MAG_CAL_DURATION_MS);
+
+    g_mag_calibrating = true;
+    led_set_both(LED_COLOR_BLUE, LED_MODE_BLINK);
+
+    int32_t min_x = INT32_MAX, min_y = INT32_MAX, min_z = INT32_MAX;
+    int32_t max_x = INT32_MIN, max_y = INT32_MIN, max_z = INT32_MIN;
+    uint32_t elapsed = 0;
+    uint32_t samples = 0;
+
+    while (elapsed < MAG_CAL_DURATION_MS) {
+        int32_t mx, my, mz;
+        if (mmc5603_read_xyz(g_mmc5603_handle, &mx, &my, &mz) == ESP_OK) {
+            if (mx < min_x) min_x = mx;
+            if (mx > max_x) max_x = mx;
+            if (my < min_y) min_y = my;
+            if (my > max_y) max_y = my;
+            if (mz < min_z) min_z = mz;
+            if (mz > max_z) max_z = mz;
+            samples++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(MAG_CAL_SAMPLE_MS));
+        elapsed += MAG_CAL_SAMPLE_MS;
+
+        /* Progress log every 5s */
+        if (samples > 0 && (elapsed % 5000) == 0) {
+            SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+                "[MAG_CAL] %us/%us samples=%u | X[%ld..%ld] Y[%ld..%ld] Z[%ld..%ld]",
+                elapsed / 1000, MAG_CAL_DURATION_MS / 1000, samples,
+                (long)min_x, (long)max_x, (long)min_y, (long)max_y, (long)min_z, (long)max_z);
+        }
+    }
+
+    led_all_off();  /* clear blue blink; normal LED cycles will restore indicators */
+
+    if (samples == 0) {
+        SYS_LOGE_MODULE(SYS_LOG_MODULE_MAIN, TAG, "[MAG_CAL] no samples collected, aborted");
+        g_mag_calibrating = false;
+        return;
+    }
+
+    /* Validate per-axis swing before accepting. The min/max method is only valid
+     * if each axis was rotated through its field extrema; a narrow swing means
+     * incomplete rotation → midpoint would be wrong. Keep the previous (good)
+     * offset for any axis that wasn't rotated enough, so a sloppy re-calibration
+     * cannot corrupt an earlier good one. */
+    int32_t swing_x = max_x - min_x;
+    int32_t swing_y = max_y - min_y;
+    int32_t swing_z = max_z - min_z;
+    bool upd_x = (swing_x >= MAG_CAL_MIN_SWING_MG);
+    bool upd_y = (swing_y >= MAG_CAL_MIN_SWING_MG);
+    bool upd_z = (swing_z >= MAG_CAL_MIN_SWING_MG);
+
+    if (!upd_x && !upd_y && !upd_z) {
+        /* No axis rotated enough — reject entirely, keep previous calibration */
+        SYS_LOGW_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+            "[MAG_CAL] REJECTED — swing too small (X=%ld Y=%ld Z=%ld mG < %d), kept previous",
+            (long)swing_x, (long)swing_y, (long)swing_z, MAG_CAL_MIN_SWING_MG);
+        g_mag_calibrating = false;
+        return;
+    }
+
+    if (upd_x) g_mag_cal.off_x = (max_x + min_x) / 2;
+    if (upd_y) g_mag_cal.off_y = (max_y + min_y) / 2;
+    if (upd_z) g_mag_cal.off_z = (max_z + min_z) / 2;
+    g_mag_cal.valid = true;
+    g_mag_calibrating = false;
+
+    SYS_LOGI_MODULE(SYS_LOG_MODULE_MAIN, TAG,
+        "[MAG_CAL] DONE samples=%u | swing X=%ld%s Y=%ld%s Z=%ld%s mG | offset: X=%ld Y=%ld Z=%ld (saved)",
+        samples,
+        (long)swing_x, upd_x ? "(upd)" : "(keep)", (long)swing_y, upd_y ? "(upd)" : "(keep)",
+        (long)swing_z, upd_z ? "(upd)" : "(keep)",
+        (long)g_mag_cal.off_x, (long)g_mag_cal.off_y, (long)g_mag_cal.off_z);
+
+    mag_cal_save();
 }
 
 uint8_t power_manage_get_sensor_flags(void)

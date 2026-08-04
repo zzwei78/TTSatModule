@@ -1,8 +1,9 @@
 # 传感器数据主动上报（高频）— 开发文档
 
-> 版本: 3.0
+> 版本: 3.1
 > 更新: 2026-08-03
-> 适用固件: TTSatModule v1.2.2+
+> 适用固件: TTSatModule v1.3.0+
+> 变更: 9.2 节补全倾角补偿方位角算法；硬铁校准由固件完成（per-device，存 NVS）
 
 ## 概述
 
@@ -199,17 +200,77 @@ if (!(flags & 0x01)) { /* 加速度无效 */ }
 if (!(flags & 0x02)) { /* 磁场无效 */ }
 ```
 
-### 9.2 角度计算
+### 9.2 角度计算（仰角 + 倾角补偿方位角）
+
+> 重要：设备上报的 `mx/my/mz` **已由固件做了硬铁校准**（减去 per-device 偏移）。
+> APP 拿到的是去偏移后的磁场。下面直接用即可，无需再减硬铁偏移。
+> 软铁校准暂不做（实测不够准再加）。
+
+#### 9.2.1 单位归一
 
 ```c
-// 俯仰角 (Pitch / 仰角)
-float ax_g = ax / 1000.0f, ay_g = ay / 1000.0f, az_g = az / 1000.0f;
-float pitch = atan2f(ay_g, sqrtf(ax_g*ax_g + az_g*az_g)) * 180.0f / 3.14159265f;
+#define PI  3.14159265f
 
-// 航向角 (Heading / 方位角, 2D 简化)
-float heading = atan2f((float)my, (float)mx) * 180.0f / 3.14159265f;
-if (heading < 0) heading += 360.0f;   // 0=北 90=东 180=南 270=西
+/* 加速度 mg → g（用于算姿态角） */
+float ax_g = ax / 1000.0f;
+float ay_g = ay / 1000.0f;
+float az_g = az / 1000.0f;
+
+/* 磁场保持 mG（比例运算，单位不影响角度） */
+float mxf = (float)mx;
+float myf = (float)my;
+float mzf = (float)mz;
 ```
+
+#### 9.2.2 由加速度算姿态（Pitch / Roll）
+
+```c
+/* Pitch（俯仰 / 仰角）：设备前端抬起的角度，0=水平，+=抬头 */
+float pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g));   /* 弧度 */
+
+/* Roll（横滚）：设备侧倾角度，0=水平 */
+float roll  = atan2f(ay_g, az_g);                            /* 弧度 */
+
+float elevation = pitch * 180.0f / PI;   /* 仰角（°），即设备指向的俯仰 */
+```
+
+#### 9.2.3 倾角补偿方位角（核心）
+
+设备倾斜时，必须先把磁向量从**设备坐标系**旋转到**水平面**，再算航向，否则方位角严重失真：
+
+```c
+float cp = cosf(pitch), sp = sinf(pitch);
+float cr = cosf(roll),  sr = sinf(roll);
+
+/* 把磁向量投影到水平面 */
+float Xh = mxf * cp + mzf * sp;
+float Yh = mxf * sr * sp + myf * cr - mzf * sr * cp;
+
+/* 水平面内算航向 */
+float heading = atan2f(Yh, Xh) * 180.0f / PI;   /* ° */
+if (heading < 0) heading += 360.0f;             /* 0=北 90=东 180=南 270=西 */
+```
+
+> ⚠️ **轴序与符号需按实际安装方向校验**。上面是常见约定（X 朝设备前端、Y 朝左、Z 朝上）。
+> 若实测方位角整体偏 180°/方向反转，调整 `atan2f` 的符号或 Xh/Yh 的正负：
+> - 方向差 180° → `atan2f(-Yh, -Xh)` 或整体取反
+> - 东西颠倒 → 交换 Xh/Yh 或改 Yh 符号
+> - 建议先用"水平放置、分别朝北/东/南/西"验证四向，再微调符号。
+
+#### 9.2.4 何时可退化为 2D（无倾角补偿）
+
+仅当**确认设备始终保持水平**（如固定在水平支架上）时，可直接用简化公式：
+
+```c
+float heading = atan2f(myf, mxf) * 180.0f / PI;
+if (heading < 0) heading += 360.0f;
+```
+
+手持或晃动场景**必须用 9.2.3 的倾角补偿版本**，否则倾斜几度方位角就会偏十几度。
+
+#### 9.2.5 前置条件：硬铁校准
+
+方位角准的前提是**设备已做过硬铁校准**（固件端按键触发，存 NVS）。未校准时偏移未去除，方位角会系统性偏移。APP 可提示用户先完成一次硬铁校准（长按设备按键 5s + 360° 旋转）。
 
 ---
 

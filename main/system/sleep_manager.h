@@ -65,6 +65,14 @@ typedef enum {
 #define PWRKEY_SLEEP_THRESHOLD_MS          5000  /* 5-10s release: force TT off + deep sleep */
 #define PWRKEY_RESET_THRESHOLD_MS          10000 /* >= 10s release: hardware reboot TT */
 
+/* Pwrkey 5-10s long-press action (TEST mode for magnetometer hard-iron calibration):
+ *   0 = force TT off + deep sleep  (production default)
+ *   1 = enter mag hard-iron calibration routine (test, both blue LEDs blink)
+ * Override on compile cmd: -DPWRKEY_5S_ACTION_MAG_CALIBRATION=1 */
+#ifndef PWRKEY_5S_ACTION_MAG_CALIBRATION
+#define PWRKEY_5S_ACTION_MAG_CALIBRATION   0
+#endif
+
 /* ========== Public API ========== */
 
 /**

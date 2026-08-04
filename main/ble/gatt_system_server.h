@@ -91,6 +91,7 @@
 /* Battery Event Report Commands */
 #define SYS_CMD_ENABLE_BATTERY_REPORT   0x7E  // Enable battery event notifications
 #define SYS_CMD_DISABLE_BATTERY_REPORT  0x7F  // Disable battery event notifications
+#define SYS_CMD_SET_DISCHARGE_LIMIT     0x80  // Set/get discharge output protection (enable + threshold%)
 
 /* TT Status Notification (device → APP push, unsolicited) */
 #define TT_STATUS_NOTIFY_ID             0x08  /* Identifier byte for TT status push */
@@ -259,6 +260,8 @@ int gatt_system_server_send_sensor_data(void);
 #define BATTERY_EVENT_TEMP_HIGH         0x05  /* Temperature >= high threshold */
 #define BATTERY_EVENT_TEMP_LOW          0x06  /* Temperature <= low threshold */
 #define BATTERY_EVENT_PERIODIC          0x07  /* Periodic heartbeat (every 2 min) */
+#define BATTERY_EVENT_DISCHARGE_CUT     0x08  /* External charge output cut (SOC <= limit) */
+#define BATTERY_EVENT_DISCHARGE_RESTORE 0x09  /* External charge output restored (SOC recovered) */
 
 /* Event subscription bitmask (used in ENABLE_BATTERY_REPORT flags param) */
 #define BATTERY_REPORT_FLAG_SOC         0x01  /* Subscribe to SOC change events */

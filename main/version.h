@@ -15,14 +15,14 @@ extern "C" {
 /* Firmware Version Information */
 #define FIRMWARE_VERSION_MAJOR     1
 #define FIRMWARE_VERSION_MINOR     3
-#define FIRMWARE_VERSION_PATCH     0
+#define FIRMWARE_VERSION_PATCH     1
 
 /* Build Information */
 #define FIRMWARE_BUILD_DATE        __DATE__
 #define FIRMWARE_BUILD_TIME        __TIME__
 
 /* Version String */
-#define FIRMWARE_VERSION_STRING    "1.3.0"
+#define FIRMWARE_VERSION_STRING    "1.3.1"
 
 /* Product Information */
 #define PRODUCT_MANUFACTURER       "SatCat"

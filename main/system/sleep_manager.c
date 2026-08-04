@@ -943,7 +943,16 @@ static void pwrkey_monitor_task(void *pvParameters)
             }
 
             if (held_ms < PWRKEY_RESET_THRESHOLD_MS) {
-                /* 5-10s: force TT off + deep sleep (unless charging) */
+                /* 5-10s zone */
+#if PWRKEY_5S_ACTION_MAG_CALIBRATION
+                /* TEST: magnetometer hard-iron calibration (both blue LEDs blink) */
+                SYS_LOGW(TAG, "Pwrkey %lldms -> mag hard-iron calibration (test mode)", held_ms);
+                extern void power_manage_mag_calibration_run(void);
+                power_manage_mag_calibration_run();
+                sleep_manager_notify_activity("pwrkey");
+                break;
+#else
+                /* Production: force TT off + deep sleep (unless charging) */
                 uint8_t chg_flags = 0;
                 bool charging = false;
                 if (power_manage_get_charging_status(&chg_flags) == ESP_OK) {
@@ -963,6 +972,7 @@ static void pwrkey_monitor_task(void *pvParameters)
                 sleep_manager_enter_deep_sleep();
                 /* Does not return */
                 break;
+#endif
             }
 
             /* >= 10s: hardware reboot TT */

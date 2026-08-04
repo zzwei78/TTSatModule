@@ -110,6 +110,11 @@ void led_swap_assignment(void);
  */
 void led_all_off(void);
 
+/**
+ * @brief Drive both physical LEDs to the same color/mode (e.g. calibration indicator)
+ */
+void led_set_both(led_color_t color, led_mode_t mode);
+
 /* ========== Legacy API (backward compatible) ========== */
 
 void led_set(led_id_t id, bool on);

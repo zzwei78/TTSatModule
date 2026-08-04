@@ -113,6 +113,7 @@ static const uint8_t DEBUG_ALLOWED_COMMANDS[] = {
     // ===== Battery Event Report Commands =====
     0x7E,  // ENABLE_BATTERY_REPORT
     0x7F,  // DISABLE_BATTERY_REPORT
+    0x80,  // SET_DISCHARGE_LIMIT (enable + threshold%)
 
     // ===== Service Control Commands =====
     0x10,  // SERVICE_START
@@ -864,6 +865,13 @@ static void print_system_command(const uint8_t *data, size_t len)
 
     case SYS_CMD_DISABLE_BATTERY_REPORT:
         cmd_name = "DISABLE_BATTERY_REPORT";
+        break;
+
+    case SYS_CMD_SET_DISCHARGE_LIMIT:
+        cmd_name = "SET_DISCHARGE_LIMIT";
+        if (len >= 2) {
+            snprintf(param_str, sizeof(param_str), "enable=%u, threshold=%u%%", data[1], (len >= 3 ? data[2] : 0));
+        }
         break;
 
     default:
@@ -2777,6 +2785,26 @@ static esp_err_t handle_system_control_command_async(const system_cmd_packet_t *
             power_manage_disable_battery_report();
             resp_data[0] = 0;
             resp_len = 1;
+        }
+        break;
+
+    case SYS_CMD_SET_DISCHARGE_LIMIT:
+        {
+            /* Set/get discharge output protection.
+             * Set:   param = [enable(0/1)][threshold%(5~95, optional)]
+             * Query: no param (param_len == 0)
+             * Response: [enable][threshold][output_off] */
+            if (param_len >= 1) {
+                bool enable = cmd_params[0] != 0;
+                uint8_t thr = (param_len >= 2) ? cmd_params[1] : 0;  /* 0 = keep previous */
+                power_manage_set_discharge_limit(enable, thr);
+            }
+            bool e = false; uint8_t t = 0; bool off = false;
+            power_manage_get_discharge_limit(&e, &t, &off);
+            resp_data[0] = e ? 1 : 0;
+            resp_data[1] = t;
+            resp_data[2] = off ? 1 : 0;
+            resp_len = 3;
         }
         break;
 
